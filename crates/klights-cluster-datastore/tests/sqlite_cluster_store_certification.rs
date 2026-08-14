@@ -4,8 +4,9 @@ use std::time::Duration;
 use klights_cluster_core::{
     ClusterMembership, ClusterMetadata, LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation,
     LogApplyNamespaceRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow,
-    LogApplyPodCleanupIntentRow, LogApplyResourceRow, LogApplyWatchEventRow, NoPublicChangeReason,
-    OutboxStreamWatermark, SnapshotRestoreOperation, StorageResponse, WatchReplayPosition,
+    LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
+    NoPublicChangeReason, OutboxStreamWatermark, SnapshotRestoreOperation, StorageResponse,
+    WatchReplayPosition,
 };
 use klights_cluster_datastore::sqlite::{
     self, SqliteApplyLedgerRead, SqliteReadStore,
@@ -1546,6 +1547,7 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
     )
     .await
     .unwrap();
+    let source_reads = SqliteReadStore::new(source_read_executor.clone());
     let source_recovery = SqliteRecoveryStore::new(
         source_executor,
         source_read_executor,
@@ -1560,6 +1562,22 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
         "captured-config-uid",
         7,
         serde_json::json!({"tier": "certified"}),
+    );
+    let deleted_before_capture = resource_row(
+        "ConfigMap",
+        Some("captured"),
+        "deleted-during-capture",
+        "deleted-during-capture-uid",
+        6,
+        serde_json::json!({}),
+    );
+    let deleted_tombstone = resource_row(
+        "ConfigMap",
+        Some("captured"),
+        "deleted-during-capture",
+        "deleted-during-capture-uid",
+        7,
+        serde_json::json!({}),
     );
     let cluster_scoped = resource_row("Node", None, "cp-1", "cp-1-uid", 7, serde_json::json!({}));
     let watermark = OutboxStreamWatermark {
@@ -1588,48 +1606,78 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
     };
     source_recovery
         .restore_snapshot_parts(
-            vec![SnapshotRestoreOperation::new(
-                7,
-                Some(watermark.clone()),
-                vec![
-                    LogApplyMutation::PutNamespace(namespace("captured", 7)),
-                    LogApplyMutation::PutResource(namespaced.clone()),
-                    LogApplyMutation::PutResource(cluster_scoped),
-                    LogApplyMutation::PutWatchEvent(watch_event(&namespaced, 4)),
-                    LogApplyMutation::PutNodeSubnet(LogApplyNodeSubnetRow {
-                        node_name: "cp-1".to_string(),
-                        subnet: "10.42.1.0/24".to_string(),
-                        subnet_base_int: u32::from(std::net::Ipv4Addr::new(10, 42, 1, 0)),
-                        gateway_ip: "10.42.1.1".to_string(),
-                        node_ip: "10.0.0.1".to_string(),
-                        mode: "root".to_string(),
-                        hostport_range: None,
-                    }),
-                    LogApplyMutation::PutNodeDataplane(LogApplyNodeDataplaneRow {
-                        node_name: "cp-1".to_string(),
-                        mode: "root".to_string(),
-                        encryption: "enabled".to_string(),
-                        public_key: Some(
-                            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-                        ),
-                        endpoint: "10.0.0.1".to_string(),
-                        port: Some(51820),
-                    }),
-                    LogApplyMutation::PutPodCleanupIntent(LogApplyPodCleanupIntentRow {
-                        node_name: "cp-1".to_string(),
-                        namespace: "captured".to_string(),
-                        pod_name: "cleanup-pod".to_string(),
-                        pod_uid: "cleanup-uid".to_string(),
-                        reason: "NodeLost".to_string(),
-                        resource_version: 7,
-                        created_at_ms: 456,
-                        pod_data: serde_json::json!({
-                            "metadata": {"name": "cleanup-pod", "uid": "cleanup-uid"},
+            vec![
+                SnapshotRestoreOperation::new(
+                    6,
+                    None,
+                    vec![
+                        LogApplyMutation::PutResource(deleted_before_capture.clone()),
+                        LogApplyMutation::PutWatchEvent(watch_event(&deleted_before_capture, 3)),
+                    ],
+                ),
+                SnapshotRestoreOperation::new(
+                    7,
+                    Some(watermark.clone()),
+                    vec![
+                        LogApplyMutation::PutNamespace(namespace("captured", 7)),
+                        LogApplyMutation::PutResource(namespaced.clone()),
+                        LogApplyMutation::PutResource(cluster_scoped),
+                        LogApplyMutation::PutWatchEvent(watch_event(&namespaced, 4)),
+                        LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                            event_id: Some(5),
+                            api_version: deleted_tombstone.api_version.clone(),
+                            kind: deleted_tombstone.kind.clone(),
+                            namespace: deleted_tombstone.namespace.clone(),
+                            name: deleted_tombstone.name.clone(),
+                            resource_version: deleted_tombstone.resource_version,
+                            event_type: "DELETED".to_string(),
+                            data: deleted_tombstone.data.clone(),
                         }),
-                    }),
-                    LogApplyMutation::PutAppliedOutbox(applied.clone()),
-                ],
-            )],
+                        LogApplyMutation::DeleteResource(LogApplyResourceKey {
+                            api_version: deleted_tombstone.api_version.clone(),
+                            kind: deleted_tombstone.kind.clone(),
+                            namespace: deleted_tombstone.namespace.clone(),
+                            name: deleted_tombstone.name.clone(),
+                            uid: deleted_tombstone.uid.clone(),
+                            precondition_resource_version: Some(
+                                deleted_before_capture.resource_version,
+                            ),
+                        }),
+                        LogApplyMutation::PutNodeSubnet(LogApplyNodeSubnetRow {
+                            node_name: "cp-1".to_string(),
+                            subnet: "10.42.1.0/24".to_string(),
+                            subnet_base_int: u32::from(std::net::Ipv4Addr::new(10, 42, 1, 0)),
+                            gateway_ip: "10.42.1.1".to_string(),
+                            node_ip: "10.0.0.1".to_string(),
+                            mode: "root".to_string(),
+                            hostport_range: None,
+                        }),
+                        LogApplyMutation::PutNodeDataplane(LogApplyNodeDataplaneRow {
+                            node_name: "cp-1".to_string(),
+                            mode: "root".to_string(),
+                            encryption: "enabled".to_string(),
+                            public_key: Some(
+                                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+                            ),
+                            endpoint: "10.0.0.1".to_string(),
+                            port: Some(51820),
+                        }),
+                        LogApplyMutation::PutPodCleanupIntent(LogApplyPodCleanupIntentRow {
+                            node_name: "cp-1".to_string(),
+                            namespace: "captured".to_string(),
+                            pod_name: "cleanup-pod".to_string(),
+                            pod_uid: "cleanup-uid".to_string(),
+                            reason: "NodeLost".to_string(),
+                            resource_version: 7,
+                            created_at_ms: 456,
+                            pod_data: serde_json::json!({
+                                "metadata": {"name": "cleanup-pod", "uid": "cleanup-uid"},
+                            }),
+                        }),
+                        LogApplyMutation::PutAppliedOutbox(applied.clone()),
+                    ],
+                ),
+            ],
             7,
             Some(9),
             Some(
@@ -1674,6 +1722,22 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
         .await
         .unwrap();
 
+    assert!(
+        ClusterResourceRead::get_resource(
+            &source_reads,
+            ResourceGetRequest::new(
+                "v1",
+                "ConfigMap",
+                Some("captured".to_string()),
+                "deleted-during-capture",
+            ),
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "qualified source delete must remove the live row before capture"
+    );
+
     let request = SnapshotCaptureRequest::try_new(
         SnapshotPageLimit::try_new(1).unwrap(),
         Duration::from_secs(30),
@@ -1702,6 +1766,43 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
             "missing capture family {required:?}"
         );
     }
+    let captured_operations = pages
+        .iter()
+        .filter_map(SnapshotCapturePage::operations)
+        .flat_map(|operations| operations.iter())
+        .collect::<Vec<_>>();
+    // Retires `snapshot_replays_resource_deletes_since_rv`: canonical capture
+    // represents a delete as live-row absence plus its exact watch tombstone,
+    // not as the legacy facade's synthetic `DeleteResource` operation.
+    assert!(
+        !captured_operations
+            .iter()
+            .flat_map(|operation| operation.mutations())
+            .any(|mutation| {
+                matches!(
+                    mutation,
+                    LogApplyMutation::PutResource(row)
+                        if row.name == "deleted-during-capture"
+                )
+            }),
+        "capture must not revive a deleted live row"
+    );
+    assert!(
+        captured_operations
+            .iter()
+            .flat_map(|operation| operation.mutations())
+            .any(|mutation| {
+                matches!(
+                    mutation,
+                    LogApplyMutation::PutWatchEvent(event)
+                        if event.event_type == "DELETED"
+                            && event.name == "deleted-during-capture"
+                            && event.event_id == Some(5)
+                            && event.resource_version == 7
+                )
+            }),
+        "capture must retain the exact deleted watch-history event"
+    );
 
     let destination_root = tempfile::tempdir().unwrap();
     let mut destination_opts = OpenOpts::disk(destination_root.path().join("cluster.db"));
@@ -1738,14 +1839,24 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
             vec![SnapshotRestoreOperation::new(
                 1,
                 None,
-                vec![LogApplyMutation::PutResource(resource_row(
-                    "ConfigMap",
-                    Some("captured"),
-                    "divergent",
-                    "divergent-uid",
-                    1,
-                    serde_json::json!({}),
-                ))],
+                vec![
+                    LogApplyMutation::PutResource(resource_row(
+                        "ConfigMap",
+                        Some("captured"),
+                        "divergent",
+                        "divergent-uid",
+                        1,
+                        serde_json::json!({}),
+                    )),
+                    LogApplyMutation::PutResource(resource_row(
+                        "ConfigMap",
+                        Some("captured"),
+                        "deleted-during-capture",
+                        "stale-replacement-uid",
+                        1,
+                        serde_json::json!({}),
+                    )),
+                ],
             )],
             1,
             Some(0),
@@ -1759,6 +1870,21 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
         )
         .await
         .unwrap();
+    assert!(
+        ClusterResourceRead::get_resource(
+            &destination_reads,
+            ResourceGetRequest::new(
+                "v1",
+                "ConfigMap",
+                Some("captured".to_string()),
+                "deleted-during-capture",
+            ),
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "destination fixture must begin with a divergent same-name UID"
+    );
     destination_recovery
         .restore_authoritative_snapshot(snapshot_from_capture(&header, &pages))
         .await
@@ -1777,6 +1903,21 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
             "{name}"
         );
     }
+    assert!(
+        ClusterResourceRead::get_resource(
+            &destination_reads,
+            ResourceGetRequest::new(
+                "v1",
+                "ConfigMap",
+                Some("captured".to_string()),
+                "deleted-during-capture",
+            ),
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "authoritative replacement must retain deleted-resource absence and remove a stale same-name UID"
+    );
     assert!(
         ClusterTopologyRead::get_node_subnet(
             &destination_reads,
@@ -1859,6 +2000,19 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
             durable_mutations
                 .iter()
                 .any(|mutation| matches!(mutation, LogApplyMutation::PutWatchEvent(_))),
+        ),
+        (
+            "deleted-resource watch tombstone",
+            durable_mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    LogApplyMutation::PutWatchEvent(event)
+                        if event.event_type == "DELETED"
+                            && event.name == "deleted-during-capture"
+                            && event.event_id == Some(5)
+                            && event.resource_version == 7
+                )
+            }),
         ),
         (
             "node subnet",

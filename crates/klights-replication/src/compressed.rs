@@ -115,4 +115,22 @@ mod tests {
         let bad = [0x01, 0x02, 0x03];
         assert!(decode(&bad).is_err());
     }
+
+    #[test]
+    fn framed_json_rejects_missing_tag_truncation_and_invalid_json() {
+        // The snapshot wire has a framing tag, not a checksum.  Every bad
+        // framing/input class must fail before the snapshot decoder can
+        // interpret it as a valid restore payload.
+        for (name, bytes) in [
+            ("missing tag", Vec::new()),
+            ("unknown tag", vec![0xff]),
+            ("truncated zstd", vec![TAG_ZSTD, 0x28]),
+            ("invalid raw json", vec![TAG_RAW, b'{']),
+        ] {
+            assert!(
+                decode_json::<serde_json::Value>(&bytes).is_err(),
+                "{name} must be rejected"
+            );
+        }
+    }
 }

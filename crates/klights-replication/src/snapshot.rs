@@ -1089,6 +1089,29 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn restore_adapter_rejects_bad_framing_without_calling_persistence() {
+        for (name, bytes) in [
+            ("missing tag", Vec::new()),
+            ("unknown tag", vec![0xff]),
+            ("truncated zstd", vec![crate::compressed::TAG_ZSTD, 0x28]),
+            ("invalid raw json", vec![0x00, b'{']),
+        ] {
+            let persistence = Arc::new(RecordingPersistence::default());
+            let adapter = RaftSnapshotRestoreAdapter::new(persistence.clone(), supervisor());
+            assert!(
+                crate::state_machine::RaftSnapshotRestore::restore_snapshot(&adapter, bytes)
+                    .await
+                    .is_err(),
+                "{name} must not decode as a snapshot"
+            );
+            assert!(
+                persistence.snapshot.lock().unwrap().is_none(),
+                "{name} must not reach authoritative persistence"
+            );
+        }
+    }
+
     #[test]
     fn legacy_snapshot_alias_and_missing_allocator_fields_remain_decodable() {
         let legacy = serde_json::json!({

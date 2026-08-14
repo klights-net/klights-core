@@ -13,8 +13,7 @@ pub struct IntegrationRaftComposition {
 }
 
 impl IntegrationRaftComposition {
-    pub const SNAPSHOT_EMIT_PAGE_SIZE: usize =
-        crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE;
+    pub const SNAPSHOT_CAPTURE_PAGE_SIZE: usize = klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE;
 
     pub fn new(db: Arc<crate::datastore::sqlite::Datastore>) -> Self {
         Self { db }

@@ -376,7 +376,7 @@ mod tests {
             .await
             .unwrap();
         seed_snapshot_identity(&backend).await;
-        let entries = (1..=IntegrationRaftComposition::SNAPSHOT_EMIT_PAGE_SIZE as i64)
+        let entries = (1..=IntegrationRaftComposition::SNAPSHOT_CAPTURE_PAGE_SIZE as i64)
             .map(|event_id| {
                 klights_cluster_core::SnapshotRestoreOperation::new(
                     1_000 + event_id,
@@ -615,7 +615,7 @@ mod tests {
             .await
             .unwrap();
         seed_snapshot_identity(&destination).await;
-        let entries = (1..=IntegrationRaftComposition::SNAPSHOT_EMIT_PAGE_SIZE as i64)
+        let entries = (1..=IntegrationRaftComposition::SNAPSHOT_CAPTURE_PAGE_SIZE as i64)
             .map(|event_id| {
                 klights_cluster_core::SnapshotRestoreOperation::new(
                     event_id,

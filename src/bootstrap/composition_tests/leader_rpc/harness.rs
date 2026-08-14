@@ -396,40 +396,6 @@ impl IntegrationLeaderRpcComposition {
         .await
     }
 
-    pub async fn snapshot(
-        &self,
-        after_rv: i64,
-    ) -> anyhow::Result<Vec<klights_cluster_core::SnapshotRestoreOperation>> {
-        let mut sink = IntegrationLeaderRpcVecSnapshotSink::default();
-        crate::datastore::snapshot_export::stream_snapshot_commits(
-            self.db.as_ref(),
-            after_rv,
-            &mut sink,
-        )
-        .await?;
-        Ok(sink.operations)
-    }
-
-    pub async fn stream_snapshot(
-        &self,
-        after_rv: i64,
-        sender: tokio::sync::mpsc::Sender<
-            Result<klights_cluster_core::SnapshotRestoreOperation, tonic::Status>,
-        >,
-    ) -> anyhow::Result<()> {
-        let mut sink = IntegrationLeaderRpcChannelSnapshotSink {
-            sender: Some(sender),
-        };
-        crate::datastore::snapshot_export::stream_snapshot_commits(
-            self.db.as_ref(),
-            after_rv,
-            &mut sink,
-        )
-        .await?;
-        sink.sender.take();
-        Ok(())
-    }
-
     pub async fn register_node_at_addresses(
         &self,
         node_name: &str,
@@ -747,51 +713,6 @@ impl IntegrationLeaderRpcComposition {
 
 struct IntegrationLeaderRpcMetadataRead {
     current_rv: i64,
-}
-
-#[derive(Default)]
-struct IntegrationLeaderRpcVecSnapshotSink {
-    operations: Vec<klights_cluster_core::SnapshotRestoreOperation>,
-}
-
-impl crate::datastore::snapshot_export::SnapshotCommitSink for IntegrationLeaderRpcVecSnapshotSink {
-    async fn push(
-        &mut self,
-        operation: klights_cluster_core::SnapshotRestoreOperation,
-    ) -> anyhow::Result<()> {
-        self.operations.push(operation);
-        Ok(())
-    }
-}
-
-struct IntegrationLeaderRpcChannelSnapshotSink {
-    sender: Option<
-        tokio::sync::mpsc::Sender<
-            Result<klights_cluster_core::SnapshotRestoreOperation, tonic::Status>,
-        >,
-    >,
-}
-
-impl crate::datastore::snapshot_export::SnapshotCommitSink
-    for IntegrationLeaderRpcChannelSnapshotSink
-{
-    async fn push(
-        &mut self,
-        operation: klights_cluster_core::SnapshotRestoreOperation,
-    ) -> anyhow::Result<()> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Ok(());
-        };
-        sender
-            .send(Ok(operation))
-            .await
-            .map_err(|error| anyhow::anyhow!("snapshot test receiver dropped: {error}"))
-    }
-
-    fn finish(&mut self) -> anyhow::Result<()> {
-        self.sender.take();
-        Ok(())
-    }
 }
 
 impl klights_cluster_store::ClusterMetadataRead for IntegrationLeaderRpcMetadataRead {
