@@ -2,6 +2,7 @@ use crate::current::metrics::{
     METRICS_API_VERSION, MetricsObjectBuilder, PodMetric, snapshot_for_resources,
 };
 use crate::current::*;
+use crate::generic_read::ListResourceVersionMatch;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -22,15 +23,12 @@ async fn list_node_metrics(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = crate::current::resource_query_ports::list_resources(
-        state.resource_mutation().resource_query.as_ref(),
+    let list = list_metric_resources(
+        &state,
         "v1",
         "Node",
-        None,
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
-        query.limit,
-        query.continue_token.as_deref(),
+        klights_leader_api::ResourceListScope::Cluster,
+        query,
     )
     .await?;
     let snapshot =
@@ -60,6 +58,70 @@ async fn list_node_metrics(
         ),
         "items": items,
     })))
+}
+
+/// Metrics is a Kubernetes-facing LIST endpoint even though it projects
+/// stored resources into metrics objects.  Its outer continuation therefore
+/// follows the same public envelope as generated resource LISTs; only root
+/// sees the typed private cursor.
+async fn list_metric_resources(
+    state: &Arc<ApiState>,
+    api_version: &str,
+    kind: &str,
+    scope: klights_leader_api::ResourceListScope,
+    query: ListQuery,
+) -> Result<klights_leader_api::ResourceListResult, AppError> {
+    let operation_now = state.operational().clock.now().unix_timestamp();
+    let normalized_limit = query.normalized_limit()?;
+    let (continue_token, continuation_mode) =
+        crate::generic_read::process_generic_list_continue_token(query.continue_token.clone())?;
+    let resource_version_match = match query.resolve_resource_version_match(
+        continuation_mode != klights_leader_api::ResourceListContinuationMode::Initial,
+    )? {
+        ListResourceVersionMatch::Any => klights_leader_api::ResourceListResourceVersionMatch::Any,
+        ListResourceVersionMatch::NotOlderThan(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv)
+        }
+        ListResourceVersionMatch::Exact(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::Exact(rv)
+        }
+    };
+    let list = state
+        .resource_mutation()
+        .resource_query
+        .list_resources(
+            klights_leader_api::ResourceListRequest::try_new_with_continuation_mode(
+                api_version,
+                kind,
+                scope,
+                query.label_selector,
+                query.field_selector,
+                normalized_limit,
+                continue_token,
+                continuation_mode,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?
+            .with_resource_version_match(resource_version_match)?,
+        )
+        .await
+        .map_err(|error| crate::generic_read::generic_list_query_error(error, operation_now))?;
+    let (items, resource_version, replay_position, continue_token, remaining_item_count) =
+        list.into_parts();
+    klights_leader_api::ResourceListResult::try_new(
+        items,
+        resource_version,
+        replay_position,
+        continue_token.map(|inner| {
+            crate::generic_read::encode_generic_list_continue_token(
+                &inner,
+                resource_version,
+                operation_now,
+                crate::generic_read::PublicListContinuationMode::Pinned,
+            )
+        }),
+        remaining_item_count,
+    )
+    .map_err(AppError::from)
 }
 
 async fn get_node_metrics(
@@ -111,19 +173,13 @@ async fn list_pod_metrics_for_namespace(
     namespace: Option<String>,
     query: ListQuery,
 ) -> Result<Json<Value>, AppError> {
-    let list = crate::current::pod_repository_ports::list_pods(
-        state.resource_mutation().pod_repository.as_ref(),
-        namespace.as_deref(),
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
-        query.limit,
-        query.continue_token.as_deref(),
-    )
-    .await
-    .map_err(AppError::from)?;
+    let scope = namespace
+        .map(klights_leader_api::ResourceListScope::Namespace)
+        .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces);
+    let list = list_metric_resources(&state, "v1", "Pod", scope, query).await?;
     let snapshot = snapshot_for_resources(
         state.pod_node_subresources().node_metrics.as_ref(),
-        &list.items,
+        list.items(),
     )
     .await;
     let builder =
@@ -131,7 +187,7 @@ async fn list_pod_metrics_for_namespace(
             klights_auth::clock::chrono_utc(state.operational().clock.now()),
         ));
     let items: Vec<Value> = list
-        .items
+        .items()
         .iter()
         .filter_map(|pod| {
             PodMetric::from_resource(pod, &snapshot)
@@ -142,7 +198,11 @@ async fn list_pod_metrics_for_namespace(
     Ok(Json(json!({
         "apiVersion": METRICS_API_VERSION,
         "kind": "PodMetricsList",
-        "metadata": list_metadata(list.resource_version, list.continue_token, list.remaining_item_count),
+        "metadata": list_metadata(
+            list.resource_version(),
+            list.continue_token().map(str::to_string),
+            list.remaining_item_count(),
+        ),
         "items": items,
     })))
 }

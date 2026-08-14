@@ -39,7 +39,7 @@ pub(in crate::current) async fn delete_collection_apiservices(
         state.resource_mutation().resource_command.as_ref(),
         "apiregistration.k8s.io/v1",
         "APIService",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;

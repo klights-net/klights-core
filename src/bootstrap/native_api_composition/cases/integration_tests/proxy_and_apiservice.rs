@@ -6988,6 +6988,7 @@ async fn test_crd_non_storage_field_selector_filters_on_converted_objects() {
         .to_string();
 
     for (name, host, port_value) in [
+        ("w0", "host2", "443"),
         ("w1", "host1", "80"),
         ("w2", "host1", "8080"),
         ("w3", "host2", "80"),
@@ -7039,12 +7040,13 @@ async fn test_crd_non_storage_field_selector_filters_on_converted_objects() {
         .unwrap_or_default();
     assert_eq!(
         unfiltered_items.len(),
-        3,
+        4,
         "converted v1 list without selector must include all created objects, response: {}",
         unfiltered_list_value
     );
 
     let list_resp = app
+        .clone()
         .clone()
         .oneshot(
             Request::builder()
@@ -7073,6 +7075,56 @@ async fn test_crd_non_storage_field_selector_filters_on_converted_objects() {
     );
     assert_eq!(items[0]["apiVersion"], "example.com/v1");
     assert_eq!(items[0]["hostPort"], "host1:80");
+
+    // The storage representation is v1 (`hostPort`), while this requested
+    // served version exposes `host`. A bounded v2 selector must be evaluated
+    // after conversion and its page-two boundary must not skip w2.
+    let moved_selector_page1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/example.com/v2/namespaces/default/widgets?fieldSelector=host%3Dhost1&limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved_selector_page1.status(), StatusCode::OK);
+    let moved_selector_page1: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(moved_selector_page1.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        moved_selector_page1["items"][0]["metadata"]["name"], "w1",
+        "moved-path selector page one: {moved_selector_page1}"
+    );
+    let moved_selector_continue = moved_selector_page1["metadata"]["continue"]
+        .as_str()
+        .expect("bounded moved-path selector must expose a continuation");
+    let moved_selector_page2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/example.com/v2/namespaces/default/widgets?fieldSelector=host%3Dhost1&limit=1&continue={moved_selector_continue}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved_selector_page2.status(), StatusCode::OK);
+    let moved_selector_page2: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(moved_selector_page2.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(moved_selector_page2["items"][0]["metadata"]["name"], "w2");
 
     let watch_resp = app
         .clone()
@@ -8812,8 +8864,8 @@ async fn test_namespace_list_label_selector_pagination_filters_before_chunking()
     assert_eq!(page1_names, vec!["ns-a", "ns-b"]);
     assert_eq!(
         page1_json["metadata"]["remainingItemCount"].as_i64(),
-        Some(1),
-        "filtered result set has one item left after page 1"
+        None,
+        "filtered bounded pages omit an inexact remaining count"
     );
 
     let continue_token = page1_json["metadata"]["continue"]
@@ -9561,13 +9613,9 @@ async fn custom_resource_list_includes_continue_for_paginated_non_conversion_crd
         "continue token must not be empty"
     );
 
-    // Verify remainingItemCount is present
-    let remaining = list
-        .pointer("/metadata/remainingItemCount")
-        .and_then(|v| v.as_i64());
     assert!(
-        remaining.is_some(),
-        "paginated CRD list should include metadata.remainingItemCount"
+        list.pointer("/metadata/remainingItemCount").is_none(),
+        "cross-version pagination omits an inexact remainingItemCount"
     );
 }
 
@@ -9730,6 +9778,152 @@ async fn custom_resource_list_continue_returns_next_page_for_non_conversion_crd(
     );
 }
 
+/// A CRD field selector is applied after conversion/defaulting.  The root
+/// therefore returns bounded candidate pages; native LIST must keep consuming
+/// them until it fills the public limit, rather than returning the first
+/// partial matching batch.  This crosses two 64-candidate boundaries.
+#[tokio::test]
+async fn custom_resource_field_selector_fills_limit_across_candidate_batches() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let app = state.router();
+    let namespace = "candidate-page-fill";
+    let plural = "candidatewidgets";
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "candidatewidgets.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"kind": "CandidateWidget", "plural": plural, "singular": "candidatewidget"},
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "selectableFields": [{"jsonPath": ".match"}],
+                "schema": {"openAPIV3Schema": {"type": "object", "properties": {"match": {"type": "string"}}}}
+            }]
+        }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&crd).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":namespace}})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let mut names = (0..64)
+        .map(|index| (format!("a-{index:03}"), "no"))
+        .collect::<Vec<_>>();
+    names.push(("b-match-one".to_string(), "yes"));
+    names.extend((0..64).map(|index| (format!("c-{index:03}"), "no")));
+    names.push(("z-match-two".to_string(), "yes"));
+    for (name, selector_value) in names {
+        let object = json!({
+            "apiVersion": "example.com/v1",
+            "kind": "CandidateWidget",
+            "metadata": {"name": name, "namespace": namespace},
+            "match": selector_value,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/apis/example.com/v1/namespaces/{namespace}/{plural}"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&object).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "create {name}");
+    }
+
+    // Capture an explicit historical contract, then force the converted
+    // selector scan across its internal 64-candidate boundary. Subsequent
+    // root batches must use their pinned cursor, not replay Exact again.
+    let snapshot = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/{namespace}/{plural}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), StatusCode::OK);
+    let snapshot: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(snapshot.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let resource_version = snapshot["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("snapshot list must carry resourceVersion");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/{namespace}/{plural}?fieldSelector=match%3Dyes&limit=2&resourceVersion={resource_version}&resourceVersionMatch=Exact"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let matched = page["items"]
+        .as_array()
+        .expect("CRD LIST items must be an array")
+        .iter()
+        .map(|item| item["metadata"]["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(matched, ["b-match-one", "z-match-two"]);
+    assert!(
+        page.pointer("/metadata/continue").is_none(),
+        "the two matching items exhaust this selected collection: {page:#?}"
+    );
+}
+
 /// Non-conversion CRD list continue tokens must use the same encoded
 /// Kubernetes-compatible token format as built-in resources, not raw names.
 #[tokio::test]
@@ -9848,23 +10042,32 @@ async fn custom_resource_list_continue_token_is_encoded_for_non_conversion_crd()
         .decode(token)
         .expect("continue token must be base64url JSON");
     let decoded: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-    assert_eq!(decoded["n"], json!("ew-1"));
+    let inner = decoded["n"]
+        .as_str()
+        .expect("outer continuation must preserve the opaque root cursor");
+    let root_cursor = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(inner)
+        .expect("root continuation must be base64url JSON");
+    let root_cursor: serde_json::Value = serde_json::from_slice(&root_cursor).unwrap();
+    assert_eq!(root_cursor["after_name"], json!("ew-1"));
+    assert!(
+        root_cursor["crd_plan"].is_object(),
+        "a CRD continuation must bind a compact immutable definition reference"
+    );
     assert!(decoded["rv"].as_i64().unwrap_or(0) > 0);
     assert!(decoded["ts"].as_i64().is_some());
 }
 
-/// Expired CRD list continue tokens must return the Kubernetes 410
-/// ResourceExpired response instead of being treated as raw names.
+/// A compacted CRD cursor must return a typed 410 recovery cursor, and that
+/// recovery cursor must execute as a fresh page rather than restart silently.
 #[tokio::test]
 async fn custom_resource_list_expired_continue_returns_resource_expired() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use base64::Engine as _;
     use serde_json::json;
     use tower::ServiceExt;
 
-    let state = build_test_app_state().await;
-    let app = state.router();
+    let (app, db) = build_test_router_with_db().await;
 
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
@@ -9900,27 +10103,113 @@ async fn custom_resource_list_expired_continue_returns_resource_expired() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let expired_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        - k8s_native_service::generic_read::CONTINUE_TOKEN_TTL_SECS
-        - 1;
-    let token_data = k8s_native_service::generic_read::ContinueTokenData {
-        n: "expired-0".to_string(),
-        rv: 1,
-        ts: Some(expired_ts),
-        session: false,
-    };
-    let expired_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&token_data).unwrap());
-
-    let list_resp = app
+    let namespace = "crd-expired";
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":namespace}})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for name in ["expired-0", "expired-1", "expired-2"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/apis/example.com/v1/namespaces/{namespace}/expiredwidgets"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "apiVersion": "example.com/v1", "kind": "ExpiredWidget",
+                            "metadata": {"name": name, "namespace": namespace},
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "create {name}");
+    }
+    let first = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/apis/example.com/v1/namespaces/default/expiredwidgets?limit=1&continue={expired_token}"
+                    "/apis/example.com/v1/namespaces/{namespace}/expiredwidgets?limit=1"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_page: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    let first_token = first_page["metadata"]["continue"]
+        .as_str()
+        .expect("first CRD page must be paginated")
+        .to_string();
+    let first_resource_version = first_page["items"][0]["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("first CRD item must carry a resource version")
+        .parse()
+        .expect("resource version must be numeric");
+    let first_update = db
+        .update_resource(
+            "example.com/v1",
+            "ExpiredWidget",
+            Some(namespace),
+            "expired-0",
+            json!({
+                "apiVersion": "example.com/v1", "kind": "ExpiredWidget",
+                "metadata": {"name": "expired-0", "namespace": namespace},
+                "spec": {"compacted": true},
+            }),
+            first_resource_version,
+        )
+        .await
+        .unwrap();
+    // Keep only the second post-snapshot mutation. Reversing it can recover
+    // the first update but not the original LIST snapshot, so the typed
+    // positioned reader must report expiry instead of drifting forward.
+    db.update_resource(
+        "example.com/v1",
+        "ExpiredWidget",
+        Some(namespace),
+        "expired-0",
+        json!({
+            "apiVersion": "example.com/v1", "kind": "ExpiredWidget",
+            "metadata": {"name": "expired-0", "namespace": namespace},
+            "spec": {"compacted": "again"},
+        }),
+        first_update.resource_version,
+    )
+    .await
+    .unwrap();
+    db.gc_watch_events(1, 1000).await.unwrap();
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/{namespace}/expiredwidgets?limit=1&continue={first_token}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -9934,12 +10223,52 @@ async fn custom_resource_list_expired_continue_returns_resource_expired() {
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["reason"], json!("Expired"));
     assert_eq!(status["code"], json!(410));
+    let recovery = status
+        .pointer("/metadata/continue")
+        .and_then(|v| v.as_str())
+        .expect("typed root expiry must include a recovery continuation token");
+    let protobuf_expired = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/{namespace}/expiredwidgets?limit=1&continue={first_token}"
+                ))
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protobuf_expired.status(), StatusCode::GONE);
+    let protobuf_status = k8s_native_service::test_protobuf::decode_protobuf(
+        &axum::body::to_bytes(protobuf_expired.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .expect("protobuf Accept must preserve typed 410 Status");
+    assert_eq!(protobuf_status["reason"], "Expired");
     assert!(
-        status
-            .pointer("/metadata/continue")
-            .and_then(|v| v.as_str())
-            .is_some(),
-        "410 response must include an inconsistent continuation token"
+        protobuf_status.pointer("/metadata/continue").is_some(),
+        "protobuf 410 must preserve the typed recovery cursor"
+    );
+    let recovery_response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/{namespace}/expiredwidgets?limit=1&continue={recovery}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery_response.status(),
+        StatusCode::OK,
+        "the typed CRD recovery cursor must be executable"
     );
 }
 

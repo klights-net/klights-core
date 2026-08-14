@@ -104,7 +104,7 @@ async fn find_apiservice_backend_uncached<S: DiscoveryState + ?Sized>(
         state.resource_query(),
         "apiregistration.k8s.io/v1",
         "APIService",
-        None,
+        ResourceListScope::Cluster,
     )
     .await?;
 

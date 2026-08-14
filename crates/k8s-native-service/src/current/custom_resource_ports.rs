@@ -49,24 +49,6 @@ impl CustomResourceWatchTarget {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum CustomResourceListSnapshot {
-    Current,
-    Expired,
-    List(ResourceListResult),
-}
-
-pub struct CustomResourceSnapshotRequest {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub label_selector: Option<String>,
-    pub field_selector: Option<String>,
-    pub limit: Option<i64>,
-    pub continue_token: Option<String>,
-    pub resource_version: i64,
-}
-
 pub type CustomResourceReadFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 pub type CustomResourceWaitFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -78,17 +60,9 @@ pub trait CustomResourceProjection: Send + Sync {
     ) -> futures::future::BoxFuture<'_, Result<Vec<Resource>, klights_leader_api::LeaderWatchError>>;
 }
 
-/// Focused custom-resource snapshot/watch capability.
-///
-/// Ordinary live reads and writes use the existing leader query/command
-/// contracts. This port contains only operations that require an atomic local
-/// LIST-to-WATCH boundary or historical snapshot reconstruction.
+/// Focused custom-resource watch capability. Ordinary LIST snapshot reads use
+/// the typed leader/root continuation path rather than a parallel public port.
 pub trait CustomResourceReadPort: Send + Sync {
-    fn snapshot_resources_at_rv(
-        &self,
-        request: CustomResourceSnapshotRequest,
-    ) -> CustomResourceReadFuture<'_, CustomResourceListSnapshot>;
-
     fn list_resources_for_watch_targets(
         &self,
         targets: Vec<CustomResourceWatchTarget>,

@@ -225,14 +225,14 @@ pub async fn delete_non_pod_collection(
     command: &dyn LeaderResourceCommand,
     api_version: &str,
     kind: &str,
-    namespace: Option<&str>,
+    scope: klights_leader_api::ResourceListScope,
     label_selector: Option<&str>,
 ) -> Result<(), AppError> {
     let resources = crate::generic_read::list_resources(
         query,
         api_version,
         kind,
-        namespace,
+        scope.clone(),
         label_selector,
         None,
         None,
@@ -244,7 +244,7 @@ pub async fn delete_non_pod_collection(
             command,
             api_version,
             kind,
-            namespace,
+            scope.namespace(),
             &resource.name,
             ResourcePreconditions::from_resource(&resource),
         )
@@ -413,7 +413,7 @@ mod tests {
             &command,
             "v1",
             "ConfigMap",
-            Some("default"),
+            klights_leader_api::ResourceListScope::Namespace("default".to_string()),
             None,
         )
         .await
@@ -439,7 +439,7 @@ mod tests {
             &RejectingCommand,
             "v1",
             "ConfigMap",
-            Some("default"),
+            klights_leader_api::ResourceListScope::Namespace("default".to_string()),
             None,
         )
         .await

@@ -134,7 +134,7 @@ impl klights_kubelet::pod_events::PodEventQuery for LeaderPodEventQuery<'_> {
             .list_resources(klights_leader_api::ResourceListRequest::try_new(
                 "v1",
                 "Event",
-                Some(namespace.to_string()),
+                klights_leader_api::ResourceListScope::Namespace(namespace.to_string()),
                 None,
                 None,
                 None,

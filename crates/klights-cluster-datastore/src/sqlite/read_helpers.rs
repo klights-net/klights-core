@@ -19,12 +19,14 @@ pub fn row_to_namespaced_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<R
     let data_bytes: Vec<u8> = row.get(7)?;
     let data: Value = serde_json::from_slice(&data_bytes)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let name: String = row.get(4)?;
+    super::snapshot::record_physical_resource_decode(&name);
     Ok(Resource {
         id: row.get(0)?,
         api_version: row.get(1)?,
         kind: row.get(2)?,
         namespace: Some(row.get(3)?),
-        name: row.get(4)?,
+        name,
         resource_version: row.get(5)?,
         uid: row.get(6)?,
         data: std::sync::Arc::new(data),
@@ -35,12 +37,14 @@ pub fn row_to_cluster_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reso
     let data_bytes: Vec<u8> = row.get(6)?;
     let data: Value = serde_json::from_slice(&data_bytes)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let name: String = row.get(3)?;
+    super::snapshot::record_physical_resource_decode(&name);
     Ok(Resource {
         id: row.get(0)?,
         api_version: row.get(1)?,
         kind: row.get(2)?,
         namespace: None,
-        name: row.get(3)?,
+        name,
         resource_version: row.get(4)?,
         uid: row.get(5)?,
         data: std::sync::Arc::new(data),

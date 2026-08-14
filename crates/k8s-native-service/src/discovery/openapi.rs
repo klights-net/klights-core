@@ -34,7 +34,7 @@ pub async fn openapi_v3_discovery_with_crds(
         query,
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
-        None,
+        ResourceListScope::Cluster,
     )
     .await
     .map(klights_leader_api::ResourceListResult::into_items)
@@ -598,7 +598,7 @@ pub async fn openapi_v2(query: &dyn klights_leader_api::LeaderResourceQuery) -> 
         query,
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
-        None,
+        ResourceListScope::Cluster,
     )
     .await
     .map(klights_leader_api::ResourceListResult::into_items)

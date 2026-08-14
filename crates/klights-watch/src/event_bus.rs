@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn watch_signal_from_events_groups_by_topic_and_namespace() {
-        let events = vec![
+        let events = [
             watch_event_for_signal("v1", "Pod", Some("default"), "pod-a", 10),
             watch_event_for_signal("v1", "Pod", Some("default"), "pod-b", 12),
             watch_event_for_signal("v1", "Pod", Some("kube-system"), "pod-c", 11),
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn watch_signal_from_events_chunks_advances_by_group_limit() {
-        let events = vec![
+        let events = [
             watch_event_for_signal("v1", "Pod", Some("ns-a"), "pod-a", 10),
             watch_event_for_signal("v1", "Pod", Some("ns-b"), "pod-b", 11),
             watch_event_for_signal("v1", "Pod", Some("ns-c"), "pod-c", 12),

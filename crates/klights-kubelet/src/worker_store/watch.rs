@@ -8,8 +8,8 @@ use anyhow::{Result, anyhow};
 use futures::StreamExt as _;
 use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_leader_api::{
-    LeaderWatchError, ResourceEvent, ResourceListRequest, ResourceQueryConsistency, WatchRequest,
-    WatchResumeCursor,
+    LeaderWatchError, ResourceEvent, ResourceListRequest, ResourceListScope,
+    ResourceQueryConsistency, WatchRequest, WatchResumeCursor,
 };
 use klights_watch::{
     EventType, WatchEvent, WatchSignal, WatchSignalSubscribe, WatchTarget, WatchTargetScope,
@@ -144,7 +144,7 @@ impl WorkerStoreAdapter {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Vec<klights_supervisor::SupervisedJoinHandle<()>>> {
         let mut handles = Vec::new();
-        for req in self.worker_watch_requests() {
+        for (req, scope) in self.worker_watch_requests() {
             let this = self.clone();
             let cancel = cancel.clone();
             let spawn_supervisor = supervisor.clone();
@@ -155,7 +155,8 @@ impl WorkerStoreAdapter {
                         klights_supervisor::TaskCategory::Network,
                         "worker_store_watch_mirror",
                         async move {
-                            this.run_watch_mirror(req, mirror_supervisor, cancel).await;
+                            this.run_watch_mirror(req, scope, mirror_supervisor, cancel)
+                                .await;
                         },
                     )
                     .await?,
@@ -164,8 +165,8 @@ impl WorkerStoreAdapter {
         Ok(handles)
     }
 
-    fn worker_watch_requests(&self) -> Vec<WatchRequest> {
-        let mut reqs = vec![
+    fn worker_watch_requests(&self) -> Vec<(WatchRequest, ResourceListScope)> {
+        let mut reqs = vec![(
             WatchRequest::try_new(
                 "v1",
                 "Pod",
@@ -176,17 +177,28 @@ impl WorkerStoreAdapter {
                 None,
             )
             .expect("worker Pod watch identity is valid"),
-        ];
-        for (api_version, kind, namespace) in [
-            ("v1", "Namespace", None),
-            ("v1", "ConfigMap", None),
-            ("v1", "Secret", None),
-            ("v1", "PersistentVolumeClaim", None),
-            ("v1", "PersistentVolume", None),
-            ("v1", "Node", None),
-            ("coordination.k8s.io/v1", "Lease", Some("kube-node-lease")),
+            ResourceListScope::AllNamespaces,
+        )];
+        for (api_version, kind, namespace, scope) in [
+            ("v1", "Namespace", None, ResourceListScope::Cluster),
+            ("v1", "ConfigMap", None, ResourceListScope::AllNamespaces),
+            ("v1", "Secret", None, ResourceListScope::AllNamespaces),
+            (
+                "v1",
+                "PersistentVolumeClaim",
+                None,
+                ResourceListScope::AllNamespaces,
+            ),
+            ("v1", "PersistentVolume", None, ResourceListScope::Cluster),
+            ("v1", "Node", None, ResourceListScope::Cluster),
+            (
+                "coordination.k8s.io/v1",
+                "Lease",
+                Some("kube-node-lease"),
+                ResourceListScope::Namespace("kube-node-lease".to_string()),
+            ),
         ] {
-            reqs.push(
+            reqs.push((
                 WatchRequest::try_new(
                     api_version,
                     kind,
@@ -197,7 +209,8 @@ impl WorkerStoreAdapter {
                     None,
                 )
                 .expect("worker mirror watch identity is valid"),
-            );
+                scope,
+            ));
         }
         reqs
     }
@@ -205,6 +218,7 @@ impl WorkerStoreAdapter {
     async fn run_watch_mirror(
         self: Arc<Self>,
         req: WatchRequest,
+        scope: ResourceListScope,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         cancel: tokio_util::sync::CancellationToken,
     ) {
@@ -223,7 +237,12 @@ impl WorkerStoreAdapter {
             }
             if next_resource_version.is_none() {
                 match self
-                    .reconcile_watch_snapshot(&req, &mut state, selector_membership.as_mut())
+                    .reconcile_watch_snapshot(
+                        &req,
+                        scope.clone(),
+                        &mut state,
+                        selector_membership.as_mut(),
+                    )
                     .await
                 {
                     Ok((resource_version, watch_replay_position)) => {
@@ -359,15 +378,17 @@ impl WorkerStoreAdapter {
     pub async fn run_watch_mirror_for_test(
         self: Arc<Self>,
         req: WatchRequest,
+        scope: ResourceListScope,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         cancel: tokio_util::sync::CancellationToken,
     ) {
-        self.run_watch_mirror(req, supervisor, cancel).await;
+        self.run_watch_mirror(req, scope, supervisor, cancel).await;
     }
 
     async fn reconcile_watch_snapshot(
         &self,
         req: &WatchRequest,
+        scope: ResourceListScope,
         state: &mut ReflectorState,
         selector_membership: &mut dyn klights_watch::WatchTransitionProjector,
     ) -> Result<(i64, Option<WatchReplayPosition>)> {
@@ -376,7 +397,7 @@ impl WorkerStoreAdapter {
             .list_resources(ResourceListRequest::try_new(
                 req.api_version().to_string(),
                 req.kind().to_string(),
-                req.namespace().map(str::to_owned),
+                scope,
                 req.label_selector().map(str::to_owned),
                 req.field_selector().map(str::to_owned),
                 None,
@@ -400,10 +421,11 @@ impl WorkerStoreAdapter {
     pub async fn reconcile_watch_snapshot_for_test(
         &self,
         req: &WatchRequest,
+        scope: ResourceListScope,
         state: &mut ReflectorState,
         selector_membership: &mut dyn klights_watch::WatchTransitionProjector,
     ) -> Result<(i64, Option<WatchReplayPosition>)> {
-        self.reconcile_watch_snapshot(req, state, selector_membership)
+        self.reconcile_watch_snapshot(req, scope, state, selector_membership)
             .await
     }
 

@@ -4386,11 +4386,11 @@ async fn test_list_configmaps_returns_continue_and_remaining_when_more_pages_exi
         "continue token must not be empty"
     );
 
-    // remainingItemCount must be present and >= 1
-    let remaining = page1["metadata"]["remainingItemCount"]
-        .as_i64()
-        .expect("metadata.remainingItemCount must be present when more pages exist");
-    assert!(remaining >= 1, "remainingItemCount must be >= 1");
+    assert_eq!(
+        page1["metadata"]["remainingItemCount"].as_i64(),
+        None,
+        "bounded keyset pages omit the optional inexact remaining count"
+    );
 
     // Fetch second page using continue token
     let req2 = Request::builder()

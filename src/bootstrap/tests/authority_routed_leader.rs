@@ -12,7 +12,7 @@ use klights_kubelet::node_outbox::payload::OutboxOperation;
 use klights_leader_api::node_get_request;
 use klights_leader_api::{
     LeaderResourceCommand, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
-    ResourceCommandResult,
+    ResourceCommandResult, ResourceListScope,
 };
 use klights_replication::authority::{AuthorityPublisher, WatchLeaderAuthority};
 use klights_types::ResourceKey;
@@ -823,7 +823,7 @@ async fn exercise_read_dispatch(proxy: &AuthorityRoutedLeader) {
             ResourceListRequest::try_new(
                 "v1",
                 "Pod",
-                None,
+                ResourceListScope::AllNamespaces,
                 None,
                 None,
                 None,

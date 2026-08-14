@@ -415,6 +415,67 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     assert_eq!(node_list["items"][0]["usage"]["cpu"], "777m");
     assert_eq!(node_list["items"][0]["usage"]["memory"], "262144Ki");
 
+    // Metrics projects a normal resource LIST, but its `continue` remains a
+    // Kubernetes-facing outer token.  It must not leak the root cursor or
+    // reject its own second page after the root continuation migration.
+    db.create_resource(
+        "v1",
+        "Node",
+        None,
+        "node-b",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-b"}
+        }),
+    )
+    .await
+    .unwrap();
+    let first_metrics_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1/nodes?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_metrics_page.status(), StatusCode::OK);
+    let first_metrics_page: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(first_metrics_page.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let metrics_continue = first_metrics_page["metadata"]["continue"]
+        .as_str()
+        .expect("first metrics page must carry public continuation");
+    let second_metrics_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/metrics.k8s.io/v1beta1/nodes?limit=1&continue={metrics_continue}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_status = second_metrics_page.status();
+    let second_body = axum::body::to_bytes(second_metrics_page.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_status,
+        StatusCode::OK,
+        "metrics second page must decode the public outer continuation: {}",
+        String::from_utf8_lossy(&second_body)
+    );
+
     let node_get_resp = app
         .clone()
         .oneshot(
@@ -481,6 +542,104 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
         pod_list["items"][0]["containers"][2]["usage"]["memory"],
         "1024Ki"
     );
+
+    // Pod metrics is a projected Kubernetes LIST. Its page token must remain
+    // the outer envelope, and expiry must stay a typed 410 rather than the
+    // old PodRepository 503 conversion.
+    let pod_b = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("metrics-ns"),
+            "pod-b",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "pod-b", "namespace": "metrics-ns"},
+                "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "busybox"}]}
+            }),
+        )
+        .await
+        .unwrap();
+    let first_pod_metrics_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1/namespaces/metrics-ns/pods?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_pod_metrics_page.status(), StatusCode::OK);
+    let first_pod_metrics_page: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(first_pod_metrics_page.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let pod_metrics_continue = first_pod_metrics_page["metadata"]["continue"]
+        .as_str()
+        .expect("pod metrics page one must expose a public continuation")
+        .to_string();
+    let second_pod_metrics_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/metrics.k8s.io/v1beta1/namespaces/metrics-ns/pods?limit=1&continue={pod_metrics_continue}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_pod_metrics_page.status(), StatusCode::OK);
+
+    // Advance the existing collection after page one before compacting it;
+    // otherwise a cursor at the current head remains reconstructable by
+    // definition.
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("metrics-ns"),
+        "pod-b",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pod-b", "namespace": "metrics-ns"},
+            "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "busybox"}]}
+        }),
+        pod_b.resource_version,
+    )
+    .await
+    .unwrap();
+    db.gc_watch_events(1, 1000).await.unwrap();
+    let expired_pod_metrics_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/metrics.k8s.io/v1beta1/namespaces/metrics-ns/pods?limit=1&continue={pod_metrics_continue}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let expired_status = expired_pod_metrics_page.status();
+    let expired: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(expired_pod_metrics_page.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(expired_status, StatusCode::GONE, "{expired}");
+    assert_eq!(expired["reason"], "Expired");
+    assert!(expired["metadata"]["continue"].is_string());
 
     let pod_get_resp = app
         .oneshot(

@@ -314,6 +314,40 @@ message ListResourcesRequest {
   optional string field_selector = 5;
   optional int64 limit = 6;
   optional string continue_token = 7;
+  ResourceListContinuationMode continuation_mode = 8;
+  ResourceListScope scope = 9;
+  ResourceListResourceVersionMatch resource_version_match = 10;
+  optional int64 requested_resource_version = 11;
+  optional CustomResourceListIdentity custom_resource = 12;
+}
+
+message CustomResourceListIdentity {
+  string group = 1;
+  string plural = 2;
+  string requested_version = 3;
+}
+
+enum ResourceListResourceVersionMatch {
+  RESOURCE_LIST_RESOURCE_VERSION_MATCH_ANY = 0;
+  RESOURCE_LIST_RESOURCE_VERSION_MATCH_NOT_OLDER_THAN = 1;
+  RESOURCE_LIST_RESOURCE_VERSION_MATCH_EXACT = 2;
+}
+
+// Scope remains explicit even when namespace is absent. Unspecified is
+// rejected rather than inferred, preventing cluster/all-namespaces aliasing.
+enum ResourceListScope {
+  RESOURCE_LIST_SCOPE_UNSPECIFIED = 0;
+  RESOURCE_LIST_SCOPE_CLUSTER = 1;
+  RESOURCE_LIST_SCOPE_ALL_NAMESPACES = 2;
+  RESOURCE_LIST_SCOPE_NAMESPACE = 3;
+}
+
+// The continuation bytes stay opaque to RPC. This explicit mode prevents a
+// compacted pinned cursor from being silently retried as a current snapshot.
+enum ResourceListContinuationMode {
+  RESOURCE_LIST_CONTINUATION_INITIAL = 0;
+  RESOURCE_LIST_CONTINUATION_PINNED = 1;
+  RESOURCE_LIST_CONTINUATION_RECOVERY = 2;
 }
 
 message ListResourcesResponse {
@@ -323,6 +357,20 @@ message ListResourcesResponse {
   int64 resource_version = 4;
   optional int64 remaining_item_count = 5;
   optional WatchReplayPosition watch_replay_position = 6;
+  optional ResourceObject frozen_custom_resource_definition = 7;
+  repeated CandidateContinuation candidate_continuations = 8;
+}
+
+message CandidateContinuation {
+  optional string continue_token = 1;
+}
+
+// Structured OutOfRange status details for an expired pinned LIST snapshot.
+// `replacement_continue_token` is an opaque recovery cursor owned by root.
+message ResourceListExpiredDetails {
+  int64 requested_resource_version = 1;
+  int64 oldest_available_resource_version = 2;
+  optional string replacement_continue_token = 3;
 }
 
 // Durable apply-order cursor used for lossless LIST/WATCH handoff.  The

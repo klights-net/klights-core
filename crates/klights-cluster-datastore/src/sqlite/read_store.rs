@@ -16,18 +16,19 @@ use klights_cluster_store::{
     PeerTopologyRequest, PositionedRawWatchHistoryPage, PositionedRawWatchHistoryRead,
     RawWatchEventsAfterPositionRequest, RawWatchEventsSinceRequest, RawWatchHistoryPage,
     RawWatchHistoryRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
-    ResourceGetRequest, ResourceKeyScopeRequest, ResourceListPage, ResourceListQuery,
-    ResourceListRead, ResourceListRequest, ResourceListSnapshot, ResourceReadError,
-    ResourceReadFuture, ResourceScopeSnapshot, ResourceSnapshotAtPositionRequest,
-    ResourceSnapshotRead, ResourceVersionMatch, ResourceWatchTargetsRequest, StoredNodeSubnet,
-    WatchEventsSinceRequest, WatchHistoryError, WatchHistoryFuture, WatchHistoryPage,
-    WatchHistoryRead, WatchHistoryRequest, WatchRangeFuture, WatchRangeStart,
+    ResourceGetRequest, ResourceKeyScopeRequest, ResourceListPage, ResourceListRead,
+    ResourceListRequest, ResourceListSnapshot, ResourceReadError, ResourceReadFuture,
+    ResourceScopeSnapshot, ResourceSnapshotAtPositionRequest, ResourceSnapshotRead,
+    ResourceVersionMatch, ResourceWatchTargetsRequest, StoredNodeSubnet, WatchEventsSinceRequest,
+    WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
+    WatchRangeFuture, WatchRangeStart,
 };
 use klights_supervisor::DbExecutor;
 use klights_types::{HostPortRange, LabelSelector, NodeName, NodePeerMode, PodSubnet};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
+use super::read_helpers::row_to_namespaced_resource;
 use super::read_queries as queries;
 
 /// Passive SQLite implementation of cluster resource/history/topology reads.
@@ -118,7 +119,7 @@ impl ClusterResourceRead for SqliteReadStore {
                 query.field_selector(),
                 (!all_namespaces).then_some(query.limit()).flatten(),
                 (!all_namespaces)
-                    .then(|| query.continuation().map(|cursor| cursor.after().name()))
+                    .then(|| query.start_after().map(ResourceCollectionKey::name))
                     .flatten(),
             );
             let continuation_position = query
@@ -135,6 +136,89 @@ impl ClusterResourceRead for SqliteReadStore {
                 )
             {
                 return self.list_historical(request).await;
+            }
+            // A selector can underfill several physical key windows. Pin the
+            // canonical LIST port to one exact replay position and reuse the
+            // bounded historical state machine instead of letting the legacy
+            // compatibility reader scan every candidate inside one DB closure.
+            if query.limit().is_some_and(|limit| limit > 0)
+                && (query.label_selector().is_some() || query.field_selector().is_some())
+            {
+                let position = self
+                    .read_db_call("cluster-read:selector-list-position", |connection| {
+                        Ok(sqlite_replay_position(connection)?)
+                    })
+                    .await
+                    .map_err(|error| map_resource_error(anyhow::Error::new(error)))?;
+                let snapshot = ResourceListSnapshot::try_new(position)?;
+                let continuation = query
+                    .start_after()
+                    .cloned()
+                    .map(|after| ResourceContinuation::new(after, snapshot));
+                let bounded_query = klights_cluster_store::ResourceListQuery::try_new(
+                    query.label_selector().map(str::to_string),
+                    query.field_selector().map(str::to_string),
+                    query.limit(),
+                    continuation,
+                    ResourceVersionMatch::AtPosition(position),
+                )?;
+                return super::snapshot::bounded_historical_list(
+                    self,
+                    ResourceListRequest::new(
+                        request.api_version().to_string(),
+                        request.kind().to_string(),
+                        request.scope().clone(),
+                        bounded_query,
+                    ),
+                    position,
+                )
+                .await;
+            }
+            if all_namespaces
+                && query.label_selector().is_none()
+                && query.field_selector().is_none()
+                && query.limit().is_some_and(|limit| limit > 0)
+            {
+                let av = request.api_version().to_string();
+                let kind = request.kind().to_string();
+                let after = query.start_after().cloned();
+                let limit = usize::try_from(query.limit().unwrap()).unwrap_or(usize::MAX);
+                let (mut items, position) = self.read_db_call("cluster-read:all-namespaces-keyset", move |connection| {
+                    let mut sql = String::from("SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2");
+                    let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(av), Box::new(kind)];
+                    if let Some(after) = after {
+                        sql.push_str(&format!(" AND (namespace > ?{} OR (namespace = ?{} AND name > ?{}))", values.len()+1, values.len()+2, values.len()+3));
+                        let namespace = after.namespace().unwrap_or_default().to_string();
+                        values.push(Box::new(namespace.clone())); values.push(Box::new(namespace)); values.push(Box::new(after.name().to_string()));
+                    }
+                    sql.push_str(&format!(" ORDER BY namespace, name LIMIT ?{}", values.len()+1));
+                    values.push(Box::new(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)));
+                    let refs = values.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
+                    let mut statement = connection.prepare(&sql)?;
+                    let rows = statement.query_map(refs.as_slice(), row_to_namespaced_resource)?;
+                    let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok((items, sqlite_replay_position(connection)?))
+                }).await.map_err(|error| map_resource_error(anyhow::Error::new(error)))?;
+                let has_more = items.len() > limit;
+                items.truncate(limit);
+                let snapshot = ResourceListSnapshot::try_new(position)?;
+                let continuation = if has_more {
+                    let last = items
+                        .last()
+                        .expect("probe means a bounded page has a last item");
+                    Some(ResourceContinuation::new(
+                        ResourceCollectionKey::new(last.namespace.clone(), last.name.clone()),
+                        snapshot,
+                    ))
+                } else {
+                    None
+                };
+                return Ok(ResourceListRead::Current(ResourceListPage::try_new(
+                    items,
+                    snapshot,
+                    continuation,
+                    None,
+                )?));
             }
             let mut page = SqliteReadStore::list_resources(
                 self,
@@ -156,7 +240,7 @@ impl ClusterResourceRead for SqliteReadStore {
                 });
             }
             if all_namespaces {
-                normalize_legacy_collection_page(&mut page, query.continuation(), true);
+                normalize_legacy_collection_page(&mut page, query.start_after(), true);
             }
             Ok(ResourceListRead::Current(legacy_port_page(
                 page,
@@ -886,116 +970,9 @@ fn decode_json_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
-fn sqlite_target_for_collection(
-    api_version: &str,
-    kind: &str,
-    scope: &ResourceCollectionScope,
-) -> klights_cluster_store::DurableWatchTarget {
-    match scope {
-        ResourceCollectionScope::Cluster => {
-            klights_cluster_store::DurableWatchTarget::cluster(api_version, kind)
-        }
-        ResourceCollectionScope::AllNamespaces => {
-            klights_cluster_store::DurableWatchTarget::namespaced(api_version, kind)
-        }
-        ResourceCollectionScope::Namespace(namespace) => {
-            klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
-                api_version,
-                kind,
-                namespace,
-            )
-        }
-    }
-}
-
-fn sqlite_filter_and_page(
-    items: &mut Vec<Resource>,
-    api_version: &str,
-    kind: &str,
-    query: &klights_cluster_store::ResourceListQuery,
-    boundary: WatchReplayPosition,
-    all_namespaces: bool,
-) -> Result<ResourceListPage> {
-    let labels = query
-        .label_selector()
-        .map(klights_types::parse_label_selector)
-        .transpose()?
-        .unwrap_or_default();
-    let fields = query
-        .field_selector()
-        .map(klights_types::FieldSelector::parse)
-        .transpose()?;
-    items.retain(|resource| {
-        let resource_labels = resource
-            .data
-            .pointer("/metadata/labels")
-            .and_then(Value::as_object);
-        labels
-            .iter()
-            .all(|requirement| requirement.matches(resource_labels))
-            && fields.as_ref().is_none_or(|selector| {
-                selector.matches_resource_with_identity(api_version, kind, resource.data.as_ref())
-            })
-    });
-    if all_namespaces {
-        items.sort_by(|left, right| {
-            (
-                left.namespace.as_deref().unwrap_or_default(),
-                left.name.as_str(),
-            )
-                .cmp(&(
-                    right.namespace.as_deref().unwrap_or_default(),
-                    right.name.as_str(),
-                ))
-        });
-    } else {
-        items.sort_by(|left, right| left.name.cmp(&right.name));
-    }
-    if let Some(cursor) = query.continuation() {
-        if all_namespaces && cursor.after().namespace().is_some() {
-            let after = (
-                cursor.after().namespace().unwrap_or_default(),
-                cursor.after().name(),
-            );
-            items.retain(|item| {
-                (
-                    item.namespace.as_deref().unwrap_or_default(),
-                    item.name.as_str(),
-                ) > after
-            });
-        } else {
-            // Legacy public continue tokens carry only the final name. Keep
-            // their established name-only resume semantics while native
-            // focused-port cursors retain the composite namespace/name key.
-            items.retain(|item| item.name.as_str() > cursor.after().name());
-        }
-    }
-    let limit = query.limit().and_then(|value| usize::try_from(value).ok());
-    let has_more = limit.is_some_and(|value| items.len() > value);
-    if let Some(limit) = limit
-        && items.len() > limit
-    {
-        items.truncate(limit);
-    }
-    let snapshot =
-        ResourceListSnapshot::try_new(boundary).map_err(|error| anyhow!(error.to_string()))?;
-    let continuation = has_more
-        .then(|| {
-            items.last().map(|item| {
-                ResourceContinuation::new(
-                    ResourceCollectionKey::new(item.namespace.clone(), item.name.clone()),
-                    snapshot,
-                )
-            })
-        })
-        .flatten();
-    ResourceListPage::try_new(std::mem::take(items), snapshot, continuation, None)
-        .map_err(|error| anyhow!(error.to_string()))
-}
-
 fn normalize_legacy_collection_page(
     page: &mut SqliteResourceList,
-    continuation: Option<&ResourceContinuation>,
+    continuation: Option<&ResourceCollectionKey>,
     all_namespaces: bool,
 ) {
     if all_namespaces {
@@ -1013,11 +990,8 @@ fn normalize_legacy_collection_page(
         page.items.sort_by(|left, right| left.name.cmp(&right.name));
     }
     if let Some(cursor) = continuation {
-        if all_namespaces && cursor.after().namespace().is_some() {
-            let after = (
-                cursor.after().namespace().unwrap_or_default(),
-                cursor.after().name(),
-            );
+        if all_namespaces && cursor.namespace().is_some() {
+            let after = (cursor.namespace().unwrap_or_default(), cursor.name());
             page.items.retain(|item| {
                 (
                     item.namespace.as_deref().unwrap_or_default(),
@@ -1025,8 +999,7 @@ fn normalize_legacy_collection_page(
                 ) > after
             });
         } else {
-            page.items
-                .retain(|item| item.name.as_str() > cursor.after().name());
+            page.items.retain(|item| item.name.as_str() > cursor.name());
         }
     }
     page.continue_token = None;
@@ -1272,6 +1245,69 @@ impl SqliteReadStore {
         limit: Option<i64>,
         continue_token: Option<&str>,
     ) -> Result<SqliteResourceList> {
+        if label_selector.is_none()
+            && field_selector.is_none()
+            && limit.is_some_and(|value| value > 0)
+        {
+            let limit = usize::try_from(limit.unwrap()).unwrap_or(usize::MAX);
+            let after = continue_token
+                .filter(|token| !token.is_empty())
+                .map(str::to_string);
+            return self
+                .read_db_call("cluster-read:namespaces-keyset", move |connection| {
+                    let transaction = connection.transaction()?;
+                    let mut query = queries::NAMESPACES_LIST_HEAD.to_string();
+                    let mut parameters: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    if let Some(after) = after {
+                        query.push_str(" WHERE name > ?1");
+                        parameters.push(Box::new(after));
+                    }
+                    query.push_str(&format!(
+                        " ORDER BY name ASC LIMIT ?{}",
+                        parameters.len() + 1
+                    ));
+                    parameters.push(Box::new(
+                        i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+                    ));
+                    let references = parameters
+                        .iter()
+                        .map(|parameter| parameter.as_ref())
+                        .collect::<Vec<_>>();
+                    let mut statement = transaction.prepare(&query)?;
+                    let rows = statement.query_map(references.as_slice(), |row| {
+                        let data_bytes: Vec<u8> = row.get(3)?;
+                        let data: Value = serde_json::from_slice(&data_bytes).map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                        Ok(Resource {
+                            id: 0,
+                            api_version: "v1".to_string(),
+                            kind: "Namespace".to_string(),
+                            namespace: None,
+                            name: row.get(0)?,
+                            resource_version: row.get(1)?,
+                            uid: row.get(2)?,
+                            data: std::sync::Arc::new(data),
+                        })
+                    })?;
+                    let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let has_more = items.len() > limit;
+                    items.truncate(limit);
+                    let watch_replay_position =
+                        Self::current_watch_replay_position_in_tx(&transaction)?;
+                    Ok(SqliteResourceList {
+                        continue_token: has_more
+                            .then(|| items.last().map(|item| item.name.clone()))
+                            .flatten(),
+                        items,
+                        resource_version: watch_replay_position.resource_version,
+                        watch_replay_position: Some(watch_replay_position),
+                        remaining_item_count: None,
+                    })
+                })
+                .await
+                .map_err(|error| anyhow!("Failed to page namespaces: {error}"));
+        }
         let mut list = self.list_namespaces(label_selector, field_selector).await?;
         if let Some(token) = continue_token.filter(|token| !token.is_empty()) {
             list.items.retain(|item| item.name.as_str() > token);
@@ -1546,131 +1582,45 @@ impl SqliteReadStore {
         request: ResourceListRequest,
     ) -> std::result::Result<ResourceListRead, ResourceReadError> {
         let query = request.query().clone();
-        let continuation_position = query
-            .continuation()
-            .map(|continuation| continuation.snapshot().position());
-        let requested = match query.resource_version_match() {
-            ResourceVersionMatch::AtPosition(position) => position.resource_version,
-            ResourceVersionMatch::Exact(resource_version) => resource_version,
-            ResourceVersionMatch::Any | ResourceVersionMatch::NotOlderThan(_) => {
-                continuation_position
-                    .expect("historical continuation has a pinned resource position")
-                    .resource_version
-            }
-        };
-        match query.resource_version_match() {
-            ResourceVersionMatch::Exact(resource_version) => {
-                let namespace = match request.scope() {
-                    ResourceCollectionScope::Cluster | ResourceCollectionScope::AllNamespaces => {
-                        None
-                    }
-                    ResourceCollectionScope::Namespace(namespace) => Some(namespace.as_str()),
-                };
-                match self
-                    .snapshot_resources_at_rv(
-                        request.api_version(),
-                        request.kind(),
-                        namespace,
-                        query.clone(),
-                        resource_version,
-                    )
-                    .await
-                    .map_err(map_resource_error)?
-                {
-                    super::snapshot::ExactSnapshotRead::Current => {
-                        let mut page = SqliteReadStore::list_resources(
-                            self,
-                            request.api_version(),
-                            request.kind(),
-                            namespace,
-                            SqliteResourceListQuery::new(
-                                query.label_selector(),
-                                query.field_selector(),
-                                None,
-                                None,
-                            ),
-                        )
-                        .await
-                        .map_err(map_resource_error)?;
-                        normalize_legacy_collection_page(
-                            &mut page,
-                            query.continuation(),
-                            matches!(request.scope(), ResourceCollectionScope::AllNamespaces),
-                        );
-                        Ok(ResourceListRead::Current(legacy_port_page(
-                            page,
-                            None,
-                            query.limit(),
-                        )?))
-                    }
-                    super::snapshot::ExactSnapshotRead::Expired { oldest_available } => {
-                        Ok(ResourceListRead::Expired {
-                            requested,
-                            oldest_available,
-                        })
-                    }
-                    super::snapshot::ExactSnapshotRead::List(page) => {
-                        Ok(ResourceListRead::Historical(page))
-                    }
+        let position = if let Some(continuation) = query.continuation() {
+            continuation.snapshot().position()
+        } else {
+            match query.resource_version_match() {
+                ResourceVersionMatch::Exact(resource_version) => {
+                    self.historical_exact_position(resource_version).await?
+                }
+                ResourceVersionMatch::AtPosition(position) => position,
+                ResourceVersionMatch::Any | ResourceVersionMatch::NotOlderThan(_) => {
+                    return Err(ResourceReadError::InvalidContinuation {
+                        message: "historical LIST requires a pinned continuation".to_string(),
+                    });
                 }
             }
-            ResourceVersionMatch::AtPosition(position) => {
-                self.list_at_position(request, query, requested, position)
-                    .await
-            }
-            ResourceVersionMatch::Any | ResourceVersionMatch::NotOlderThan(_) => {
-                self.list_at_position(
-                    request,
-                    query,
-                    requested,
-                    continuation_position
-                        .expect("historical continuation has a pinned resource position"),
-                )
-                .await
-            }
-        }
+        };
+        super::snapshot::bounded_historical_list(self, request, position).await
     }
 
-    async fn list_at_position(
+    /// Convert an exact Kubernetes resourceVersion to the one durable apply
+    /// position used by every bounded candidate/history window.  This happens
+    /// once, before any public continuation exists; follow-ups use the typed
+    /// snapshot verbatim and cannot drift to a later event at the same RV.
+    async fn historical_exact_position(
         &self,
-        request: ResourceListRequest,
-        query: ResourceListQuery,
-        requested: i64,
-        position: WatchReplayPosition,
-    ) -> std::result::Result<ResourceListRead, ResourceReadError> {
-        let target =
-            sqlite_target_for_collection(request.api_version(), request.kind(), request.scope());
-        match self
-            .snapshot_resources_at_position(
-                &[target],
-                query.label_selector(),
-                query.field_selector(),
-                position,
-            )
-            .await
-            .map_err(map_resource_error)?
-        {
-            ResourceSnapshotRead::Current => Err(ResourceReadError::Conflict {
-                message: "positioned snapshot unexpectedly requested a current relist".to_string(),
-            }),
-            ResourceSnapshotRead::Expired => Err(ResourceReadError::Expired {
-                requested,
-                oldest_available: 0,
-            }),
-            ResourceSnapshotRead::Historical(snapshot) => {
-                let mut items = snapshot.into_items();
-                let page = sqlite_filter_and_page(
-                    &mut items,
-                    request.api_version(),
-                    request.kind(),
-                    &query,
-                    position,
-                    matches!(request.scope(), ResourceCollectionScope::AllNamespaces),
-                )
-                .map_err(map_resource_error)?;
-                Ok(ResourceListRead::Historical(page))
-            }
-        }
+        resource_version: i64,
+    ) -> std::result::Result<WatchReplayPosition, ResourceReadError> {
+        self.read_db_call(
+            "cluster-read:historical-exact-position",
+            move |connection| {
+                let head = sqlite_replay_position(connection)?;
+                Ok(WatchReplayPosition {
+                    resource_version,
+                    event_id: 0,
+                    resource_version_filter_through_event_id: head.event_id,
+                })
+            },
+        )
+        .await
+        .map_err(|error| ResourceReadError::retryable(error.to_string()))
     }
 }
 

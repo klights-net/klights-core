@@ -17,6 +17,7 @@ use klights_cluster_store::*;
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
 const MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES: usize = 16;
+type WatchGcIndexEntry = (u64, u64, Option<Vec<u8>>, Option<Vec<u8>>);
 
 fn durable_targets(targets: &[WatchTarget]) -> Vec<klights_cluster_store::DurableWatchTarget> {
     targets
@@ -342,7 +343,7 @@ impl RedbWatchStore {
     pub async fn gc_watch(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         self.db_call("gc_watch", move |db| {
             let w = db.begin_write()?;
-            let entries: Vec<(u64, u64, Option<Vec<u8>>)> = {
+            let entries: Vec<WatchGcIndexEntry> = {
                 let tbl = w.open_table(tables::WATCH_EVENTS)?;
                 let mut entries = Vec::new();
                 for entry in tbl.iter()? {
@@ -354,17 +355,24 @@ impl RedbWatchStore {
                         .get("resourceVersion")
                         .and_then(Value::as_u64)
                         .unwrap_or_default();
-                    entries.push((event_id, rv, floor_key_for_event(&event)));
+                    let history_key =
+                        crate::redb::mutation_helpers::resource_history_key(&event, event_id).ok();
+                    entries.push((event_id, rv, floor_key_for_event(&event), history_key));
                 }
                 entries
             };
-            let candidates = watch_gc_candidates(&entries, max_rows, batch_cap);
+            let gc_entries: Vec<(u64, u64, Option<Vec<u8>>)> = entries
+                .iter()
+                .map(|(event_id, rv, floor, _)| (*event_id, *rv, floor.clone()))
+                .collect();
+            let candidates = watch_gc_candidates(&gc_entries, max_rows, batch_cap);
             if candidates.is_empty() {
                 w.commit()?;
                 return Ok(0);
             }
 
             let mut keys_to_remove = Vec::with_capacity(candidates.len());
+            let mut history_keys_to_remove = Vec::with_capacity(candidates.len());
             let mut floor_updates: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
             for (event_id, rv, floor_key) in candidates {
                 if let Some(key) = floor_key {
@@ -377,6 +385,13 @@ impl RedbWatchStore {
                         .or_insert((rv, event_id));
                 }
                 keys_to_remove.push(event_id);
+                if let Some(history_key) = entries
+                    .iter()
+                    .find(|(known_id, _, _, _)| *known_id == event_id)
+                    .and_then(|(_, _, _, history_key)| history_key.clone())
+                {
+                    history_keys_to_remove.push(history_key);
+                }
             }
 
             {
@@ -405,6 +420,12 @@ impl RedbWatchStore {
                 }
                 n
             };
+            {
+                let mut history = w.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY)?;
+                for key in history_keys_to_remove {
+                    history.remove(key.as_slice())?;
+                }
+            }
             w.commit()?;
             Ok(removed)
         })

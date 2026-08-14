@@ -252,7 +252,9 @@ async fn resource_command_result_or_current(
         let request = ResourceListRequest::try_new(
             key.api_version,
             key.kind,
-            key.namespace,
+            key.namespace
+                .map(klights_leader_api::ResourceListScope::Namespace)
+                .unwrap_or(klights_leader_api::ResourceListScope::Cluster),
             None,
             None,
             Some(0),

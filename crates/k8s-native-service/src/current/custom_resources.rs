@@ -3,6 +3,7 @@ use crate::generic_command::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
+use crate::generic_read::ListResourceVersionMatch;
 use async_trait::async_trait;
 use axum::Extension;
 use klights_auth::AuthenticatedIdentity;
@@ -362,6 +363,7 @@ mod crd_watch_topic_tests {
     #[test]
     fn conversion_crd_watch_versions_cover_storage_and_requested_versions() {
         let conversion = crate::current::crd_conversion::CrdConversionConfig {
+            namespaced: true,
             storage_version: "v1".to_string(),
             served_versions: vec!["v1".to_string(), "v2".to_string()],
             strategy: Some("Webhook".to_string()),
@@ -413,6 +415,34 @@ mod crd_watch_topic_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].api_version, "widgets.test/v1");
         assert_eq!(merged[0].resource_version, 12);
+    }
+
+    #[test]
+    fn candidate_boundary_rejects_empty_and_repeated_opaque_tokens() {
+        // A resumed public page must seed the consumed set with its incoming
+        // opaque boundary. Returning that boundary again is no safer than
+        // repeating one produced in this process.
+        let mut last = Some("incoming".to_string());
+        let mut consumed = std::collections::BTreeSet::new();
+        consumed.insert("incoming".to_string());
+
+        assert!(matches!(
+            advance_crd_candidate_boundary(Some(String::new()), &mut last, &mut consumed),
+            Err(klights_leader_api::ResourceQueryError::CorruptResponse { .. })
+        ));
+        assert_eq!(
+            advance_crd_candidate_boundary(Some("opaque-a".into()), &mut last, &mut consumed)
+                .unwrap(),
+            Some("opaque-a".into())
+        );
+        assert!(matches!(
+            advance_crd_candidate_boundary(Some("opaque-a".into()), &mut last, &mut consumed),
+            Err(klights_leader_api::ResourceQueryError::Conflict { .. })
+        ));
+        assert!(matches!(
+            advance_crd_candidate_boundary(Some("incoming".into()), &mut last, &mut consumed),
+            Err(klights_leader_api::ResourceQueryError::Conflict { .. })
+        ));
     }
 }
 
@@ -681,37 +711,32 @@ pub async fn proxy_cluster_custom_resource_subresource(
     Ok(response)
 }
 
-/// Wrap a converted custom-resource object back into a [`Resource`] so the
-/// conversion-backed list path can flow through the shared
-/// [`crate::current::query::resolve_list_page`] helper. Only `data` is consumed
-/// downstream (the unified item-render loop), but identity fields are populated
-/// from the object for completeness.
-fn synthetic_cr_resource(
-    api_version: &str,
-    kind: &str,
-    data: Value,
-    resource_version: i64,
-) -> klights_cluster_core::Resource {
-    let name = data
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let namespace = data
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let data = std::sync::Arc::new(data);
-    klights_cluster_core::Resource {
-        id: 0,
-        api_version: api_version.to_string(),
-        kind: kind.to_string(),
-        namespace,
-        name,
-        uid: klights_cluster_core::Resource::uid_from_data(&data),
-        resource_version,
-        data,
+/// Validates a candidate-page boundary before it becomes the next root LIST
+/// request.  The boundary is opaque to native service, but it is still a
+/// protocol violation for the root to return an empty or already-consumed
+/// boundary: accepting either would let a filtered CRD LIST loop forever.
+fn advance_crd_candidate_boundary(
+    boundary: Option<String>,
+    last_boundary: &mut Option<String>,
+    consumed_boundaries: &mut std::collections::BTreeSet<String>,
+) -> Result<Option<String>, klights_leader_api::ResourceQueryError> {
+    let Some(boundary) = boundary else {
+        return Ok(None);
+    };
+    if boundary.is_empty() {
+        return Err(klights_leader_api::ResourceQueryError::corrupt_response(
+            "CRD candidate continuation omitted its opaque boundary",
+        ));
     }
+    if last_boundary.as_deref() == Some(boundary.as_str())
+        || !consumed_boundaries.insert(boundary.clone())
+    {
+        return Err(klights_leader_api::ResourceQueryError::Conflict {
+            message: "CRD candidate continuation repeated an opaque boundary".to_string(),
+        });
+    }
+    *last_boundary = Some(boundary.clone());
+    Ok(Some(boundary))
 }
 
 async fn list_cr_inner(
@@ -735,20 +760,26 @@ async fn list_cr_inner(
         plural,
     } = resource_type;
     let api_version = resource_type.api_version();
-    validate_crd_field_selector(
-        &api_version,
-        plural,
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
-        info.namespaced,
-        &info.selectable_fields,
-    )?;
-    let conversion = load_crd_conversion_config(
-        state.resource_mutation().resource_query.as_ref(),
-        group,
-        plural,
-    )
-    .await?;
+    // Watches retain their established live discovery path. LIST receives the
+    // immutable canonical definition from the same root snapshot as its page.
+    let conversion = if query.watch == Some("true".to_string()) {
+        validate_crd_field_selector(
+            &api_version,
+            plural,
+            query.label_selector.as_deref(),
+            query.field_selector.as_deref(),
+            info.namespaced,
+            &info.selectable_fields,
+        )?;
+        load_crd_conversion_config(
+            state.resource_mutation().resource_query.as_ref(),
+            group,
+            plural,
+        )
+        .await?
+    } else {
+        None
+    };
 
     if query.watch == Some("true".to_string()) {
         query.validate_send_initial_events_watch()?;
@@ -1070,224 +1101,253 @@ async fn list_cr_inner(
 
     let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
-    let has_continue = query
-        .continue_token
-        .as_deref()
-        .is_some_and(|t| !t.is_empty());
-    let rv_match = query.resolve_resource_version_match(has_continue)?;
-    let (db_continue_name, continue_resource_version) =
-        process_continue_token_at(query.continue_token.clone(), operation_now.unix_timestamp())?;
-
-    let needs_conversion = conversion
-        .as_ref()
-        .is_some_and(|c| c.served_versions.len() > 1 || c.strategy.as_deref() == Some("Webhook"));
-
-    let list_label_selector = query.label_selector.clone();
-    let list_field_selector = query.field_selector.clone();
-    let list_continue_name = db_continue_name.clone();
-
-    // Shared consistent-snapshot selection. Non-conversion CRDs live in the
-    // generic resource table and pin a real historical snapshot just like the
-    // core kinds. Conversion-backed CRDs build a merged cross-version view
-    // client-side and cannot pin a historical snapshot, so they report `Expired`
-    // to opt into the inconsistent-continuation fallback (Exact => 410). See
-    // `query::resolve_list_page`.
-    let crate::current::query::ResolvedListPage {
-        list,
-        response_rv,
-        continue_resource_version,
-    } = if needs_conversion {
-        let conv = conversion
-            .clone()
-            .expect("needs_conversion implies conversion is Some");
-        let state_conv = state.clone();
-        let group_owned = group.to_string();
-        let plural_owned = plural.to_string();
-        let api_version_owned = api_version.clone();
-        let kind_owned = info.kind.clone();
-        crate::current::query::resolve_list_page(
-            state.resource_mutation().list_resource_versions.as_ref(),
-            rv_match,
-            continue_resource_version,
-            |_srv| async {
-                Ok(crate::current::custom_resource_ports::CustomResourceListSnapshot::Expired)
-            },
-            || async move {
-                let (resources, rv) = gather_custom_resources_across_served_versions(
-                    state_conv.resource_mutation().resource_query.as_ref(),
-                    &conv,
-                    &group_owned,
-                    &kind_owned,
-                    ns.map(str::to_string),
-                    list_label_selector.clone(),
-                )
-                .await?;
-
-                let mut objects: Vec<Value> = resources
-                    .into_iter()
-                    .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
-                    .collect();
-                objects = convert_crd_objects_to_requested_version(
-                    state_conv.resource_mutation().identity.as_ref(),
-                    state_conv.resource_mutation().resource_query.as_ref(),
-                    &conv,
-                    &group_owned,
-                    &plural_owned,
-                    &api_version_owned,
-                    objects,
-                )
-                .await?;
-                objects.retain(|object| {
-                    object_matches_field_selector(object, list_field_selector.as_deref())
-                });
-
-                // Conversion-backed CRDs: stable sort by name, then apply
-                // client-side pagination after the merged view is built.
-                objects.sort_by(|a, b| {
-                    let na = a
-                        .pointer("/metadata/name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let nb = b
-                        .pointer("/metadata/name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    na.cmp(nb)
-                });
-
-                // Apply continue token offset by name.
-                let start_offset = match list_continue_name.as_deref() {
-                    Some(name) => objects.partition_point(|o| {
-                        o.pointer("/metadata/name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            <= name
-                    }),
-                    None => 0,
-                };
-                let sliced = if start_offset < objects.len() {
-                    &objects[start_offset..]
-                } else {
-                    &[]
-                };
-
-                let (page, cont, remaining) = if let Some(lim) = normalized_limit {
-                    if sliced.len() > lim as usize {
-                        let last_name = sliced[lim as usize - 1]
-                            .pointer("/metadata/name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        (
-                            sliced[..lim as usize].to_vec(),
-                            Some(last_name.to_string()),
-                            None, // Exact remaining count would require converting all remaining objects
-                        )
-                    } else {
-                        (sliced.to_vec(), None, None)
-                    }
-                } else {
-                    (sliced.to_vec(), None, None)
-                };
-
-                let items = page
-                    .into_iter()
-                    .map(|data| synthetic_cr_resource(&api_version_owned, &kind_owned, data, rv))
-                    .collect();
-                klights_leader_api::ResourceListResult::try_new(items, rv, None, cont, remaining)
-                    .map_err(AppError::from)
-            },
-        )
-        .await?
+    // Every CRD collection is read from its canonical storage version. The
+    // continuation stays entirely on the typed leader/root/store path; native
+    // service owns only the outer envelope, never a name/RV cursor. Conversion
+    // happens after the pinned page is selected.
+    let collection_scope = if info.namespaced {
+        ns.map(str::to_owned)
+            .map(klights_leader_api::ResourceListScope::Namespace)
+            .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces)
     } else {
-        let reads_for_snapshot = state.resource_mutation().custom_resource_reads.clone();
-        let query_for_live = state.resource_mutation().resource_query.clone();
-        let av_snap = api_version.clone();
-        let av_live = api_version.clone();
-        let kind_snap = info.kind.clone();
-        let kind_live = info.kind.clone();
-        let namespace = ns.map(str::to_string);
-        let snapshot_namespace = namespace.clone();
-        let live_namespace = namespace;
-        let snapshot_label_selector = list_label_selector.clone();
-        let live_label_selector = list_label_selector;
-        let snapshot_field_selector = list_field_selector.clone();
-        let live_field_selector = list_field_selector;
-        let snapshot_continue_name = list_continue_name.clone();
-        let live_continue_name = list_continue_name;
-        crate::current::query::resolve_list_page(
-            state.resource_mutation().list_resource_versions.as_ref(),
-            rv_match,
-            continue_resource_version,
-            |srv| async move {
-                reads_for_snapshot
-                    .snapshot_resources_at_rv(
-                        crate::current::custom_resource_ports::CustomResourceSnapshotRequest {
-                            api_version: av_snap,
-                            kind: kind_snap,
-                            namespace: snapshot_namespace,
-                            label_selector: snapshot_label_selector,
-                            field_selector: snapshot_field_selector,
-                            limit: normalized_limit,
-                            continue_token: snapshot_continue_name,
-                            resource_version: srv,
-                        },
-                    )
-                    .await
-            },
-            || async move {
-                crate::current::resource_query_ports::list_resources(
-                    query_for_live.as_ref(),
-                    &av_live,
-                    &kind_live,
-                    live_namespace.as_deref(),
-                    live_label_selector.as_deref(),
-                    live_field_selector.as_deref(),
-                    normalized_limit,
-                    live_continue_name.as_deref(),
-                )
-                .await
-            },
-        )
-        .await?
+        klights_leader_api::ResourceListScope::Cluster
     };
+    let (continue_token, continuation_mode) =
+        crate::generic_read::process_generic_list_continue_token(query.continue_token.clone())?;
+    let resource_version_match = match query.resolve_resource_version_match(
+        continuation_mode != klights_leader_api::ResourceListContinuationMode::Initial,
+    )? {
+        ListResourceVersionMatch::Any => klights_leader_api::ResourceListResourceVersionMatch::Any,
+        ListResourceVersionMatch::NotOlderThan(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv)
+        }
+        ListResourceVersionMatch::Exact(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::Exact(rv)
+        }
+    };
+    // Field-selector matching occurs after CRD conversion/defaulting, while
+    // the root can only page canonical storage candidates.  Keep consuming
+    // those bounded root pages in this one request until the requested public
+    // page is full or the pinned collection is exhausted.  This is neither a
+    // polling loop nor recursion: every iteration awaits one new opaque root
+    // continuation boundary and is bounded by the finite pinned collection.
+    let candidate_mode = query.field_selector.is_some();
+    let mut current_continue_token = continue_token;
+    let mut current_continuation_mode = continuation_mode;
+    let mut last_opaque_boundary = candidate_mode
+        .then(|| current_continue_token.clone())
+        .flatten();
+    let mut consumed_opaque_boundaries = std::collections::BTreeSet::new();
+    if let Some(boundary) = last_opaque_boundary.as_ref() {
+        consumed_opaque_boundaries.insert(boundary.clone());
+    }
+    let mut frozen_definition: Option<klights_cluster_core::Resource> = None;
+    let mut conversion: Option<Option<crate::current::crd_conversion::CrdConversionConfig>> = None;
+    let mut response_rv: Option<i64> = None;
+    let mut next_inner = None;
+    let mut remaining_item_count: Option<i64>;
+    let mut items = Vec::new();
 
-    // Unified item rendering: CRD defaults are applied to every served object,
-    // whether it came from a live list, a pinned snapshot, or a converted view.
-    let (listed_resources, _, _, continue_token, remaining_item_count) = list.into_parts();
-    let mut items: Vec<Value> = Vec::with_capacity(listed_resources.len());
-    for r in listed_resources {
-        let mut data = std::sync::Arc::unwrap_or_clone(r.data);
-        apply_crd_defaults(
-            state.resource_mutation().resource_query.as_ref(),
-            group,
-            version,
-            &info.kind,
-            &mut data,
+    loop {
+        // A continuation already owns its replay position. Reapplying an
+        // initial Exact/NotOlderThan contract would be invalid and can make a
+        // converted field-selector scan fail only after its first 64-candidate
+        // root page.
+        let batch_resource_version_match = if current_continuation_mode
+            == klights_leader_api::ResourceListContinuationMode::Initial
+        {
+            resource_version_match
+        } else {
+            klights_leader_api::ResourceListResourceVersionMatch::Any
+        };
+        let list = state
+            .resource_mutation()
+            .resource_query
+            .list_resources(
+                klights_leader_api::ResourceListRequest::try_new_with_continuation_mode(
+                    &api_version,
+                    &info.kind,
+                    collection_scope.clone(),
+                    query.label_selector.clone(),
+                    query.field_selector.clone(),
+                    normalized_limit,
+                    current_continue_token.take(),
+                    current_continuation_mode,
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                )?
+                .with_resource_version_match(batch_resource_version_match)?
+                .with_custom_resource_identity(
+                    klights_leader_api::CustomResourceListIdentity::try_new(
+                        group, plural, version,
+                    )?,
+                )?,
+            )
+            .await
+            .map_err(|error| {
+                crate::generic_read::generic_list_query_error(error, operation_now.unix_timestamp())
+            })?;
+        let page_definition = list
+            .frozen_custom_resource_definition()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Internal("CRD LIST response omitted frozen definition".into())
+            })?;
+        if let Some(expected_definition) = frozen_definition.as_ref() {
+            if expected_definition.data != page_definition.data {
+                return Err(AppError::Conflict(
+                    "CRD candidate pages did not retain the frozen definition".into(),
+                ));
+            }
+        } else {
+            let frozen_info =
+                klights_leader_api::resource_infos_from_value(page_definition.data.as_ref())
+                    .map_err(AppError::Internal)?
+                    .into_iter()
+                    .find(|candidate| {
+                        candidate.group == group
+                            && candidate.plural == plural
+                            && candidate.version == version
+                            && candidate.kind == info.kind
+                    })
+                    .ok_or_else(|| {
+                        AppError::BadRequest(
+                            "frozen CRD does not serve requested collection".into(),
+                        )
+                    })?;
+            validate_crd_field_selector(
+                &api_version,
+                plural,
+                query.label_selector.as_deref(),
+                query.field_selector.as_deref(),
+                frozen_info.namespaced,
+                &frozen_info.selectable_fields,
+            )?;
+            conversion = Some(
+                crate::current::crd_conversion::crd_conversion_config_from_definition(
+                    &page_definition,
+                )?,
+            );
+            frozen_definition = Some(page_definition);
+        }
+        let candidate_continue_tokens = list.candidate_continue_tokens().to_vec();
+        let (listed_resources, page_rv, _, page_next_inner, page_remaining_item_count) =
+            list.into_parts();
+        if candidate_mode && candidate_continue_tokens.len() != listed_resources.len() {
+            return Err(AppError::Internal(format!(
+                "CRD candidate response has {} resources but {} continuation boundaries",
+                listed_resources.len(),
+                candidate_continue_tokens.len(),
+            )));
+        }
+        if let Some(expected_rv) = response_rv {
+            if expected_rv != page_rv {
+                return Err(AppError::Conflict(
+                    "CRD candidate pages did not retain the pinned resourceVersion".into(),
+                ));
+            }
+        } else {
+            response_rv = Some(page_rv);
+        }
+        remaining_item_count = page_remaining_item_count;
+        let frozen_definition = frozen_definition
+            .as_ref()
+            .expect("first CRD page installs its frozen definition");
+        for (candidate_index, resource) in listed_resources.into_iter().enumerate() {
+            let mut data = normalize_custom_resource_response_data(
+                state.resource_mutation().identity.as_ref(),
+                state.resource_mutation().resource_query.as_ref(),
+                conversion
+                    .as_ref()
+                    .expect("first CRD page installs conversion configuration")
+                    .as_ref(),
+                group,
+                plural,
+                &api_version,
+                std::sync::Arc::unwrap_or_clone(resource.data),
+            )
+            .await?;
+            apply_crd_defaults_from_definition(frozen_definition, version, &mut data);
+            if !object_matches_field_selector(&data, query.field_selector.as_deref()) {
+                continue;
+            }
+            items.push(data);
+            if normalized_limit.is_some_and(|limit| items.len() >= limit as usize) {
+                // A per-candidate cursor after the final candidate of an
+                // exhausted root page would manufacture a needless empty
+                // public page.  It is needed only when candidates remain in
+                // this page or the root explicitly has another page.
+                let candidates_remain_in_page =
+                    candidate_index + 1 < candidate_continue_tokens.len();
+                let boundary = if candidates_remain_in_page {
+                    Some(
+                        candidate_continue_tokens
+                            .get(candidate_index)
+                            .cloned()
+                            .flatten()
+                            .ok_or_else(|| {
+                                AppError::Internal(
+                                    "CRD candidate response omitted a continuation boundary".into(),
+                                )
+                            })?,
+                    )
+                } else {
+                    page_next_inner.clone()
+                };
+                next_inner = advance_crd_candidate_boundary(
+                    boundary,
+                    &mut last_opaque_boundary,
+                    &mut consumed_opaque_boundaries,
+                )
+                .map_err(|error| {
+                    crate::generic_read::generic_list_query_error(
+                        error,
+                        operation_now.unix_timestamp(),
+                    )
+                })?;
+                break;
+            }
+        }
+        if normalized_limit.is_some_and(|limit| items.len() >= limit as usize) || !candidate_mode {
+            break;
+        }
+        let Some(boundary) = advance_crd_candidate_boundary(
+            page_next_inner,
+            &mut last_opaque_boundary,
+            &mut consumed_opaque_boundaries,
         )
-        .await;
-        items.push(data);
+        .map_err(|error| {
+            crate::generic_read::generic_list_query_error(error, operation_now.unix_timestamp())
+        })?
+        else {
+            break;
+        };
+        current_continue_token = Some(boundary);
+        current_continuation_mode = klights_leader_api::ResourceListContinuationMode::Pinned;
+    }
+    let response_rv = response_rv.expect("CRD LIST always receives an initial root page");
+    if candidate_mode {
+        remaining_item_count = None;
     }
     let mut metadata = serde_json::json!({
-        "resourceVersion": response_rv.to_string()
+        "resourceVersion": response_rv.to_string(),
     });
-    if let Some(ct) = continue_token {
+    if let Some(inner) = next_inner {
         metadata["continue"] =
-            serde_json::Value::String(crate::current::query::encode_response_continue_token_at(
-                &ct,
+            serde_json::Value::String(crate::generic_read::encode_generic_list_continue_token(
+                &inner,
                 response_rv,
-                continue_resource_version,
                 operation_now.unix_timestamp(),
+                crate::generic_read::PublicListContinuationMode::Pinned,
             ));
     }
-    if let Some(ric) = remaining_item_count {
-        metadata["remainingItemCount"] = serde_json::Value::Number(ric.into());
+    if let Some(remaining) = remaining_item_count {
+        metadata["remainingItemCount"] = serde_json::Value::Number(remaining.into());
     }
-
     Ok(Json(serde_json::json!({
-        "apiVersion": api_version,
-        "kind": format!("{}List", info.kind),
-        "metadata": metadata,
-        "items": items,
+            "apiVersion": api_version,
+            "kind": format!("{}List", info.kind),
+            "metadata": metadata,
+            "items": items,
     }))
     .into_response())
 }
@@ -1409,7 +1469,13 @@ async fn delete_collection_cr_inner(
             state.resource_mutation().resource_query.as_ref(),
             &api_version,
             &info.kind,
-            ns,
+            if info.namespaced {
+                ns.map(str::to_owned)
+                    .map(klights_leader_api::ResourceListScope::Namespace)
+                    .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces)
+            } else {
+                klights_leader_api::ResourceListScope::Cluster
+            },
             query.label_selector.as_deref(),
             query.field_selector.as_deref(),
             None,
@@ -2017,7 +2083,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                     conversion.as_ref(),
                     group,
                     plural,
-                    &storage_api_version,
+                    &api_version,
                     created_resource,
                 )
                 .await?;

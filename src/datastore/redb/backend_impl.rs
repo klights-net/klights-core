@@ -675,7 +675,7 @@ impl DatastoreBackend for RedbDatastore {
             .snapshot_at_position(&targets, label_selector, field_selector, position)
             .await?
         {
-            RedbSnapshotRead::Expired => Ok(SnapshotAtRv::Expired),
+            RedbSnapshotRead::Expired { .. } => Ok(SnapshotAtRv::Expired),
             RedbSnapshotRead::Historical { items, position } => {
                 Ok(SnapshotAtRv::List(ResourceList {
                     items,

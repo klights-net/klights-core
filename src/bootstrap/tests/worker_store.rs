@@ -10,13 +10,13 @@ use klights_kubelet::worker_store::reflector::ReflectorState;
 use klights_kubelet::worker_store::{
     WorkerListPage, WorkerStoreAdapter, WorkerStorePorts, WorkerWatchBus,
 };
-use klights_leader_api::ResourceListRequest;
 use klights_leader_api::{
     CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery,
     LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, ResourceGetRequest,
     ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture, WatchEventType,
     WatchRequest, WatchStream,
 };
+use klights_leader_api::{ResourceListRequest, ResourceListScope};
 use klights_node_store::OutboxClaimRequest;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 use klights_watch::{EventType, WatchEvent, WatchTarget, WatchTopic};
@@ -385,7 +385,12 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
     let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
 
     let first = adapter
-        .reconcile_watch_snapshot_for_test(&req, &mut state, membership.as_mut())
+        .reconcile_watch_snapshot_for_test(
+            &req,
+            ResourceListScope::AllNamespaces,
+            &mut state,
+            membership.as_mut(),
+        )
         .await;
     assert!(
         first.is_err(),
@@ -399,7 +404,12 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
     );
 
     adapter
-        .reconcile_watch_snapshot_for_test(&req, &mut state, membership.as_mut())
+        .reconcile_watch_snapshot_for_test(
+            &req,
+            ResourceListScope::AllNamespaces,
+            &mut state,
+            membership.as_mut(),
+        )
         .await
         .expect("the same snapshot must replay after the route recovers");
     let replayed = watch.try_recv().expect("replayed snapshot event");
@@ -601,6 +611,7 @@ async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
                 driver_adapter
                     .run_watch_mirror_for_test(
                         worker_pod_watch_request(),
+                        ResourceListScope::AllNamespaces,
                         driver_supervisor,
                         driver_cancel,
                     )
@@ -888,7 +899,7 @@ async fn worker_pod_lists_are_constrained_to_local_node() {
         .list_resources(
             "v1",
             "Pod",
-            Some("default"),
+            ResourceListScope::Namespace("default".to_string()),
             None,
             None,
             WorkerListPage::unbounded(),
@@ -943,7 +954,7 @@ async fn worker_list_page_preserves_continuation_metadata() {
         .list_resources(
             "v1",
             "ConfigMap",
-            Some("default"),
+            ResourceListScope::Namespace("default".to_string()),
             None,
             None,
             WorkerListPage {
@@ -972,7 +983,7 @@ async fn worker_list_page_preserves_continuation_metadata() {
         .list_resources(
             "v1",
             "ConfigMap",
-            Some("default"),
+            ResourceListScope::Namespace("default".to_string()),
             None,
             None,
             WorkerListPage {
@@ -1621,6 +1632,7 @@ async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
                 driver_adapter
                     .run_watch_mirror_for_test(
                         worker_pod_watch_request(),
+                        ResourceListScope::AllNamespaces,
                         driver_supervisor,
                         driver_cancel,
                     )
@@ -1675,6 +1687,7 @@ async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
                 driver_adapter
                     .run_watch_mirror_for_test(
                         worker_pod_watch_request(),
+                        ResourceListScope::AllNamespaces,
                         driver_supervisor,
                         driver_cancel,
                     )

@@ -53,6 +53,7 @@ pub fn build_crd_conversion_webhook_client(
 
 #[derive(Clone, Debug)]
 pub struct CrdConversionConfig {
+    pub namespaced: bool,
     pub storage_version: String,
     pub served_versions: Vec<String>,
     pub strategy: Option<String>,
@@ -78,6 +79,15 @@ pub async fn load_crd_conversion_config(
         return Ok(None);
     };
 
+    crd_conversion_config_from_definition(&crd)
+}
+
+/// Parses conversion, schema, scope and served-version policy from a caller
+/// supplied canonical CRD definition. Paginated LIST consumes the definition
+/// frozen by the leader rather than doing a live CRD GET between pages.
+pub fn crd_conversion_config_from_definition(
+    crd: &Resource,
+) -> Result<Option<CrdConversionConfig>, AppError> {
     let versions = crd
         .data
         .pointer("/spec/versions")
@@ -111,6 +121,19 @@ pub async fn load_crd_conversion_config(
     }
 
     let storage_version = storage_version.unwrap_or_else(|| served_versions[0].clone());
+    let namespaced = match crd
+        .data
+        .pointer("/spec/scope")
+        .and_then(|value| value.as_str())
+    {
+        Some("Namespaced") => true,
+        Some("Cluster") => false,
+        _ => {
+            return Err(AppError::BadRequest(
+                "CRD spec.scope must be Namespaced or Cluster".into(),
+            ));
+        }
+    };
     let strategy = crd
         .data
         .pointer("/spec/conversion/strategy")
@@ -132,6 +155,7 @@ pub async fn load_crd_conversion_config(
         .unwrap_or_default();
 
     Ok(Some(CrdConversionConfig {
+        namespaced,
         storage_version,
         served_versions,
         strategy,
@@ -402,7 +426,15 @@ pub async fn gather_custom_resources_across_served_versions(
             query,
             &api_version,
             kind,
-            namespace.as_deref(),
+            if conversion.namespaced {
+                namespace
+                    .as_ref()
+                    .cloned()
+                    .map(klights_leader_api::ResourceListScope::Namespace)
+                    .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces)
+            } else {
+                klights_leader_api::ResourceListScope::Cluster
+            },
             label_selector.as_deref(),
             None,
             None,

@@ -21,6 +21,18 @@ pub const WATCH_EVENTS_LEGACY: TableDefinition<u64, &[u8]> = TableDefinition::ne
 /// Apply-order keyed durable watch log. The resourceVersion lives in the
 /// encoded value, allowing multiple resource identities to share one RV.
 pub const WATCH_EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("watch_events_v2");
+/// Derived ordered membership of durable history. Keys encode one resource
+/// identity followed by the big-endian event id; values repeat that id so a
+/// positioned page can seek an identity window and dereference only the
+/// retained events for those identities. This is derived from `WATCH_EVENTS`
+/// and is rebuilt at the open/restore boundary when upgrading older stores.
+pub const RESOURCE_HISTORY_BY_IDENTITY: TableDefinition<&[u8], u64> =
+    TableDefinition::new("resource_history_by_identity_v1");
+/// Derived lexical current-resource identity index.  Unlike the physical
+/// resource tables' length-prefixed keys, this is ordered as Kubernetes LIST
+/// requires: scope, apiVersion, kind, namespace, name.
+pub const RESOURCE_CURRENT_BY_IDENTITY: TableDefinition<&[u8], u8> =
+    TableDefinition::new("resource_current_by_identity_v1");
 pub const WATCH_REPLAY_FLOORS: TableDefinition<&[u8], u64> =
     TableDefinition::new("watch_replay_floors");
 pub const WATCH_REPLAY_POSITION_FLOORS: TableDefinition<&[u8], &[u8]> =

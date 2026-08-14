@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use klights_leader_api::{
-    LeaderResourceQuery, ResourceListRequest, ResourceQueryConsistency, ResourceQueryError,
+    LeaderResourceQuery, ResourceListRequest, ResourceListScope, ResourceQueryConsistency,
+    ResourceQueryError,
 };
 use klights_networking::service_routing::{
     NetworkPolicySnapshot, RoutingStateError, RoutingStateFuture, RoutingStateSource,
@@ -21,11 +22,12 @@ impl LeaderRoutingStateAdapter {
 fn fresh_list_request(
     api_version: &str,
     kind: &str,
+    scope: ResourceListScope,
 ) -> Result<ResourceListRequest, ResourceQueryError> {
     ResourceListRequest::try_new(
         api_version,
         kind,
-        None,
+        scope,
         None,
         None,
         None,
@@ -54,19 +56,29 @@ impl RoutingStateSource for LeaderRoutingStateAdapter {
         Box::pin(async move {
             let services = self
                 .query
-                .list_resources(fresh_list_request("v1", "Service").map_err(routing_state_error)?)
+                .list_resources(
+                    fresh_list_request("v1", "Service", ResourceListScope::AllNamespaces)
+                        .map_err(routing_state_error)?,
+                )
                 .await
                 .map_err(routing_state_error)?;
             let endpoints = self
                 .query
-                .list_resources(fresh_list_request("v1", "Endpoints").map_err(routing_state_error)?)
+                .list_resources(
+                    fresh_list_request("v1", "Endpoints", ResourceListScope::AllNamespaces)
+                        .map_err(routing_state_error)?,
+                )
                 .await
                 .map_err(routing_state_error)?;
             let endpoint_slices = self
                 .query
                 .list_resources(
-                    fresh_list_request("discovery.k8s.io/v1", "EndpointSlice")
-                        .map_err(routing_state_error)?,
+                    fresh_list_request(
+                        "discovery.k8s.io/v1",
+                        "EndpointSlice",
+                        ResourceListScope::AllNamespaces,
+                    )
+                    .map_err(routing_state_error)?,
                 )
                 .await
                 .map_err(routing_state_error)?;
@@ -87,19 +99,29 @@ impl RoutingStateSource for LeaderRoutingStateAdapter {
             let policies = self
                 .query
                 .list_resources(
-                    fresh_list_request("networking.k8s.io/v1", "NetworkPolicy")
-                        .map_err(routing_state_error)?,
+                    fresh_list_request(
+                        "networking.k8s.io/v1",
+                        "NetworkPolicy",
+                        ResourceListScope::AllNamespaces,
+                    )
+                    .map_err(routing_state_error)?,
                 )
                 .await
                 .map_err(routing_state_error)?;
             let pods = self
                 .query
-                .list_resources(fresh_list_request("v1", "Pod").map_err(routing_state_error)?)
+                .list_resources(
+                    fresh_list_request("v1", "Pod", ResourceListScope::AllNamespaces)
+                        .map_err(routing_state_error)?,
+                )
                 .await
                 .map_err(routing_state_error)?;
             let namespaces = self
                 .query
-                .list_resources(fresh_list_request("v1", "Namespace").map_err(routing_state_error)?)
+                .list_resources(
+                    fresh_list_request("v1", "Namespace", ResourceListScope::Cluster)
+                        .map_err(routing_state_error)?,
+                )
                 .await
                 .map_err(routing_state_error)?;
             Ok(NetworkPolicySnapshot {

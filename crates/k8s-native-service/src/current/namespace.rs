@@ -1,4 +1,5 @@
 use crate::current::*;
+use crate::generic_read::ListResourceVersionMatch;
 use klights_types::LabelSelector;
 
 pub(in crate::current) async fn get_namespace(
@@ -99,47 +100,42 @@ pub(in crate::current) async fn list_namespaces(
 
     let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
-    let has_continue = query
-        .continue_token
-        .as_deref()
-        .is_some_and(|t| !t.is_empty());
-    let rv_match = query.resolve_resource_version_match(has_continue)?;
-    let (db_continue_name, continue_resource_version) =
-        process_continue_token_at(query.continue_token.clone(), operation_now.unix_timestamp())?;
-
-    let list_query = crate::current::query::NamespaceListRequest {
-        label_selector: query.label_selector.clone(),
-        field_selector: query.field_selector.clone(),
-        limit: normalized_limit,
-        continue_token: db_continue_name,
+    let (continue_token, continuation_mode) =
+        crate::generic_read::process_generic_list_continue_token(query.continue_token.clone())?;
+    let resource_version_match = match query.resolve_resource_version_match(
+        continuation_mode != klights_leader_api::ResourceListContinuationMode::Initial,
+    )? {
+        ListResourceVersionMatch::Any => klights_leader_api::ResourceListResourceVersionMatch::Any,
+        ListResourceVersionMatch::NotOlderThan(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv)
+        }
+        ListResourceVersionMatch::Exact(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::Exact(rv)
+        }
     };
-
-    // Namespaces persist in their own table but back a real consistent snapshot
-    // (the sqlite reconstructor reads that table when kind == Namespace), so the
-    // shared helper pins paginated continuations / Exact reads exactly like every
-    // other kind. See `query::resolve_list_page`.
-    let namespace_lists = state.resource_mutation().namespace_lists.clone();
-    let snapshot_lists = namespace_lists.clone();
-    let snapshot_query = list_query.clone();
-    let crate::current::query::ResolvedListPage {
-        list: list_response,
-        response_rv,
-        continue_resource_version,
-    } = crate::current::query::resolve_list_page(
-        state.resource_mutation().list_resource_versions.as_ref(),
-        rv_match,
-        continue_resource_version,
-        |srv| async move {
-            snapshot_lists
-                .snapshot_namespaces(snapshot_query, srv)
-                .await
-        },
-        || async move { namespace_lists.list_namespaces(list_query).await },
-    )
-    .await?;
-
-    let items_with_rv: Vec<Value> = list_response
-        .items
+    let list_response = state
+        .resource_mutation()
+        .resource_query
+        .list_resources(
+            klights_leader_api::ResourceListRequest::try_new_with_continuation_mode(
+                "v1",
+                "Namespace",
+                klights_leader_api::ResourceListScope::Cluster,
+                query.label_selector.clone(),
+                query.field_selector.clone(),
+                normalized_limit,
+                continue_token,
+                continuation_mode,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?
+            .with_resource_version_match(resource_version_match)?,
+        )
+        .await
+        .map_err(|error| {
+            crate::generic_read::generic_list_query_error(error, operation_now.unix_timestamp())
+        })?;
+    let (items, response_rv, _, next_inner, remaining_item_count) = list_response.into_parts();
+    let items_with_rv: Vec<Value> = items
         .into_iter()
         .map(|r| {
             inject_resource_version_with_identity(
@@ -153,16 +149,16 @@ pub(in crate::current) async fn list_namespaces(
     let mut ns_metadata = serde_json::json!({
         "resourceVersion": response_rv.to_string(),
     });
-    if let Some(ref token) = list_response.continue_token {
+    if let Some(token) = next_inner {
         ns_metadata["continue"] =
-            serde_json::json!(crate::current::query::encode_response_continue_token_at(
-                token,
+            serde_json::json!(crate::generic_read::encode_generic_list_continue_token(
+                &token,
                 response_rv,
-                continue_resource_version,
                 operation_now.unix_timestamp(),
+                crate::generic_read::PublicListContinuationMode::Pinned,
             ));
     }
-    if let Some(remaining) = list_response.remaining_item_count {
+    if let Some(remaining) = remaining_item_count {
         ns_metadata["remainingItemCount"] = serde_json::json!(remaining);
     }
     let list = serde_json::json!({
@@ -172,7 +168,7 @@ pub(in crate::current) async fn list_namespaces(
         "items": items_with_rv
     });
 
-    Ok(Json(list).into_response())
+    Ok(K8sResponse::new(list, &headers).into_response())
 }
 
 pub(in crate::current) async fn create_namespace(

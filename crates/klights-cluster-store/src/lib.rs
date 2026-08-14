@@ -88,9 +88,9 @@ pub use raw_watch_history::{
 pub use replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 pub use resource_read::{
     ClusterResourceRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
-    ResourceGetRequest, ResourceListPage, ResourceListQuery, ResourceListRead, ResourceListRequest,
-    ResourceListSnapshot, ResourceReadError, ResourceReadFuture, ResourceReadStatus,
-    ResourceVersionMatch,
+    ResourceGetRequest, ResourceListPage, ResourceListQuery, ResourceListRead,
+    ResourceListRecoveryContinuation, ResourceListRequest, ResourceListSnapshot, ResourceReadError,
+    ResourceReadFuture, ResourceReadStatus, ResourceVersionMatch,
 };
 pub use resource_scope::{
     ClusterResourceScopeRead, ResourceKeyScopeRequest, ResourceScopeSnapshot,

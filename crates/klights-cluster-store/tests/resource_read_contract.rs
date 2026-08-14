@@ -1,8 +1,9 @@
 use klights_cluster_core::{Resource, WatchReplayPosition};
 use klights_cluster_store::{
     ClusterResourceRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
-    ResourceGetRequest, ResourceListPage, ResourceListQuery, ResourceListRead, ResourceListRequest,
-    ResourceListSnapshot, ResourceReadError, ResourceReadFuture, ResourceVersionMatch,
+    ResourceGetRequest, ResourceListPage, ResourceListQuery, ResourceListRead,
+    ResourceListRecoveryContinuation, ResourceListRequest, ResourceListSnapshot, ResourceReadError,
+    ResourceReadFuture, ResourceVersionMatch,
 };
 
 struct EmptyReader;
@@ -208,6 +209,55 @@ fn all_namespace_continuation_is_composite_and_pins_one_snapshot() {
                 snapshot,
             )),
             ResourceVersionMatch::NotOlderThan(78),
+        ),
+        Err(ResourceReadError::InvalidContinuation { .. })
+    ));
+}
+
+#[test]
+fn recovery_continuation_is_typed_unpinned_and_keeps_the_composite_key() {
+    let recovery = ResourceListRecoveryContinuation::new(ResourceCollectionKey::new(
+        Some("tenant-b"),
+        "same-name",
+    ));
+    let query = ResourceListQuery::try_new_with_recovery(
+        Some("team=blue".to_string()),
+        Some("metadata.name!=old".to_string()),
+        Some(1),
+        None,
+        Some(recovery.clone()),
+        ResourceVersionMatch::Any,
+    )
+    .expect("a recovery cursor starts a new, unpinned snapshot");
+
+    assert!(query.continuation().is_none());
+    assert_eq!(query.recovery_continuation(), Some(&recovery));
+    assert_eq!(
+        query.recovery_continuation().unwrap().after().namespace(),
+        Some("tenant-b")
+    );
+    assert_eq!(
+        query.recovery_continuation().unwrap().after().name(),
+        "same-name"
+    );
+
+    let pinned = ResourceContinuation::new(
+        ResourceCollectionKey::new(Some("tenant-a"), "same-name"),
+        ResourceListSnapshot::try_new(WatchReplayPosition {
+            resource_version: 77,
+            event_id: 101,
+            resource_version_filter_through_event_id: 0,
+        })
+        .unwrap(),
+    );
+    assert!(matches!(
+        ResourceListQuery::try_new_with_recovery(
+            None,
+            None,
+            Some(1),
+            Some(pinned),
+            Some(recovery),
+            ResourceVersionMatch::Any,
         ),
         Err(ResourceReadError::InvalidContinuation { .. })
     ));

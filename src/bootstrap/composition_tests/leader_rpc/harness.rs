@@ -384,18 +384,6 @@ impl IntegrationLeaderRpcComposition {
         (resource_query, Arc::new(lifecycle_status))
     }
 
-    pub async fn initialize_default_namespaces(&self) -> anyhow::Result<()> {
-        let identity = crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity();
-        klights_controllers::namespace::init_default_namespaces_with_ca_path(
-            &Self::file_process_executor(),
-            self.db.as_ref(),
-            &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
-            chrono::DateTime::UNIX_EPOCH,
-            identity.as_ref(),
-        )
-        .await
-    }
-
     pub async fn register_node_at_addresses(
         &self,
         node_name: &str,
@@ -620,10 +608,17 @@ impl IntegrationLeaderRpcComposition {
                 authority.clone(),
             ),
         );
-        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            self.db.clone(),
-            authority.clone(),
-        );
+        let resource_query = match passive_reads.as_ref() {
+            Some(passive_reads) => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads(
+                self.db.clone(),
+                passive_reads.ports.resource_reads(),
+                authority.clone(),
+            ),
+            None => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+                self.db.clone(),
+                authority.clone(),
+            ),
+        };
         let authority_handle =
             crate::bootstrap::authority::AuthorityHandle::from(authority.clone());
         let side_effects =

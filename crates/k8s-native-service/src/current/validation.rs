@@ -1196,6 +1196,18 @@ pub async fn apply_crd_defaults(
     }
 }
 
+/// Applies defaults from the exact CRD definition captured with a paginated
+/// LIST. This avoids a live CRD lookup changing page-two response semantics.
+pub fn apply_crd_defaults_from_definition(
+    definition: &klights_cluster_core::Resource,
+    version: &str,
+    body: &mut Value,
+) {
+    if let Some(schema) = crd_openapi_schema_from_definition(definition, version) {
+        apply_schema_defaults(body, &schema);
+    }
+}
+
 /// Apply CRD schema pruning to remove unknown fields not allowed by schema.
 pub async fn apply_crd_pruning(
     resource_query: &dyn klights_leader_api::LeaderResourceQuery,
@@ -1219,7 +1231,7 @@ async fn load_crd_openapi_schema(
         resource_query,
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
     )
     .await
     .map_err(|error| AppError::InternalError(format!("Failed to list CRDs: {error:?}")))?;
@@ -1248,6 +1260,23 @@ async fn load_crd_openapi_schema(
     }
 
     Ok(None)
+}
+
+fn crd_openapi_schema_from_definition(
+    definition: &klights_cluster_core::Resource,
+    version: &str,
+) -> Option<Value> {
+    definition
+        .data
+        .pointer("/spec/versions")
+        .and_then(Value::as_array)
+        .and_then(|versions| {
+            versions
+                .iter()
+                .find(|entry| entry.get("name").and_then(Value::as_str) == Some(version))
+        })
+        .and_then(|entry| entry.pointer("/schema/openAPIV3Schema"))
+        .cloned()
 }
 
 /// Recursively apply default values from an OpenAPI v3 schema to a JSON value.

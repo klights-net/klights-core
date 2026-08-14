@@ -15,6 +15,7 @@ pub use std::sync::Arc;
 
 pub use super::DiscoveryState;
 pub use crate::AppError;
+pub use klights_leader_api::ResourceListScope;
 use klights_leader_api::{
     LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
     ResourceQueryConsistency,
@@ -25,12 +26,12 @@ pub(super) async fn list_all_resources(
     query: &dyn LeaderResourceQuery,
     api_version: &str,
     kind: &str,
-    namespace: Option<&str>,
+    scope: ResourceListScope,
 ) -> Result<ResourceListResult, AppError> {
     let request = ResourceListRequest::try_new(
         api_version,
         kind,
-        namespace.map(str::to_string),
+        scope,
         None,
         None,
         None,
@@ -81,7 +82,7 @@ pub(super) async fn apiservice_group_versions<S: DiscoveryState + ?Sized>(
         state.resource_query(),
         "apiregistration.k8s.io/v1",
         "APIService",
-        None,
+        ResourceListScope::Cluster,
     )
     .await?;
     for item in list.into_items() {

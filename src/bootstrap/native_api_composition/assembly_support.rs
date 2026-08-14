@@ -584,12 +584,12 @@ pub(crate) mod support {
             let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
             let leader_rx =
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-            let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = Arc::new(
-                crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
+            let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+                crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads(
                     datastore.clone(),
+                    passive_reads.resource_reads(),
                     leader_rx.clone(),
-                ),
-            );
+                );
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                     datastore.clone(),
@@ -944,14 +944,6 @@ pub(crate) mod support {
             resource_command.clone(),
             finalizer_lifecycle,
             mutation_effects,
-            crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(Arc::new(
-                crate::bootstrap::composition_adapters::leader_maintenance_adapter::ClusterStoreLeaderMaintenance::new(
-                    datastore.clone(),
-                    Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(datastore.clone())),
-                    crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
-                ),
-            )),
-            crate::bootstrap::composition_adapters::list_query_adapter::DatastoreNamespaceListPort::new(datastore.clone()),
             crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                 datastore.clone(),
             ),

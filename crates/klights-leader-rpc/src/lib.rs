@@ -34,6 +34,8 @@ pub use conversions::{
 pub const JOIN_TOKEN_METADATA_KEY: &str = "x-klights-join-token";
 pub const WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY: &str = "x-klights-watch-error";
 pub const WATCH_REPLAY_EXPIRED_REASON: &str = "watch-replay-expired";
+pub const RESOURCE_LIST_EXPIRED_REASON_METADATA_KEY: &str = "x-klights-list-error";
+pub const RESOURCE_LIST_EXPIRED_REASON: &str = "resource-list-expired";
 const LEGACY_WATCH_REPLAY_EXPIRED_PREFIX: &str = "WatchResources replay window expired: resume rv ";
 const LEGACY_WATCH_REPLAY_EXPIRED_SUFFIX: &str = " requires relist";
 
@@ -57,6 +59,76 @@ pub fn watch_replay_expired_status(
         Bytes::from(details),
         metadata,
     )
+}
+
+pub fn resource_list_expired_status(
+    requested: i64,
+    oldest_available: i64,
+    replacement_continue_token: Option<String>,
+) -> tonic::Status {
+    let details = klights_internal_protobuf::ResourceListExpiredDetails {
+        requested_resource_version: requested,
+        oldest_available_resource_version: oldest_available,
+        replacement_continue_token,
+    }
+    .encode_to_vec();
+    let mut metadata = MetadataMap::new();
+    metadata.insert(
+        RESOURCE_LIST_EXPIRED_REASON_METADATA_KEY,
+        MetadataValue::from_static(RESOURCE_LIST_EXPIRED_REASON),
+    );
+    tonic::Status::with_details_and_metadata(
+        tonic::Code::OutOfRange,
+        "LIST continuation snapshot expired",
+        Bytes::from(details),
+        metadata,
+    )
+}
+
+pub fn resource_list_expired_details(
+    status: &tonic::Status,
+) -> Option<klights_internal_protobuf::ResourceListExpiredDetails> {
+    if status.code() != tonic::Code::OutOfRange {
+        return None;
+    }
+    let reason = status
+        .metadata()
+        .get(RESOURCE_LIST_EXPIRED_REASON_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())?;
+    if reason != RESOURCE_LIST_EXPIRED_REASON {
+        return None;
+    }
+    klights_internal_protobuf::ResourceListExpiredDetails::decode(status.details()).ok()
+}
+
+#[cfg(test)]
+mod resource_list_expiry_tests {
+    use super::*;
+
+    #[test]
+    fn typed_list_expiry_status_preserves_a_usable_opaque_recovery_cursor() {
+        let status = resource_list_expired_status(41, 53, Some("recovery/\u{1f680}?n=a/b".into()));
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+        let details = resource_list_expired_details(&status).expect("typed LIST expiry details");
+        assert_eq!(details.requested_resource_version, 41);
+        assert_eq!(details.oldest_available_resource_version, 53);
+        assert_eq!(
+            details.replacement_continue_token.as_deref(),
+            Some("recovery/\u{1f680}?n=a/b")
+        );
+    }
+
+    #[test]
+    fn typed_list_expiry_status_omits_absent_recovery_cursor() {
+        let status = resource_list_expired_status(41, 53, None);
+        let details = resource_list_expired_details(&status).expect("typed LIST expiry details");
+        assert_eq!(details.requested_resource_version, 41);
+        assert_eq!(details.oldest_available_resource_version, 53);
+        assert!(
+            details.replacement_continue_token.is_none(),
+            "absence must survive protobuf status framing; an empty cursor is not a recovery cursor"
+        );
+    }
 }
 
 pub fn is_watch_replay_expired_status(status: &tonic::Status) -> bool {

@@ -122,6 +122,7 @@ impl LeaderResourceQuery for VersionedSnapshotQuery {
 #[tokio::test]
 async fn conversion_merged_list_rv_does_not_skip_storage_create_between_version_reads() {
     let conversion = CrdConversionConfig {
+        namespaced: true,
         storage_version: "v1".to_string(),
         served_versions: vec!["v1".to_string(), "v2".to_string()],
         strategy: None,
@@ -317,6 +318,7 @@ async fn test_crd_conversion_skips_objects_already_on_desired_version() {
             .expect("write response");
     });
     let conversion = CrdConversionConfig {
+        namespaced: true,
         storage_version: "v1".to_string(),
         served_versions: vec!["v1".to_string(), "v2".to_string()],
         strategy: Some("Webhook".to_string()),
@@ -423,6 +425,7 @@ async fn test_crd_conversion_strategy_check_is_case_insensitive() {
             .expect("write response");
     });
     let conversion = CrdConversionConfig {
+        namespaced: true,
         storage_version: "v1".to_string(),
         served_versions: vec!["v1".to_string(), "v2".to_string()],
         strategy: Some("webhook".to_string()),
@@ -456,6 +459,7 @@ async fn test_crd_conversion_strategy_check_is_case_insensitive() {
 async fn test_crd_conversion_strategy_none_with_client_config_stamps_requested_version() {
     use serde_json::json;
     let conversion = CrdConversionConfig {
+        namespaced: true,
         storage_version: "v1".to_string(),
         served_versions: vec!["v1".to_string(), "v2".to_string()],
         strategy: Some("None".to_string()),
@@ -549,6 +553,7 @@ async fn test_crd_conversion_accepts_yaml_conversion_review_response() {
             .expect("write response");
     });
     let conversion = CrdConversionConfig {
+        namespaced: true,
         storage_version: "v1".to_string(),
         served_versions: vec!["v1".to_string(), "v2".to_string()],
         strategy: Some("Webhook".to_string()),

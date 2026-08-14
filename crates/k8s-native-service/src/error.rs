@@ -25,8 +25,9 @@ pub enum AppError {
     Internal(String),
     /// 503 Service Unavailable: allocator not ready (F6-02)
     ServiceUnavailable(String),
-    /// 410 Gone: continue token expired; carries the inconsistent continuation token.
-    ResourceExpired(String),
+    /// 410 Gone: an optional typed recovery continuation is present only when
+    /// the lower layer can safely resume after the expired boundary.
+    ResourceExpired(Option<String>),
     /// 413 Payload Too Large / Request Entity Too Large.
     PayloadTooLarge(String),
     /// Fully-structured error carrying a `metav1.Status.details` object
@@ -94,6 +95,26 @@ impl From<klights_leader_api::ResourceQueryError> for AppError {
                 Self::BadRequest(format!("{field}: {message}"))
             }
             klights_leader_api::ResourceQueryError::NotFound { .. } => Self::NotFound(display),
+            klights_leader_api::ResourceQueryError::Expired {
+                replacement_continue_token,
+                ..
+            } if replacement_continue_token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty()) =>
+            {
+                Self::ResourceExpired(Some(
+                    crate::generic_read::encode_generic_list_continue_token(
+                        replacement_continue_token
+                            .as_deref()
+                            .expect("guarded above"),
+                        0,
+                        chrono::Utc::now().timestamp(),
+                        crate::generic_read::PublicListContinuationMode::Recovery,
+                    ),
+                ))
+            }
+            klights_leader_api::ResourceQueryError::Expired { .. } => Self::ResourceExpired(None),
+            klights_leader_api::ResourceQueryError::Conflict { .. } => Self::Conflict(display),
             klights_leader_api::ResourceQueryError::Retryable { .. }
             | klights_leader_api::ResourceQueryError::Timeout
             | klights_leader_api::ResourceQueryError::Cancelled => {
@@ -313,16 +334,19 @@ impl IntoResponse for AppError {
             return (code, Json(body)).into_response();
         }
 
-        if let AppError::ResourceExpired(inconsistent_token) = self {
+        if let AppError::ResourceExpired(recovery_token) = self {
             let body = serde_json::json!({
                 "kind": "Status",
                 "apiVersion": "v1",
-                "metadata": {"continue": inconsistent_token},
                 "status": "Failure",
                 "message": "The provided from parameter is too old to display a consistent list result. You must start a new list without the from parameter.",
                 "reason": "Expired",
                 "code": 410u16,
             });
+            let mut body = body;
+            if let Some(recovery_token) = recovery_token {
+                body["metadata"] = serde_json::json!({"continue": recovery_token});
+            }
             return (StatusCode::GONE, Json(body)).into_response();
         }
 

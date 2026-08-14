@@ -12,7 +12,7 @@ macro_rules! cluster_delete_collection_handler {
                 &identity,
                 $api_version,
                 $kind,
-                None,
+                klights_leader_api::ResourceListScope::Cluster,
                 query,
             )
             .await

@@ -10,8 +10,6 @@ pub(crate) struct ApiResourceMutationServices {
     pub(crate) resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub(crate) finalizer_lifecycle: Arc<dyn klights_reconcile_api::FinalizerLifecyclePort>,
     pub(crate) mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
-    pub(crate) list_resource_versions: Arc<dyn crate::current::query::ListResourceVersionPort>,
-    pub(crate) namespace_lists: Arc<dyn crate::current::query::NamespaceListPort>,
     pub(crate) quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     pub(crate) admission: Arc<dyn crate::generic_command::ResourceAdmissionPort>,
     pub(crate) custom_resource_reads:
@@ -108,53 +106,9 @@ impl crate::discovery::DiscoveryResourceQuery for ApiResourceMutationServices {
     }
 }
 
-impl crate::generic_read::GenericReadSnapshotPort for ApiResourceMutationServices {
-    fn snapshot_resources_at_rv(
-        &self,
-        request: crate::generic_read::GenericReadSnapshotRequest,
-    ) -> crate::generic_read::GenericReadFuture<'_, crate::generic_read::GenericReadSnapshot> {
-        Box::pin(async move {
-            let snapshot = self
-                .custom_resource_reads
-                .snapshot_resources_at_rv(
-                    crate::current::custom_resource_ports::CustomResourceSnapshotRequest {
-                        api_version: request.api_version,
-                        kind: request.kind,
-                        namespace: request.namespace,
-                        label_selector: request.label_selector,
-                        field_selector: request.field_selector,
-                        limit: request.limit,
-                        continue_token: request.continue_token,
-                        resource_version: request.resource_version,
-                    },
-                )
-                .await?;
-            Ok(match snapshot {
-                crate::current::custom_resource_ports::CustomResourceListSnapshot::Current => {
-                    crate::generic_read::GenericReadSnapshot::Current
-                }
-                crate::current::custom_resource_ports::CustomResourceListSnapshot::Expired => {
-                    crate::generic_read::GenericReadSnapshot::Expired
-                }
-                crate::current::custom_resource_ports::CustomResourceListSnapshot::List(list) => {
-                    crate::generic_read::GenericReadSnapshot::List(list)
-                }
-            })
-        })
-    }
-}
-
 impl crate::generic_read::GenericReadResourceInputs for ApiResourceMutationServices {
     fn resource_query(&self) -> &dyn klights_leader_api::LeaderResourceQuery {
         self.resource_query.as_ref()
-    }
-
-    fn snapshot_port(&self) -> &dyn crate::generic_read::GenericReadSnapshotPort {
-        self
-    }
-
-    fn resource_versions(&self) -> &dyn crate::generic_read::ListResourceVersionPort {
-        self.list_resource_versions.as_ref()
     }
 
     fn prepare_resource_for_read(
@@ -630,8 +584,6 @@ pub fn build_current_router(
     resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     finalizer_lifecycle: Arc<dyn klights_reconcile_api::FinalizerLifecyclePort>,
     mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
-    list_resource_versions: Arc<dyn crate::generic_read::ListResourceVersionPort>,
-    namespace_lists: Arc<dyn crate::generic_read::NamespaceListPort>,
     quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     admission: Arc<dyn crate::generic_command::ResourceAdmissionPort>,
     custom_resource_reads: Arc<dyn super::custom_resource_ports::CustomResourceReadPort>,
@@ -702,8 +654,6 @@ pub fn build_current_router(
             resource_command,
             finalizer_lifecycle,
             mutation_effects,
-            list_resource_versions,
-            namespace_lists,
             quota_runtime,
             admission,
             custom_resource_reads,

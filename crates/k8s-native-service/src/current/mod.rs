@@ -139,7 +139,7 @@ pub(in crate::current) use pod_handlers::{
 pub use pod_native_orchestration::{PodNativeOrchestration, PodNativeOrchestrationDependencies};
 pub use pod_security::enforce_pod_security_admission;
 pub use pod_subresource_service::PodSubresourceService;
-use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token_at};
+use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery};
 pub use quotas::{
     check_resource_quota_for_creation, check_resource_quota_for_pod_update,
     check_resource_quota_for_pvc_update,
@@ -152,11 +152,11 @@ pub use state_composition::{
 pub(crate) use validation::inject_resource_version_with_identity;
 pub use validation::run_admission_for_request;
 pub use validation::{
-    AdmissionContextRequest, apply_crd_defaults, apply_crd_pruning, build_admission_context,
-    check_content_type, check_cr_field_validation_strict,
-    check_deployment_strict_decode_from_raw_json, check_field_validation_strict,
-    check_field_validation_strict_typed, check_immutable_fields, parse_apply_yaml,
-    prepare_admissionregistration_resource, validate_builtin_field_selector,
+    AdmissionContextRequest, apply_crd_defaults, apply_crd_defaults_from_definition,
+    apply_crd_pruning, build_admission_context, check_content_type,
+    check_cr_field_validation_strict, check_deployment_strict_decode_from_raw_json,
+    check_field_validation_strict, check_field_validation_strict_typed, check_immutable_fields,
+    parse_apply_yaml, prepare_admissionregistration_resource, validate_builtin_field_selector,
     validate_builtin_resource_spec, validate_crd_field_selector,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
     validate_priorityclass_update_immutable,

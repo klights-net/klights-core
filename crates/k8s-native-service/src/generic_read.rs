@@ -9,8 +9,8 @@ use axum::response::Response;
 use base64::Engine as _;
 use klights_cluster_core::Resource;
 use klights_leader_api::{
-    LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
-    ResourceQueryConsistency,
+    LeaderResourceQuery, ResourceGetRequest, ResourceListContinuationMode, ResourceListRequest,
+    ResourceListResult, ResourceListScope, ResourceQueryConsistency, ResourceQueryError,
 };
 use klights_types::ResourceKey;
 use serde::Deserialize;
@@ -18,108 +18,9 @@ use serde_json::Value;
 
 use crate::{ApiState, AppError};
 
-pub type ListResourceVersionFuture<'a> =
-    Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>>;
+pub type GenericReadFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 
-pub trait ListResourceVersionPort: Send + Sync {
-    fn advance_after(&self, minimum_resource_version: i64) -> ListResourceVersionFuture<'_>;
-}
-
-pub trait ListPageMetadata {
-    fn list_resource_version(&self) -> i64;
-}
-
-pub enum ListSnapshotResolution<Page> {
-    List(Page),
-    Current,
-    Expired,
-}
-
-pub trait ListSnapshotResult<Page> {
-    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<Page>;
-}
-
-#[derive(Clone, Debug)]
-pub struct NamespaceListRequest {
-    pub label_selector: Option<String>,
-    pub field_selector: Option<String>,
-    pub limit: Option<i64>,
-    pub continue_token: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct NamespaceListPage {
-    pub items: Vec<Resource>,
-    pub resource_version: i64,
-    pub continue_token: Option<String>,
-    pub remaining_item_count: Option<i64>,
-}
-
-pub enum NamespaceListSnapshot {
-    List(NamespaceListPage),
-    Current,
-    Expired,
-}
-
-pub type NamespaceListFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
-
-pub trait NamespaceListPort: Send + Sync {
-    fn list_namespaces(
-        &self,
-        request: NamespaceListRequest,
-    ) -> NamespaceListFuture<'_, NamespaceListPage>;
-
-    fn snapshot_namespaces(
-        &self,
-        request: NamespaceListRequest,
-        snapshot_resource_version: i64,
-    ) -> NamespaceListFuture<'_, NamespaceListSnapshot>;
-}
-
-impl ListPageMetadata for NamespaceListPage {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version
-    }
-}
-
-impl ListSnapshotResult<NamespaceListPage> for NamespaceListSnapshot {
-    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<NamespaceListPage> {
-        match self {
-            Self::List(list) => ListSnapshotResolution::List(list),
-            Self::Current => ListSnapshotResolution::Current,
-            Self::Expired => ListSnapshotResolution::Expired,
-        }
-    }
-}
-
-impl ListPageMetadata for klights_pod_api::PodListResult {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version()
-    }
-}
-
-impl ListSnapshotResult<klights_pod_api::PodListResult>
-    for klights_pod_api::PodSnapshotListOutcome
-{
-    fn into_list_snapshot_resolution(
-        self,
-    ) -> ListSnapshotResolution<klights_pod_api::PodListResult> {
-        match self {
-            Self::List(list) => ListSnapshotResolution::List(list),
-            Self::Current => ListSnapshotResolution::Current,
-            Self::Expired => ListSnapshotResolution::Expired,
-        }
-    }
-}
-
-impl ListPageMetadata for ResourceListResult {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version()
-    }
-}
-
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ListQuery {
     #[serde(rename = "labelSelector")]
     pub label_selector: Option<String>,
@@ -239,35 +140,23 @@ impl ListQuery {
     }
 }
 
-pub const CONTINUE_TOKEN_TTL_SECS: i64 = 60;
-
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContinueTokenData {
     pub n: String,
     #[serde(default)]
     pub rv: i64,
     pub ts: Option<i64>,
-    #[serde(default)]
-    pub session: bool,
+    /// The HTTP-owned envelope declares how its opaque `n` is to be routed;
+    /// it never reveals or interprets the private root cursor bytes.
+    pub continuation_mode: PublicListContinuationMode,
 }
 
-impl ContinueTokenData {
-    fn is_inconsistent(&self) -> bool {
-        self.ts.is_none()
-    }
-
-    fn is_expired_at(&self, now_unix_seconds: i64) -> bool {
-        self.ts
-            .is_some_and(|timestamp| now_unix_seconds - timestamp > CONTINUE_TOKEN_TTL_SECS)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContinueResourceVersion {
-    Current,
-    Session(i64),
-    Inconsistent { expired_rv: Option<i64> },
-    InconsistentSession(i64),
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicListContinuationMode {
+    Pinned,
+    Recovery,
 }
 
 fn decode_continue_token_data(raw: &str) -> Option<ContinueTokenData> {
@@ -277,221 +166,67 @@ fn decode_continue_token_data(raw: &str) -> Option<ContinueTokenData> {
     serde_json::from_slice(&decoded).ok()
 }
 
-pub fn encode_continue_token_at(last_name: &str, session_rv: i64, now: i64) -> String {
-    let data = ContinueTokenData {
-        n: last_name.to_string(),
-        rv: session_rv,
-        ts: Some(now),
-        session: false,
-    };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&data).unwrap_or_default())
-}
-
-pub fn encode_inconsistent_continue_token(last_name: &str, expired_rv: i64) -> String {
-    let data = ContinueTokenData {
-        n: last_name.to_string(),
-        rv: expired_rv,
-        ts: None,
-        session: false,
-    };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&data).unwrap_or_default())
-}
-
-pub fn encode_inconsistent_session_continue_token(last_name: &str, session_rv: i64) -> String {
-    let data = ContinueTokenData {
-        n: last_name.to_string(),
-        rv: session_rv,
-        ts: None,
-        session: true,
-    };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&data).unwrap_or_default())
-}
-
-pub fn encode_response_continue_token_at(
-    last_name: &str,
-    response_rv: i64,
-    continuation: ContinueResourceVersion,
-    now: i64,
-) -> String {
-    match continuation {
-        ContinueResourceVersion::Inconsistent { .. }
-        | ContinueResourceVersion::InconsistentSession(_) => {
-            encode_inconsistent_session_continue_token(last_name, response_rv)
-        }
-        ContinueResourceVersion::Current | ContinueResourceVersion::Session(_) => {
-            encode_continue_token_at(last_name, response_rv, now)
-        }
-    }
-}
-
-pub fn process_continue_token_at(
+/// Decode only the native HTTP envelope. `n` remains opaque and is forwarded
+/// byte-for-byte to leader RPC/root, whose private codec owns its meaning.
+pub fn process_generic_list_continue_token(
     raw: Option<String>,
-    now: i64,
-) -> Result<(Option<String>, ContinueResourceVersion), AppError> {
-    let raw = match raw {
-        None => return Ok((None, ContinueResourceVersion::Current)),
-        Some(value) if value.is_empty() => {
-            return Ok((None, ContinueResourceVersion::Current));
-        }
-        Some(value) => value,
+) -> Result<(Option<String>, ResourceListContinuationMode), AppError> {
+    let Some(raw) = raw.filter(|token| !token.is_empty()) else {
+        return Ok((None, ResourceListContinuationMode::Initial));
     };
     if let Some(data) = decode_continue_token_data(&raw) {
-        if !data.is_inconsistent() && data.is_expired_at(now) {
-            return Err(AppError::ResourceExpired(
-                encode_inconsistent_continue_token(&data.n, data.rv),
+        if data.n.is_empty() {
+            return Err(AppError::BadRequest(
+                "Invalid value: continue token has an empty opaque cursor".to_string(),
             ));
         }
-        if data.is_inconsistent() {
-            if data.session && data.rv > 0 {
-                return Ok((
-                    Some(data.n),
-                    ContinueResourceVersion::InconsistentSession(data.rv),
-                ));
-            }
-            let expired_rv = (data.rv > 0).then_some(data.rv);
-            return Ok((
-                Some(data.n),
-                ContinueResourceVersion::Inconsistent { expired_rv },
-            ));
-        }
-        return Ok((
-            Some(data.n),
-            if data.rv > 0 {
-                ContinueResourceVersion::Session(data.rv)
-            } else {
-                ContinueResourceVersion::Current
-            },
-        ));
+        let mode = match data.continuation_mode {
+            PublicListContinuationMode::Pinned => ResourceListContinuationMode::Pinned,
+            PublicListContinuationMode::Recovery => ResourceListContinuationMode::Recovery,
+        };
+        return Ok((Some(data.n), mode));
     }
-    Ok((Some(raw), ContinueResourceVersion::Current))
+    Err(AppError::BadRequest(
+        "Invalid value: continue token is not a native LIST envelope".to_string(),
+    ))
 }
 
-pub async fn resolve_list_response_resource_version(
-    resource_versions: &dyn ListResourceVersionPort,
-    continuation: ContinueResourceVersion,
-    current_resource_version: i64,
-) -> Result<i64, AppError> {
-    match continuation {
-        ContinueResourceVersion::Current => Ok(current_resource_version),
-        ContinueResourceVersion::Session(rv) | ContinueResourceVersion::InconsistentSession(rv) => {
-            Ok(rv)
-        }
-        ContinueResourceVersion::Inconsistent { expired_rv } => resource_versions
-            .advance_after(expired_rv.unwrap_or(current_resource_version))
-            .await
-            .map_err(|error| AppError::Internal(error.to_string())),
-    }
-}
-
-#[derive(Debug)]
-pub struct ResolvedListPage<Page> {
-    pub list: Page,
-    pub response_rv: i64,
-    pub continue_resource_version: ContinueResourceVersion,
-}
-
-pub async fn resolve_list_page<Page, Snapshot, SFut, LFut>(
-    resource_versions: &dyn ListResourceVersionPort,
-    rv_match: ListResourceVersionMatch,
-    mut continuation: ContinueResourceVersion,
-    snapshot_fetch: impl FnOnce(i64) -> SFut,
-    live_fetch: impl FnOnce() -> LFut,
-) -> Result<ResolvedListPage<Page>, AppError>
-where
-    Page: ListPageMetadata,
-    Snapshot: ListSnapshotResult<Page>,
-    SFut: Future<Output = Result<Snapshot, AppError>>,
-    LFut: Future<Output = Result<Page, AppError>>,
-{
-    let snapshot_rv = match rv_match {
-        ListResourceVersionMatch::Exact(rv) => Some(rv),
-        _ => match continuation {
-            ContinueResourceVersion::Session(rv) => Some(rv),
-            _ => None,
-        },
+pub fn encode_generic_list_continue_token(
+    inner: &str,
+    response_rv: i64,
+    now: i64,
+    mode: PublicListContinuationMode,
+) -> String {
+    let data = ContinueTokenData {
+        n: inner.to_string(),
+        rv: response_rv,
+        ts: Some(now),
+        continuation_mode: mode,
     };
-    let snapshot_list = if let Some(snapshot_rv) = snapshot_rv {
-        match snapshot_fetch(snapshot_rv)
-            .await?
-            .into_list_snapshot_resolution()
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&data).unwrap_or_default())
+}
+
+pub(crate) fn generic_list_query_error(error: ResourceQueryError, now: i64) -> AppError {
+    match error {
+        ResourceQueryError::Expired {
+            replacement_continue_token,
+            ..
+        } if replacement_continue_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()) =>
         {
-            ListSnapshotResolution::List(list) => Some(list),
-            ListSnapshotResolution::Current => None,
-            ListSnapshotResolution::Expired => match rv_match {
-                ListResourceVersionMatch::Exact(rv) => {
-                    return Err(AppError::expired(format!(
-                        "too old resource version: {rv} (the requested resourceVersion is older than the server's retained history)"
-                    )));
-                }
-                _ => {
-                    continuation = ContinueResourceVersion::InconsistentSession(snapshot_rv);
-                    None
-                }
-            },
+            AppError::ResourceExpired(Some(encode_generic_list_continue_token(
+                replacement_continue_token
+                    .as_deref()
+                    .expect("guarded above"),
+                0,
+                now,
+                PublicListContinuationMode::Recovery,
+            )))
         }
-    } else {
-        None
-    };
-    let list = match snapshot_list {
-        Some(list) => list,
-        None => live_fetch().await?,
-    };
-    let mut response_rv = resolve_list_response_resource_version(
-        resource_versions,
-        continuation,
-        list.list_resource_version(),
-    )
-    .await?;
-    match rv_match {
-        ListResourceVersionMatch::Exact(rv) => response_rv = rv,
-        ListResourceVersionMatch::NotOlderThan(rv) => response_rv = response_rv.max(rv),
-        ListResourceVersionMatch::Any => {}
+        error => AppError::from(error),
     }
-    Ok(ResolvedListPage {
-        list,
-        response_rv,
-        continue_resource_version: continuation,
-    })
-}
-
-#[derive(Clone, Debug)]
-pub struct GenericReadSnapshotRequest {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub label_selector: Option<String>,
-    pub field_selector: Option<String>,
-    pub limit: Option<i64>,
-    pub continue_token: Option<String>,
-    pub resource_version: i64,
-}
-
-pub enum GenericReadSnapshot {
-    Current,
-    Expired,
-    List(ResourceListResult),
-}
-
-impl ListSnapshotResult<ResourceListResult> for GenericReadSnapshot {
-    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<ResourceListResult> {
-        match self {
-            Self::List(list) => ListSnapshotResolution::List(list),
-            Self::Current => ListSnapshotResolution::Current,
-            Self::Expired => ListSnapshotResolution::Expired,
-        }
-    }
-}
-
-pub type GenericReadFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
-
-pub trait GenericReadSnapshotPort: Send + Sync {
-    fn snapshot_resources_at_rv(
-        &self,
-        request: GenericReadSnapshotRequest,
-    ) -> GenericReadFuture<'_, GenericReadSnapshot>;
 }
 
 pub struct GenericReadWatchRequest {
@@ -517,8 +252,6 @@ pub struct GenericListResponse {
 
 pub trait GenericReadResourceInputs: Send + Sync {
     fn resource_query(&self) -> &dyn LeaderResourceQuery;
-    fn snapshot_port(&self) -> &dyn GenericReadSnapshotPort;
-    fn resource_versions(&self) -> &dyn ListResourceVersionPort;
     fn prepare_resource_for_read(
         &self,
         api_version: &'static str,
@@ -599,7 +332,7 @@ pub async fn list_resources(
     query: &dyn LeaderResourceQuery,
     api_version: &str,
     kind: &str,
-    namespace: Option<&str>,
+    scope: ResourceListScope,
     label_selector: Option<&str>,
     field_selector: Option<&str>,
     limit: Option<i64>,
@@ -608,7 +341,7 @@ pub async fn list_resources(
     let request = ResourceListRequest::try_new(
         api_version,
         kind,
-        namespace.map(str::to_string),
+        scope,
         label_selector.map(str::to_string),
         field_selector.map(str::to_string),
         limit,
@@ -622,9 +355,9 @@ pub async fn list_all_resources(
     query: &dyn LeaderResourceQuery,
     api_version: &str,
     kind: &str,
-    namespace: Option<&str>,
+    scope: ResourceListScope,
 ) -> Result<ResourceListResult, AppError> {
-    list_resources(query, api_version, kind, namespace, None, None, None, None).await
+    list_resources(query, api_version, kind, scope, None, None, None, None).await
 }
 
 pub async fn list_inner<S: GenericReadState + 'static>(
@@ -669,61 +402,49 @@ pub async fn list_inner<S: GenericReadState + 'static>(
             AppError::Internal("operation time is outside the supported timestamp range".into())
         })?;
     let normalized_limit = query.normalized_limit()?;
-    let has_continue = query
-        .continue_token
-        .as_deref()
-        .is_some_and(|token| !token.is_empty());
-    let rv_match = query.resolve_resource_version_match(has_continue)?;
-    let (continue_name, continuation) =
-        process_continue_token_at(query.continue_token, operation_unix_timestamp)?;
-
-    let snapshot_request = GenericReadSnapshotRequest {
-        api_version: api_version.to_string(),
-        kind: kind.to_string(),
-        namespace: namespace.clone(),
-        label_selector: query.label_selector.clone(),
-        field_selector: query.field_selector.clone(),
-        limit: normalized_limit,
-        continue_token: continue_name.clone(),
-        resource_version: 0,
+    let collection_scope = match (namespaced, namespace.clone()) {
+        (true, Some(namespace)) => ResourceListScope::Namespace(namespace),
+        (true, None) => ResourceListScope::AllNamespaces,
+        (false, None) => ResourceListScope::Cluster,
+        (false, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "cluster-scoped LIST route must not carry a namespace".to_string(),
+            ));
+        }
+    };
+    let (continue_token, continuation_mode) =
+        process_generic_list_continue_token(query.continue_token.clone())?;
+    let resource_version_match = match query.resolve_resource_version_match(
+        continuation_mode != ResourceListContinuationMode::Initial,
+    )? {
+        ListResourceVersionMatch::Any => klights_leader_api::ResourceListResourceVersionMatch::Any,
+        ListResourceVersionMatch::NotOlderThan(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv)
+        }
+        ListResourceVersionMatch::Exact(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::Exact(rv)
+        }
     };
     let resources = state.read_resources();
     let query_port = resources.resource_query();
-    let snapshot_port = resources.snapshot_port();
-    let resource_versions = resources.resource_versions();
-    let live_request = ResourceListRequest::try_new(
+    let live_request = ResourceListRequest::try_new_with_continuation_mode(
         api_version,
         kind,
-        namespace,
+        collection_scope,
         query.label_selector,
         query.field_selector,
         normalized_limit,
-        continue_name,
+        continue_token,
+        continuation_mode,
         ResourceQueryConsistency::LeaderFresh,
-    )?;
-    let ResolvedListPage {
-        list,
-        response_rv,
-        continue_resource_version,
-    } = resolve_list_page(
-        resource_versions,
-        rv_match,
-        continuation,
-        |snapshot_rv| {
-            let mut request = snapshot_request;
-            request.resource_version = snapshot_rv;
-            snapshot_port.snapshot_resources_at_rv(request)
-        },
-        || async move {
-            query_port
-                .list_resources(live_request)
-                .await
-                .map_err(AppError::from)
-        },
-    )
-    .await?;
+    )?
+    .with_resource_version_match(resource_version_match)?;
+    let list = query_port
+        .list_resources(live_request)
+        .await
+        .map_err(|error| generic_list_query_error(error, operation_unix_timestamp))?;
 
-    let (listed, _, _, next_name, remaining_item_count) = list.into_parts();
+    let (listed, response_rv, _, next_inner, remaining_item_count) = list.into_parts();
     let mut items = Vec::with_capacity(listed.len());
     for resource in listed {
         let mut value = resources
@@ -732,12 +453,12 @@ pub async fn list_inner<S: GenericReadState + 'static>(
         inject_node_last_heartbeat(state.as_ref(), api_version, kind, &mut value).await;
         items.push(value);
     }
-    let continue_token = next_name.map(|name| {
-        encode_response_continue_token_at(
-            &name,
+    let continue_token = next_inner.map(|inner| {
+        encode_generic_list_continue_token(
+            &inner,
             response_rv,
-            continue_resource_version,
             operation_unix_timestamp,
+            PublicListContinuationMode::Pinned,
         )
     });
     resources.render_list(GenericListResponse {
@@ -934,22 +655,87 @@ mod tests {
     }
 
     #[test]
-    fn continuation_tokens_preserve_session_and_inconsistent_modes() {
-        let token = encode_continue_token_at("pod-b", 42, 100);
+    fn generic_list_outer_envelope_preserves_opaque_inner_and_recovery_mode() {
+        let inner = "root-private/\u{1f680}?namespace=a/b&name=equal.name";
+        let outer = encode_generic_list_continue_token(
+            inner,
+            41,
+            100,
+            PublicListContinuationMode::Recovery,
+        );
         assert_eq!(
-            process_continue_token_at(Some(token), 101).unwrap(),
+            process_generic_list_continue_token(Some(outer)).unwrap(),
             (
-                Some("pod-b".to_string()),
-                ContinueResourceVersion::Session(42)
+                Some(inner.to_string()),
+                ResourceListContinuationMode::Recovery,
             )
         );
-        let token = encode_inconsistent_session_continue_token("pod-c", 77);
+    }
+
+    #[test]
+    fn generic_list_expiry_wraps_the_typed_recovery_cursor() {
+        let error = generic_list_query_error(
+            ResourceQueryError::Expired {
+                requested: 7,
+                oldest_available: 11,
+                replacement_continue_token: Some("private-recovery/\u{1f680}".to_string()),
+            },
+            100,
+        );
+        let AppError::ResourceExpired(outer) = error else {
+            panic!("typed expiry must remain a Kubernetes 410")
+        };
+        let outer = outer.expect("typed recovery cursor must have an outer envelope");
         assert_eq!(
-            process_continue_token_at(Some(token), 200).unwrap(),
+            process_generic_list_continue_token(Some(outer)).unwrap(),
             (
-                Some("pod-c".to_string()),
-                ContinueResourceVersion::InconsistentSession(77)
+                Some("private-recovery/\u{1f680}".to_string()),
+                ResourceListContinuationMode::Recovery,
             )
         );
+    }
+
+    #[test]
+    fn generic_list_rejects_legacy_or_incomplete_public_envelopes() {
+        use base64::Engine as _;
+        for payload in [
+            serde_json::json!({"n": "opaque", "rv": 1, "ts": 2, "session": true}),
+            serde_json::json!({"n": "opaque", "rv": 1, "ts": 2}),
+            serde_json::json!({"n": "opaque", "rv": 1, "ts": 2, "continuation_mode": null}),
+        ] {
+            let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap());
+            assert!(matches!(
+                process_generic_list_continue_token(Some(token)),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_list_rejects_empty_opaque_cursors_in_both_typed_modes() {
+        for mode in [
+            PublicListContinuationMode::Pinned,
+            PublicListContinuationMode::Recovery,
+        ] {
+            let token = encode_generic_list_continue_token("", 1, 2, mode);
+            assert!(matches!(
+                process_generic_list_continue_token(Some(token)),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_list_expiry_omits_an_empty_recovery_cursor() {
+        let error = generic_list_query_error(
+            ResourceQueryError::Expired {
+                requested: 7,
+                oldest_available: 11,
+                replacement_continue_token: Some(String::new()),
+            },
+            100,
+        );
+        assert!(matches!(error, AppError::ResourceExpired(None)));
     }
 }

@@ -1069,6 +1069,14 @@ async fn resource_get_and_list_reject_non_leader_and_raw_invalid_requests() {
         field_selector: None,
         limit: None,
         continue_token: None,
+        continuation_mode:
+            klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationInitial
+                as i32,
+        scope: klights_internal_protobuf::ResourceListScope::Namespace as i32,
+        resource_version_match: klights_internal_protobuf::ResourceListResourceVersionMatch::Any
+            as i32,
+        requested_resource_version: None,
+        custom_resource: None,
     };
     assert_eq!(
         follower

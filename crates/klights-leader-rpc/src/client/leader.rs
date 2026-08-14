@@ -91,7 +91,7 @@ impl RemoteApiClient {
         ResourceListRequest::try_new(
             "v1",
             "Pod",
-            None,
+            klights_leader_api::ResourceListScope::AllNamespaces,
             None,
             Some(format!("spec.nodeName={node_name}")),
             None,
@@ -103,26 +103,74 @@ impl RemoteApiClient {
 
     fn required_worker_list_requests(node_name: &str) -> Vec<ResourceListRequest> {
         let mut reqs = vec![Self::list_pods_on_node_request(node_name)];
-        for (api_version, kind, namespace) in [
-            ("v1", "ConfigMap", None),
-            ("v1", "Secret", None),
-            ("v1", "PersistentVolumeClaim", None),
-            ("v1", "PersistentVolume", None),
-            ("node.k8s.io/v1", "RuntimeClass", None),
-            ("scheduling.k8s.io/v1", "PriorityClass", None),
-            ("v1", "ServiceAccount", None),
-            ("v1", "Service", None),
-            ("v1", "Endpoints", None),
-            ("discovery.k8s.io/v1", "EndpointSlice", None),
-            ("v1", "Node", None),
-            ("coordination.k8s.io/v1", "Lease", Some("kube-node-lease")),
-            ("v1", "Namespace", None),
+        for (api_version, kind, scope) in [
+            (
+                "v1",
+                "ConfigMap",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            (
+                "v1",
+                "Secret",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            (
+                "v1",
+                "PersistentVolumeClaim",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            (
+                "v1",
+                "PersistentVolume",
+                klights_leader_api::ResourceListScope::Cluster,
+            ),
+            (
+                "node.k8s.io/v1",
+                "RuntimeClass",
+                klights_leader_api::ResourceListScope::Cluster,
+            ),
+            (
+                "scheduling.k8s.io/v1",
+                "PriorityClass",
+                klights_leader_api::ResourceListScope::Cluster,
+            ),
+            (
+                "v1",
+                "ServiceAccount",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            (
+                "v1",
+                "Service",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            (
+                "v1",
+                "Endpoints",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            (
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            ("v1", "Node", klights_leader_api::ResourceListScope::Cluster),
+            (
+                "coordination.k8s.io/v1",
+                "Lease",
+                klights_leader_api::ResourceListScope::Namespace("kube-node-lease".into()),
+            ),
+            (
+                "v1",
+                "Namespace",
+                klights_leader_api::ResourceListScope::Cluster,
+            ),
         ] {
             reqs.push(
                 ResourceListRequest::try_new(
                     api_version,
                     kind,
-                    namespace.map(str::to_string),
+                    scope,
                     None,
                     None,
                     None,

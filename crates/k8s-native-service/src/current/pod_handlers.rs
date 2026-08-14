@@ -11,6 +11,7 @@ use crate::generic_command::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
+use crate::generic_read::ListResourceVersionMatch;
 use async_trait::async_trait;
 
 async fn dispatch_pod_handler_mutation_event(
@@ -108,61 +109,41 @@ pub(in crate::current) async fn list_pods(
     let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
 
-    let has_continue = query
-        .continue_token
-        .as_deref()
-        .is_some_and(|t| !t.is_empty());
-    let rv_match = query.resolve_resource_version_match(has_continue)?;
-
-    // Decode continue token: check TTL and extract name for DB filter.
-    let (db_continue_name, continue_resource_version) =
-        process_continue_token_at(query.continue_token, operation_now.unix_timestamp())?;
-
-    let list_query = klights_pod_api::PodListRequest::try_new(
-        Some(namespace.clone()),
-        query.label_selector.clone(),
-        query.field_selector.clone(),
-        normalized_limit,
-        db_continue_name,
-    )
-    .map_err(AppError::from)?;
-
-    // Pin paginated continuations / Exact reads to a consistent snapshot, shared
-    // with every other list handler. Pods live in the generic resource table, so
-    // the snapshot side reads `("v1","Pod")` directly; the live side stays on the
-    // PodQuery port. See `query::resolve_list_page`.
-    let pod_repository = state.resource_mutation().pod_repository.clone();
-    let snapshot_repository = pod_repository.clone();
-    let snapshot_query = list_query.clone();
-    let live_query = list_query;
-    let crate::current::query::ResolvedListPage {
-        list,
-        response_rv,
-        continue_resource_version,
-    } = crate::current::query::resolve_list_page(
-        state.resource_mutation().list_resource_versions.as_ref(),
-        rv_match,
-        continue_resource_version,
-        |srv| async move {
-            klights_pod_api::PodSnapshotQuery::snapshot_pods(
-                snapshot_repository.as_ref(),
-                klights_pod_api::PodSnapshotListRequest {
-                    list: snapshot_query,
-                    snapshot_resource_version: srv,
-                },
-            )
-            .await
-            .map_err(AppError::from)
-        },
-        || async move {
-            klights_pod_api::PodQuery::list_pods(pod_repository.as_ref(), live_query)
-                .await
-                .map_err(AppError::from)
-        },
-    )
-    .await?;
-
-    let (list_items, _, list_continue_token, remaining_item_count) = list.into_parts();
+    let (continue_token, continuation_mode) =
+        crate::generic_read::process_generic_list_continue_token(query.continue_token.clone())?;
+    let resource_version_match = match query.resolve_resource_version_match(
+        continuation_mode != klights_leader_api::ResourceListContinuationMode::Initial,
+    )? {
+        ListResourceVersionMatch::Any => klights_leader_api::ResourceListResourceVersionMatch::Any,
+        ListResourceVersionMatch::NotOlderThan(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv)
+        }
+        ListResourceVersionMatch::Exact(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::Exact(rv)
+        }
+    };
+    let list = state
+        .resource_mutation()
+        .resource_query
+        .list_resources(
+            klights_leader_api::ResourceListRequest::try_new_with_continuation_mode(
+                "v1",
+                "Pod",
+                klights_leader_api::ResourceListScope::Namespace(namespace.clone()),
+                query.label_selector.clone(),
+                query.field_selector.clone(),
+                normalized_limit,
+                continue_token,
+                continuation_mode,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?
+            .with_resource_version_match(resource_version_match)?,
+        )
+        .await
+        .map_err(|error| {
+            crate::generic_read::generic_list_query_error(error, operation_now.unix_timestamp())
+        })?;
+    let (list_items, response_rv, _, list_continue_token, remaining_item_count) = list.into_parts();
     let items: Vec<Value> = list_items
         .into_iter()
         .map(|r| {
@@ -191,11 +172,11 @@ pub(in crate::current) async fn list_pods(
     if let Some(ref name) = list_continue_token {
         // Normal pages keep the session RV; inconsistent recovery pages must
         // keep returning inconsistent tokens.
-        let token = crate::current::query::encode_response_continue_token_at(
+        let token = crate::generic_read::encode_generic_list_continue_token(
             name,
             response_rv,
-            continue_resource_version,
             operation_now.unix_timestamp(),
+            crate::generic_read::PublicListContinuationMode::Pinned,
         );
         metadata["continue"] = serde_json::json!(token);
     }
@@ -544,59 +525,41 @@ pub(in crate::current) async fn list_all_pods(
     let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
 
-    let has_continue = query
-        .continue_token
-        .as_deref()
-        .is_some_and(|t| !t.is_empty());
-    let rv_match = query.resolve_resource_version_match(has_continue)?;
-
-    // Decode continue token: check TTL and extract name for DB filter.
-    let (db_continue_name, continue_resource_version) =
-        process_continue_token_at(query.continue_token, operation_now.unix_timestamp())?;
-
-    let list_query = klights_pod_api::PodListRequest::try_new(
-        None,
-        query.label_selector.clone(),
-        query.field_selector.clone(),
-        normalized_limit,
-        db_continue_name,
-    )
-    .map_err(AppError::from)?;
-
-    // Cluster-wide Pod list: same consistent-snapshot path as the namespaced
-    // handler, with no namespace scope. See `query::resolve_list_page`.
-    let pod_repository = state.resource_mutation().pod_repository.clone();
-    let snapshot_repository = pod_repository.clone();
-    let snapshot_query = list_query.clone();
-    let live_query = list_query;
-    let crate::current::query::ResolvedListPage {
-        list,
-        response_rv,
-        continue_resource_version,
-    } = crate::current::query::resolve_list_page(
-        state.resource_mutation().list_resource_versions.as_ref(),
-        rv_match,
-        continue_resource_version,
-        |srv| async move {
-            klights_pod_api::PodSnapshotQuery::snapshot_pods(
-                snapshot_repository.as_ref(),
-                klights_pod_api::PodSnapshotListRequest {
-                    list: snapshot_query,
-                    snapshot_resource_version: srv,
-                },
-            )
-            .await
-            .map_err(AppError::from)
-        },
-        || async move {
-            klights_pod_api::PodQuery::list_pods(pod_repository.as_ref(), live_query)
-                .await
-                .map_err(AppError::from)
-        },
-    )
-    .await?;
-
-    let (list_items, _, list_continue_token, remaining_item_count) = list.into_parts();
+    let (continue_token, continuation_mode) =
+        crate::generic_read::process_generic_list_continue_token(query.continue_token.clone())?;
+    let resource_version_match = match query.resolve_resource_version_match(
+        continuation_mode != klights_leader_api::ResourceListContinuationMode::Initial,
+    )? {
+        ListResourceVersionMatch::Any => klights_leader_api::ResourceListResourceVersionMatch::Any,
+        ListResourceVersionMatch::NotOlderThan(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv)
+        }
+        ListResourceVersionMatch::Exact(rv) => {
+            klights_leader_api::ResourceListResourceVersionMatch::Exact(rv)
+        }
+    };
+    let list = state
+        .resource_mutation()
+        .resource_query
+        .list_resources(
+            klights_leader_api::ResourceListRequest::try_new_with_continuation_mode(
+                "v1",
+                "Pod",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+                query.label_selector.clone(),
+                query.field_selector.clone(),
+                normalized_limit,
+                continue_token,
+                continuation_mode,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?
+            .with_resource_version_match(resource_version_match)?,
+        )
+        .await
+        .map_err(|error| {
+            crate::generic_read::generic_list_query_error(error, operation_now.unix_timestamp())
+        })?;
+    let (list_items, response_rv, _, list_continue_token, remaining_item_count) = list.into_parts();
     let items: Vec<Value> = list_items
         .into_iter()
         .map(|r| {
@@ -621,11 +584,11 @@ pub(in crate::current) async fn list_all_pods(
         "resourceVersion": resource_version,
     });
     if let Some(ref name) = list_continue_token {
-        let token = crate::current::query::encode_response_continue_token_at(
+        let token = crate::generic_read::encode_generic_list_continue_token(
             name,
             response_rv,
-            continue_resource_version,
             operation_now.unix_timestamp(),
+            crate::generic_read::PublicListContinuationMode::Pinned,
         );
         metadata["continue"] = serde_json::json!(token);
     }

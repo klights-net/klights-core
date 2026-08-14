@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use klights_cluster_core::{Resource, WatchReplayPosition};
 use klights_leader_api::{
-    LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
-    ResourceQueryConsistency, ResourceQueryError, ResourceQueryFuture, config_map_get_request,
-    node_get_request, pod_get_request, pods_on_node_list_request, secret_get_request,
+    LeaderResourceQuery, ResourceGetRequest, ResourceListContinuationMode, ResourceListRequest,
+    ResourceListResult, ResourceListScope, ResourceQueryConsistency, ResourceQueryError,
+    ResourceQueryFuture, config_map_get_request, node_get_request, pod_get_request,
+    pods_on_node_list_request, secret_get_request,
 };
 use klights_types::ResourceKey;
 
@@ -77,7 +78,7 @@ fn list_request_preserves_selectors_pagination_and_consistency_exactly() {
     let request = ResourceListRequest::try_new(
         "v1",
         "Pod",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         Some(" app in (web,api) ".to_string()),
         Some("spec.nodeName=node-a".to_string()),
         Some(37),
@@ -98,7 +99,7 @@ fn list_request_preserves_selectors_pagination_and_consistency_exactly() {
         ResourceListRequest::try_new(
             "",
             "Pod",
-            None,
+            ResourceListScope::Cluster,
             None,
             None,
             None,
@@ -108,17 +109,7 @@ fn list_request_preserves_selectors_pagination_and_consistency_exactly() {
         ResourceListRequest::try_new(
             "v1",
             "",
-            None,
-            None,
-            None,
-            None,
-            None,
-            ResourceQueryConsistency::Cached,
-        ),
-        ResourceListRequest::try_new(
-            "v1",
-            "Pod",
-            Some(String::new()),
+            ResourceListScope::Cluster,
             None,
             None,
             None,
@@ -128,7 +119,17 @@ fn list_request_preserves_selectors_pagination_and_consistency_exactly() {
         ResourceListRequest::try_new(
             "v1",
             "Pod",
+            ResourceListScope::Namespace(String::new()),
             None,
+            None,
+            None,
+            None,
+            ResourceQueryConsistency::Cached,
+        ),
+        ResourceListRequest::try_new(
+            "v1",
+            "Pod",
+            ResourceListScope::Cluster,
             None,
             None,
             Some(-1),
@@ -141,6 +142,52 @@ fn list_request_preserves_selectors_pagination_and_consistency_exactly() {
             Err(ResourceQueryError::InvalidRequest { .. })
         ));
     }
+}
+
+#[test]
+fn list_continuation_mode_is_explicit_and_expiry_keeps_a_recovery_token() {
+    let request = ResourceListRequest::try_new_with_continuation_mode(
+        "v1",
+        "ConfigMap",
+        ResourceListScope::AllNamespaces,
+        Some("purpose=\u{1f680}/prod".into()),
+        None,
+        Some(1),
+        Some("opaque/\u{1f984}?n=1".into()),
+        ResourceListContinuationMode::Recovery,
+        ResourceQueryConsistency::LeaderFresh,
+    )
+    .unwrap();
+    assert_eq!(
+        request.continuation_mode(),
+        ResourceListContinuationMode::Recovery
+    );
+    assert_eq!(request.continue_token(), Some("opaque/\u{1f984}?n=1"));
+
+    assert!(matches!(
+        ResourceListRequest::try_new_with_continuation_mode(
+            "v1",
+            "ConfigMap",
+            ResourceListScope::AllNamespaces,
+            None,
+            None,
+            Some(1),
+            Some("opaque".into()),
+            ResourceListContinuationMode::Initial,
+            ResourceQueryConsistency::LeaderFresh,
+        ),
+        Err(ResourceQueryError::InvalidRequest { .. })
+    ));
+
+    let expired = ResourceQueryError::expired(41, 53, Some("recovery/\u{1f680}".to_string()));
+    assert!(matches!(
+        expired,
+        ResourceQueryError::Expired {
+            requested: 41,
+            oldest_available: 53,
+            replacement_continue_token,
+        } if replacement_continue_token.as_deref() == Some("recovery/\u{1f680}")
+    ));
 }
 
 #[test]

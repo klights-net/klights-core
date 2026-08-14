@@ -524,12 +524,9 @@ async fn test_list_with_limit_returns_correct_count() {
         "continue token must be set when items remain beyond the limit"
     );
 
-    // remainingItemCount must be >= 1
-    let remaining = list["metadata"]["remainingItemCount"].as_i64();
-    assert!(
-        remaining.is_some() && remaining.unwrap() >= 1,
-        "remainingItemCount must be present and >= 1 when more pages exist"
-    );
+    // Kubernetes makes remainingItemCount optional. Bounded keyset readers
+    // omit it rather than scanning the rest of the collection.
+    assert_eq!(list["metadata"]["remainingItemCount"].as_i64(), None);
 
     // All returned items must have resourceVersion
     for item in items {

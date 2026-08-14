@@ -1498,24 +1498,119 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         self.require_steady_state_auth(&request).await?;
         let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
-        let query = klights_leader_api::ResourceListRequest::try_new(
+        let scope = match klights_internal_protobuf::ResourceListScope::try_from(req.scope) {
+            Ok(klights_internal_protobuf::ResourceListScope::Cluster)
+                if req.namespace.is_none() =>
+            {
+                klights_leader_api::ResourceListScope::Cluster
+            }
+            Ok(klights_internal_protobuf::ResourceListScope::AllNamespaces)
+                if req.namespace.is_none() =>
+            {
+                klights_leader_api::ResourceListScope::AllNamespaces
+            }
+            Ok(klights_internal_protobuf::ResourceListScope::Namespace) => {
+                let namespace = req.namespace.clone().ok_or_else(|| {
+                    Status::invalid_argument("namespace LIST scope requires a namespace")
+                })?;
+                klights_leader_api::ResourceListScope::Namespace(namespace)
+            }
+            Ok(_) => {
+                return Err(Status::invalid_argument(
+                    "invalid LIST scope/namespace combination",
+                ));
+            }
+            Err(_) => return Err(Status::invalid_argument("unknown LIST scope")),
+        };
+        let continuation_mode = match klights_internal_protobuf::ResourceListContinuationMode::try_from(
+            req.continuation_mode,
+        ) {
+            Ok(klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationInitial) => {
+                klights_leader_api::ResourceListContinuationMode::Initial
+            }
+            Ok(klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationPinned) => {
+                klights_leader_api::ResourceListContinuationMode::Pinned
+            }
+            Ok(klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationRecovery) => {
+                klights_leader_api::ResourceListContinuationMode::Recovery
+            }
+            Err(_) => return Err(Status::invalid_argument("unknown LIST continuation mode")),
+        };
+        let resource_version_match =
+            match klights_internal_protobuf::ResourceListResourceVersionMatch::try_from(
+                req.resource_version_match,
+            ) {
+                Ok(klights_internal_protobuf::ResourceListResourceVersionMatch::Any) => {
+                    klights_leader_api::ResourceListResourceVersionMatch::Any
+                }
+                Ok(klights_internal_protobuf::ResourceListResourceVersionMatch::NotOlderThan) => {
+                    klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(
+                        req.requested_resource_version.ok_or_else(|| {
+                            Status::invalid_argument("missing requested resourceVersion")
+                        })?,
+                    )
+                }
+                Ok(klights_internal_protobuf::ResourceListResourceVersionMatch::Exact) => {
+                    klights_leader_api::ResourceListResourceVersionMatch::Exact(
+                        req.requested_resource_version.ok_or_else(|| {
+                            Status::invalid_argument("missing requested resourceVersion")
+                        })?,
+                    )
+                }
+                Err(_) => {
+                    return Err(Status::invalid_argument(
+                        "unknown LIST resourceVersionMatch",
+                    ));
+                }
+            };
+        let custom_resource_identity = req
+            .custom_resource
+            .map(|identity| {
+                klights_leader_api::CustomResourceListIdentity::try_new(
+                    identity.group,
+                    identity.plural,
+                    identity.requested_version,
+                )
+            })
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let query = klights_leader_api::ResourceListRequest::try_new_with_continuation_mode(
             req.api_version,
             req.kind,
-            req.namespace,
+            scope,
             req.label_selector,
             req.field_selector,
             req.limit,
             req.continue_token,
+            continuation_mode,
             klights_leader_api::ResourceQueryConsistency::LeaderFresh,
         )
+        .and_then(|query| query.with_resource_version_match(resource_version_match))
+        .and_then(|query| match custom_resource_identity {
+            Some(identity) => query.with_custom_resource_identity(identity),
+            None => Ok(query),
+        })
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let list = self
             .ports
             .resource_query
             .list_resources(query)
             .await
-            .map_err(|err| Status::unavailable(err.to_string()))?;
+            .map_err(resource_query_error_to_status)?;
         self.require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+        let frozen_custom_resource_definition = list
+            .frozen_custom_resource_definition()
+            .map(resource_to_proto);
+        let candidate_continuations = list
+            .candidate_continue_tokens()
+            .iter()
+            .cloned()
+            .map(
+                |continue_token| klights_internal_protobuf::CandidateContinuation {
+                    continue_token,
+                },
+            )
+            .collect();
         let (items, resource_version, watch_replay_position, continue_token, remaining_item_count) =
             list.into_parts();
         let items: Vec<klights_internal_protobuf::ResourceObject> =
@@ -1528,6 +1623,8 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                 resource_version,
                 remaining_item_count,
                 watch_replay_position: watch_replay_position.map(watch_replay_position_to_proto),
+                frozen_custom_resource_definition,
+                candidate_continuations,
             },
         ))
     }
@@ -2635,6 +2732,32 @@ fn pod_cleanup_intent_error_to_status(error: klights_leader_api::PodCleanupInten
         Error::Unavailable { .. } | Error::Transport { .. } => Status::unavailable(message),
         Error::Timeout => Status::deadline_exceeded(message),
         Error::Cancelled => Status::cancelled(message),
+        _ => Status::internal(message),
+    }
+}
+
+fn resource_query_error_to_status(error: klights_leader_api::ResourceQueryError) -> Status {
+    use klights_leader_api::ResourceQueryError as Error;
+    let message = error.to_string();
+    match error {
+        Error::InvalidRequest { .. } => Status::invalid_argument(message),
+        Error::Expired {
+            requested,
+            oldest_available,
+            replacement_continue_token,
+        } => crate::resource_list_expired_status(
+            requested,
+            oldest_available,
+            replacement_continue_token,
+        ),
+        Error::Conflict { .. } => Status::aborted(message),
+        Error::NotFound { .. } => Status::not_found(message),
+        Error::Retryable { .. } => Status::unavailable(message),
+        Error::Timeout => Status::deadline_exceeded(message),
+        Error::Cancelled => Status::cancelled(message),
+        Error::CorruptResponse { .. } => Status::data_loss(message),
+        Error::Unsupported { .. } => Status::unimplemented(message),
+        Error::QueryFailed { .. } => Status::internal(message),
         _ => Status::internal(message),
     }
 }

@@ -80,7 +80,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected = vec![
+        let expected = [
             (Some("ns-a".to_string()), "a".to_string()),
             (Some("ns-a".to_string()), "same".to_string()),
             (Some("ns-b".to_string()), "same".to_string()),

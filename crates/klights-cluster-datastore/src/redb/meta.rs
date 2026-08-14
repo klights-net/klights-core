@@ -56,6 +56,8 @@ pub(super) fn schema_check(db: &Database) -> Result<(), OpenError> {
     check!(tables::RES_NS);
     check!(tables::NAMESPACES);
     check!(tables::WATCH_EVENTS);
+    check!(tables::RESOURCE_HISTORY_BY_IDENTITY);
+    check!(tables::RESOURCE_CURRENT_BY_IDENTITY);
     check!(tables::WATCH_REPLAY_FLOORS);
     check!(tables::WATCH_REPLAY_POSITION_FLOORS);
     check!(tables::OUTBOX_STREAM_WATERMARKS);

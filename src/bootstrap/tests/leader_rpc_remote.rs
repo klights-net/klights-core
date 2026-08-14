@@ -15,8 +15,8 @@ use klights_leader_api::{
     CacheReadinessError, CacheReadinessRequest, LeaderCacheReadiness, LeaderNetworkTopologyQuery,
     LeaderNodeSubnetAllocation, LeaderResourceQuery, LeaderWatch, NodeDataplaneQuery,
     NodeSubnetAllocationError, NodeSubnetAllocationRequest, NodeSubnetQuery, PeerSubnetsQuery,
-    ResourceEvent, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
-    WatchEventType, WatchRequest, pod_get_request,
+    ResourceEvent, ResourceGetRequest, ResourceListRequest, ResourceListScope,
+    ResourceQueryConsistency, WatchEventType, WatchRequest, pod_get_request,
 };
 use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
 use klights_leader_rpc::client::RemoteApiClient;
@@ -59,7 +59,10 @@ impl TestRemote {
         let request = ResourceListRequest::try_new(
             scope.api_version().to_string(),
             scope.kind().to_string(),
-            scope.namespace().map(str::to_owned),
+            scope
+                .namespace()
+                .map(|namespace| ResourceListScope::Namespace(namespace.to_owned()))
+                .unwrap_or(ResourceListScope::AllNamespaces),
             scope.label_selector().map(str::to_owned),
             scope.field_selector().map(str::to_owned),
             None,
@@ -590,7 +593,7 @@ async fn grpc_list_position_round_trips_into_lossless_watch_resume() {
     let list_req = ResourceListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -647,6 +650,293 @@ async fn grpc_list_position_round_trips_into_lossless_watch_resume() {
             .is_some_and(|position| position.event_id > list_position.event_id)
     );
     handle.abort();
+}
+
+#[tokio::test]
+async fn grpc_paginated_list_preserves_namespace_scope_and_pinned_mode_on_page_two() {
+    let (client, db, handle) = remote_client_and_leader_db().await;
+    for name in ["cm-a", "cm-b", "cm-c"] {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": name}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let first = client
+        .list_resources(
+            ResourceListRequest::try_new(
+                "v1",
+                "ConfigMap",
+                ResourceListScope::Namespace("default".to_string()),
+                None,
+                None,
+                Some(2),
+                None,
+                ResourceQueryConsistency::LeaderFresh,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("first direct RPC page");
+    let continuation = first
+        .continue_token()
+        .expect("first page must carry typed private continuation")
+        .to_string();
+    let second = client
+        .list_resources(
+            ResourceListRequest::try_new_with_continuation_mode(
+                "v1",
+                "ConfigMap",
+                ResourceListScope::Namespace("default".to_string()),
+                None,
+                None,
+                Some(2),
+                Some(continuation),
+                klights_leader_api::ResourceListContinuationMode::Pinned,
+                ResourceQueryConsistency::LeaderFresh,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("pinned page two must retain direct RPC scope/mode");
+    assert_eq!(
+        second
+            .items()
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["cm-c"]
+    );
+    assert_eq!(second.resource_version(), first.resource_version());
+    assert!(second.continue_token().is_none());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn grpc_custom_resource_list_accepts_retained_served_versions_across_pages() {
+    let (client, db, handle) = remote_client_and_leader_db().await;
+    db.create_resource(
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        "widgets.example.com",
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com", "uid": "widgets-crd"},
+            "spec": {
+                "group": "example.com", "scope": "Namespaced",
+                "names": {"kind": "Widget", "plural": "widgets", "singular": "widget"},
+                "versions": [
+                    {"name": "v1", "served": true, "storage": true},
+                    {"name": "v2", "served": true, "storage": false}
+                ]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    for (api_version, name) in [
+        ("example.com/v1", "a-stored-v1"),
+        ("example.com/v2", "z-retained-v2"),
+    ] {
+        db.create_resource(
+            api_version,
+            "Widget",
+            Some("default"),
+            name,
+            json!({
+                "apiVersion": api_version, "kind": "Widget",
+                "metadata": {"namespace": "default", "name": name}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let first = client
+        .list_resources(
+            ResourceListRequest::try_new(
+                "example.com/v2",
+                "Widget",
+                ResourceListScope::Namespace("default".to_string()),
+                None,
+                None,
+                Some(1),
+                None,
+                ResourceQueryConsistency::LeaderFresh,
+            )
+            .unwrap()
+            .with_custom_resource_identity(
+                klights_leader_api::CustomResourceListIdentity::try_new(
+                    "example.com",
+                    "widgets",
+                    "v2",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("remote v2 CRD page one must accept the storage-version item");
+    let continuation = first
+        .continue_token()
+        .expect("page one continuation")
+        .to_string();
+    let second = client
+        .list_resources(
+            ResourceListRequest::try_new_with_continuation_mode(
+                "example.com/v2",
+                "Widget",
+                ResourceListScope::Namespace("default".to_string()),
+                None,
+                None,
+                Some(1),
+                Some(continuation),
+                klights_leader_api::ResourceListContinuationMode::Pinned,
+                ResourceQueryConsistency::LeaderFresh,
+            )
+            .unwrap()
+            .with_custom_resource_identity(
+                klights_leader_api::CustomResourceListIdentity::try_new(
+                    "example.com",
+                    "widgets",
+                    "v2",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("remote v2 CRD page two must accept a retained served-version item");
+    let served_versions = [
+        first.items()[0].api_version.as_str(),
+        second.items()[0].api_version.as_str(),
+    ];
+    assert!(served_versions.contains(&"example.com/v1"));
+    assert!(served_versions.contains(&"example.com/v2"));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn paginated_leader_fresh_list_never_marks_a_partial_scope_cache_complete() {
+    let (client, db, handle) = remote_client_and_leader_db().await;
+    for name in ["cm-a", "cm-b", "cm-c"] {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": name}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let partial = client
+        .list_resources(
+            ResourceListRequest::try_new(
+                "v1",
+                "ConfigMap",
+                ResourceListScope::Namespace("default".to_string()),
+                None,
+                None,
+                Some(1),
+                None,
+                ResourceQueryConsistency::LeaderFresh,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("leader-fresh first page");
+    assert_eq!(partial.items().len(), 1);
+    let cached_full_scope = client
+        .list_resources(
+            ResourceListRequest::try_new(
+                "v1",
+                "ConfigMap",
+                ResourceListScope::Namespace("default".to_string()),
+                None,
+                None,
+                None,
+                None,
+                ResourceQueryConsistency::Cached,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("cached request must synchronously prime the complete scope, not reuse page one");
+    assert_eq!(
+        cached_full_scope
+            .items()
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["cm-a", "cm-b", "cm-c"]
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn cache_never_answers_historical_or_custom_resource_lists() {
+    let remote = remote_for_tests("worker-cache-contract");
+    let scope = CacheReadinessRequest::try_new(
+        "v1".to_string(),
+        "ConfigMap".to_string(),
+        Some("default".to_string()),
+        None,
+        None,
+    )
+    .unwrap();
+    remote.cache_prime_scope(scope).await;
+
+    // The cache is deliberately ready but has no leader transport. Both calls
+    // must therefore fail as direct reads instead of silently returning the
+    // ready live cache for an Exact or root-composed custom-resource request.
+    let exact = ResourceListRequest::try_new(
+        "v1",
+        "ConfigMap",
+        ResourceListScope::Namespace("default".to_string()),
+        None,
+        None,
+        None,
+        None,
+        ResourceQueryConsistency::Cached,
+    )
+    .unwrap()
+    .with_resource_version_match(klights_leader_api::ResourceListResourceVersionMatch::Exact(
+        1,
+    ))
+    .unwrap();
+    assert!(remote.list_resources(exact).await.is_err());
+
+    let custom = ResourceListRequest::try_new(
+        "example.com/v1",
+        "Widget",
+        ResourceListScope::Namespace("default".to_string()),
+        None,
+        Some("spec.rank=7".to_string()),
+        None,
+        None,
+        ResourceQueryConsistency::Cached,
+    )
+    .unwrap()
+    .with_custom_resource_identity(
+        klights_leader_api::CustomResourceListIdentity::try_new("example.com", "widgets", "v1")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(remote.list_resources(custom).await.is_err());
 }
 
 #[tokio::test]
@@ -790,7 +1080,7 @@ async fn leader_fresh_get_never_falls_back_to_a_primed_cache_without_transport()
             ResourceListRequest::try_new(
                 "v1",
                 "Pod",
-                Some("default".to_string()),
+                ResourceListScope::Namespace("default".to_string()),
                 None,
                 None,
                 None,

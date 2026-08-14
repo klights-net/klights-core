@@ -9,7 +9,6 @@ pub(crate) mod generated_handler_adapter;
 pub(crate) mod leader_bootstrap_store_adapter;
 pub(crate) mod leader_maintenance_adapter;
 pub(crate) mod leader_topology_cleanup_adapter;
-pub(crate) mod list_query_adapter;
 pub(crate) mod networking_state_adapter;
 pub(crate) mod node_admin_adapter;
 pub(crate) mod node_log_runtime_adapter;

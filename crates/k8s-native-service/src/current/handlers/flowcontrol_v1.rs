@@ -15,7 +15,7 @@ pub(in crate::current) async fn delete_collection_flowschemas(
         state.resource_mutation().resource_command.as_ref(),
         "flowcontrol.apiserver.k8s.io/v1",
         "FlowSchema",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;
@@ -33,7 +33,7 @@ pub(in crate::current) async fn delete_collection_prioritylevelconfigurations(
         state.resource_mutation().resource_command.as_ref(),
         "flowcontrol.apiserver.k8s.io/v1",
         "PriorityLevelConfiguration",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;

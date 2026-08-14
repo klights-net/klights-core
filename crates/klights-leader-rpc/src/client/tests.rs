@@ -511,6 +511,8 @@ mod cases {
                 event_id: 9,
                 resource_version_filter_through_event_id: 9,
             }),
+            frozen_custom_resource_definition: None,
+            candidate_continuations: Vec::new(),
         };
         let mut negative = base();
         negative.watch_replay_position.as_mut().unwrap().event_id = -1;
@@ -528,6 +530,23 @@ mod cases {
                 Err(klights_leader_api::ResourceQueryError::CorruptResponse { .. })
             ));
         }
+    }
+
+    #[test]
+    fn list_response_preserves_per_candidate_continuation_presence() {
+        let candidates = vec![
+            klights_internal_protobuf::CandidateContinuation {
+                continue_token: Some("opaque/after-first".to_string()),
+            },
+            klights_internal_protobuf::CandidateContinuation {
+                continue_token: None,
+            },
+        ];
+        assert_eq!(
+            super::super::candidate_continue_tokens_from_wire(candidates),
+            vec![Some("opaque/after-first".to_string()), None],
+            "RPC must preserve each candidate boundary, including absence"
+        );
     }
 
     #[test]

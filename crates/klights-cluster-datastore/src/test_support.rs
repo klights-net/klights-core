@@ -292,6 +292,14 @@ impl ResourceTestStore {
         Self { datastore }
     }
 
+    /// Datastore-owned focused read capability for root composition tests.
+    /// It exposes no backend or connection escape hatch.
+    pub fn focused_resource_reads_for_test_support(
+        &self,
+    ) -> std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead> {
+        self.datastore.focused_read_store()
+    }
+
     pub async fn create(
         &self,
         api_version: &str,

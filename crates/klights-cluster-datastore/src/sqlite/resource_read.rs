@@ -391,135 +391,98 @@ impl SqliteReadStore {
 
         if selector_free_limited {
             let lim = limit.expect("selector_free_limited implies Some(limit)");
-            let fetch_limit = lim;
-            let token_for_count = token_owned.clone();
-            let ns_for_count = ns_owned.clone();
+            let fetch_limit = lim.saturating_add(1);
             let event_compat = needs_event_v1_compat(api_version, kind);
-            let (items, total_after_token, watch_position) =
-                if use_namespaced_table(api_version, kind, &namespace) {
-                    self.read_db_call("db_query", move |conn| {
-                        let tx = conn.transaction()?;
-                        let conn = &tx;
-                        let (where_head, mut params): (&str, Vec<Box<dyn rusqlite::ToSql>>) =
-                            if event_compat {
-                                (
-                                    queries::NAMESPACED_LIST_BY_KIND_EVENT_COMPAT_HEAD,
-                                    vec![Box::new(k.clone())],
-                                )
-                            } else {
-                                (
-                                    queries::NAMESPACED_LIST_BY_AV_KIND_HEAD,
-                                    vec![Box::new(av.clone()), Box::new(k.clone())],
-                                )
-                            };
-                        let mut query = format!("{}{where_head}", queries::NAMESPACED_LIST_HEAD,);
-                        if let Some(ref ns_val) = ns_owned {
-                            query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
-                            params.push(Box::new(ns_val.clone()));
-                        }
-                        if let Some(token) = &token_owned {
-                            query.push_str(&format!(" AND name > ?{}", params.len() + 1));
-                            params.push(Box::new(token.clone()));
-                        }
-
-                        let mut count_query =
-                            format!("{}{where_head}", queries::NAMESPACED_COUNT_HEAD);
-                        let mut count_params: Vec<Box<dyn rusqlite::ToSql>> = if event_compat {
-                            vec![Box::new(k.clone())]
+            let (mut items, watch_position) = if use_namespaced_table(api_version, kind, &namespace)
+            {
+                self.read_db_call("db_query", move |conn| {
+                    let tx = conn.transaction()?;
+                    let conn = &tx;
+                    let (where_head, mut params): (&str, Vec<Box<dyn rusqlite::ToSql>>) =
+                        if event_compat {
+                            (
+                                queries::NAMESPACED_LIST_BY_KIND_EVENT_COMPAT_HEAD,
+                                vec![Box::new(k.clone())],
+                            )
                         } else {
-                            vec![Box::new(av.clone()), Box::new(k.clone())]
+                            (
+                                queries::NAMESPACED_LIST_BY_AV_KIND_HEAD,
+                                vec![Box::new(av.clone()), Box::new(k.clone())],
+                            )
                         };
-                        if let Some(ref ns_val) = ns_for_count {
-                            count_query
-                                .push_str(&format!(" AND namespace = ?{}", count_params.len() + 1));
-                            count_params.push(Box::new(ns_val.clone()));
-                        }
-                        if let Some(token) = &token_for_count {
-                            count_query
-                                .push_str(&format!(" AND name > ?{}", count_params.len() + 1));
-                            count_params.push(Box::new(token.clone()));
-                        }
+                    let mut query = format!("{}{where_head}", queries::NAMESPACED_LIST_HEAD,);
+                    if let Some(ref ns_val) = ns_owned {
+                        query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
+                        params.push(Box::new(ns_val.clone()));
+                    }
+                    if let Some(token) = &token_owned {
+                        query.push_str(&format!(" AND name > ?{}", params.len() + 1));
+                        params.push(Box::new(token.clone()));
+                    }
 
-                        query.push_str(&format!(" ORDER BY name LIMIT ?{}", params.len() + 1));
-                        params.push(Box::new(fetch_limit));
+                    query.push_str(&format!(" ORDER BY name LIMIT ?{}", params.len() + 1));
+                    params.push(Box::new(fetch_limit));
 
-                        let param_refs: Vec<&dyn rusqlite::ToSql> =
-                            params.iter().map(|p| p.as_ref()).collect();
-                        let mut stmt = conn.prepare(&query)?;
-                        let rows = stmt.query_map(&param_refs[..], row_to_namespaced_resource)?;
-                        // Bounded by `fetch_limit` (LIMIT clause); pre-size to avoid
-                        // realloc churn on the common large-page list path.
-                        let mut items = Vec::with_capacity(
-                            usize::try_from(fetch_limit)
-                                .unwrap_or(usize::MAX)
-                                .min(MAX_INTERNAL_LIST_PREALLOCATION),
-                        );
-                        for row in rows {
-                            items.push(row?);
-                        }
+                    let param_refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let mut stmt = conn.prepare(&query)?;
+                    let rows = stmt.query_map(&param_refs[..], row_to_namespaced_resource)?;
+                    // Bounded by `fetch_limit` (LIMIT clause); pre-size to avoid
+                    // realloc churn on the common large-page list path.
+                    let mut items = Vec::with_capacity(
+                        usize::try_from(fetch_limit)
+                            .unwrap_or(usize::MAX)
+                            .min(MAX_INTERNAL_LIST_PREALLOCATION),
+                    );
+                    for row in rows {
+                        items.push(row?);
+                    }
 
-                        let count_param_refs: Vec<&dyn rusqlite::ToSql> =
-                            count_params.iter().map(|p| p.as_ref()).collect();
-                        let total_after_token: i64 =
-                            conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
-                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        Ok((items, total_after_token, watch_position))
-                    })
-                    .await?
-                } else {
-                    self.read_db_call("db_query", move |conn| {
-                        let tx = conn.transaction()?;
-                        let conn = &tx;
-                        let mut query = queries::CLUSTER_LIST_HEAD.to_string();
-                        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                            vec![Box::new(av.clone()), Box::new(k.clone())];
-                        if let Some(token) = &token_owned {
-                            query.push_str(&format!(" AND name > ?{}", params.len() + 1));
-                            params.push(Box::new(token.clone()));
-                        }
-                        query.push_str(&format!(" ORDER BY name LIMIT ?{}", params.len() + 1));
-                        params.push(Box::new(fetch_limit));
+                    let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
+                    Ok((items, watch_position))
+                })
+                .await?
+            } else {
+                self.read_db_call("db_query", move |conn| {
+                    let tx = conn.transaction()?;
+                    let conn = &tx;
+                    let mut query = queries::CLUSTER_LIST_HEAD.to_string();
+                    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                        vec![Box::new(av.clone()), Box::new(k.clone())];
+                    if let Some(token) = &token_owned {
+                        query.push_str(&format!(" AND name > ?{}", params.len() + 1));
+                        params.push(Box::new(token.clone()));
+                    }
+                    query.push_str(&format!(" ORDER BY name LIMIT ?{}", params.len() + 1));
+                    params.push(Box::new(fetch_limit));
 
-                        let mut count_query = queries::CLUSTER_COUNT_HEAD.to_string();
-                        let mut count_params: Vec<Box<dyn rusqlite::ToSql>> =
-                            vec![Box::new(av.clone()), Box::new(k.clone())];
-                        if let Some(token) = &token_for_count {
-                            count_query
-                                .push_str(&format!(" AND name > ?{}", count_params.len() + 1));
-                            count_params.push(Box::new(token.clone()));
-                        }
+                    let param_refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let mut stmt = conn.prepare(&query)?;
+                    let rows = stmt.query_map(&param_refs[..], row_to_cluster_resource)?;
+                    // Bounded by `fetch_limit` (LIMIT clause); pre-size to avoid
+                    // realloc churn on the common large-page list path.
+                    let mut items = Vec::with_capacity(
+                        usize::try_from(fetch_limit)
+                            .unwrap_or(usize::MAX)
+                            .min(MAX_INTERNAL_LIST_PREALLOCATION),
+                    );
+                    for row in rows {
+                        items.push(row?);
+                    }
 
-                        let param_refs: Vec<&dyn rusqlite::ToSql> =
-                            params.iter().map(|p| p.as_ref()).collect();
-                        let mut stmt = conn.prepare(&query)?;
-                        let rows = stmt.query_map(&param_refs[..], row_to_cluster_resource)?;
-                        // Bounded by `fetch_limit` (LIMIT clause); pre-size to avoid
-                        // realloc churn on the common large-page list path.
-                        let mut items = Vec::with_capacity(
-                            usize::try_from(fetch_limit)
-                                .unwrap_or(usize::MAX)
-                                .min(MAX_INTERNAL_LIST_PREALLOCATION),
-                        );
-                        for row in rows {
-                            items.push(row?);
-                        }
+                    let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
+                    Ok((items, watch_position))
+                })
+                .await?
+            };
 
-                        let count_param_refs: Vec<&dyn rusqlite::ToSql> =
-                            count_params.iter().map(|p| p.as_ref()).collect();
-                        let total_after_token: i64 =
-                            conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
-                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        Ok((items, total_after_token, watch_position))
-                    })
-                    .await?
-                };
-
-            let mut next_token = None;
-            let mut remaining_item_count = None;
-            if total_after_token > lim {
-                next_token = items.last().map(|r| r.name.clone());
-                remaining_item_count = Some((total_after_token - lim).max(0));
-            }
+            let has_more = i64::try_from(items.len()).unwrap_or(i64::MAX) > lim;
+            let page_limit = usize::try_from(lim).unwrap_or(usize::MAX);
+            items.truncate(page_limit);
+            let next_token = has_more
+                .then(|| items.last().map(|r| r.name.clone()))
+                .flatten();
             let response_rv =
                 list_response_resource_version(&items, watch_position.resource_version);
             let watch_replay_position = Some(WatchReplayPosition {
@@ -532,7 +495,7 @@ impl SqliteReadStore {
                 resource_version: response_rv,
                 watch_replay_position,
                 continue_token: next_token,
-                remaining_item_count,
+                remaining_item_count: None,
             });
         }
 
@@ -652,17 +615,11 @@ impl SqliteReadStore {
                         let mut cursor_name = token_owned.clone();
 
                         loop {
-                            let mut query = base_query.clone();
-                            let mut param_strings = base_param_strings.clone();
-                            if let Some(cursor) = &cursor_name {
-                                query.push_str(&format!(
-                                    " AND r.name > ?{}",
-                                    param_strings.len() + 1
-                                ));
-                                param_strings.push(cursor.clone());
-                            }
-                            query.push_str(" ORDER BY r.name");
-                            query.push_str(&format!(" LIMIT ?{}", param_strings.len() + 1));
+                            let (query, param_strings) = residual_selector_window_query(
+                                &base_query,
+                                &base_param_strings,
+                                cursor_name.as_deref(),
+                            );
 
                             let mut params: Vec<Box<dyn rusqlite::ToSql>> = param_strings
                                 .iter()
@@ -1507,4 +1464,23 @@ impl SqliteReadStore {
             .await?;
         Ok(rv)
     }
+}
+
+/// Builds exactly one residual-selector candidate window.  The returned SQL
+/// has a single ordered, exclusive scan cursor and a final bound LIMIT; the
+/// async extraction uses this value to issue one DB closure per window.
+fn residual_selector_window_query(
+    base_query: &str,
+    base_params: &[String],
+    cursor_name: Option<&str>,
+) -> (String, Vec<String>) {
+    let mut query = base_query.to_string();
+    let mut params = base_params.to_vec();
+    if let Some(cursor) = cursor_name {
+        query.push_str(&format!(" AND r.name > ?{}", params.len() + 1));
+        params.push(cursor.to_string());
+    }
+    query.push_str(" ORDER BY r.name");
+    query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+    (query, params)
 }

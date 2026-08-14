@@ -32,7 +32,7 @@ async fn delete_collection_runtimeclasses(
         state.resource_mutation().resource_command.as_ref(),
         "node.k8s.io/v1",
         "RuntimeClass",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;

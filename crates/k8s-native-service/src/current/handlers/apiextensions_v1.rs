@@ -211,7 +211,7 @@ pub async fn delete_collection_customresourcedefinitions(
         state.resource_mutation().resource_query.as_ref(),
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
         None,
         None,

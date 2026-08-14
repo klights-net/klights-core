@@ -17,7 +17,10 @@ use klights_cluster_store::{
 };
 
 use super::RedbRecoveryStore;
-use crate::redb::tables;
+use crate::redb::{
+    mutation_helpers::{rebuild_resource_current_index, rebuild_resource_history_index},
+    tables,
+};
 
 /// Tables included in cluster snapshots (ClusterReplicated + ConfigReplicated).
 /// NodeLocal tables are excluded — they belong to individual nodes.
@@ -350,6 +353,11 @@ impl DatastoreSnapshotter for RedbRecoveryStore {
                 }
             }
 
+            // The index is derived rather than snapshotted. Rebuild it before
+            // publishing the restored database so positioned pages cannot
+            // observe a durable watch row without its identity entry.
+            rebuild_resource_history_index(&w)?;
+            rebuild_resource_current_index(&w)?;
             w.commit()
                 .map_err(|e| anyhow::anyhow!("restore commit failed: {e}"))?;
             Ok(())

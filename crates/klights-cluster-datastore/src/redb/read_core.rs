@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use super::{RedbAccessor, tables};
 use anyhow::{Result, anyhow};
@@ -17,7 +18,9 @@ use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_cluster_store::{
     DataplaneEncryption, DataplaneMode, DataplanePeerMetadata, DurableRawWatchEvent,
     DurableReplayFloor, DurableReplayTarget, DurableWatchEvent, DurableWatchScope,
-    DurableWatchTarget, PeerTopologyRequest, ResourceCollectionKey, StoredNodeSubnet,
+    DurableWatchTarget, PeerTopologyRequest, ResourceCollectionKey, ResourceCollectionScope,
+    ResourceContinuation, ResourceListPage, ResourceListRequest, ResourceListSnapshot,
+    ResourceReadError, StoredNodeSubnet,
 };
 use klights_types::{HostPortRange, NodeName, NodePeerMode, PodSubnet};
 use redb::{ReadableDatabase, ReadableTable};
@@ -28,6 +31,100 @@ use super::key_codec::{decode_resource_key, lex_next, resource_key, resource_pre
 use super::replay_floor::LegacyReplayFloor;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
+const HISTORICAL_CANDIDATE_CAP: usize = 64;
+const HISTORICAL_IDENTITY_HISTORY_CAP: usize = 64;
+const PHYSICAL_BOUND_PREFIX: &str = "physical-bound-";
+
+static PHYSICAL_RESOURCE_DECODES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PHYSICAL_EVENT_DECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PHYSICAL_CANDIDATE_BATCH_MAX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PHYSICAL_HISTORY_BATCH_MAX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalBoundCounters {
+    pub resource_decodes: u64,
+    pub event_decodes: u64,
+    pub candidate_batch_max: u64,
+    pub history_batch_max: u64,
+}
+
+pub fn reset_physical_bound_counters_for_test() {
+    use std::sync::atomic::Ordering;
+    PHYSICAL_RESOURCE_DECODES.store(0, Ordering::Release);
+    PHYSICAL_EVENT_DECODES.store(0, Ordering::Release);
+    PHYSICAL_CANDIDATE_BATCH_MAX.store(0, Ordering::Release);
+    PHYSICAL_HISTORY_BATCH_MAX.store(0, Ordering::Release);
+}
+
+pub fn physical_bound_counters_for_test() -> PhysicalBoundCounters {
+    use std::sync::atomic::Ordering;
+    PhysicalBoundCounters {
+        resource_decodes: PHYSICAL_RESOURCE_DECODES.load(Ordering::Acquire),
+        event_decodes: PHYSICAL_EVENT_DECODES.load(Ordering::Acquire),
+        candidate_batch_max: PHYSICAL_CANDIDATE_BATCH_MAX.load(Ordering::Acquire),
+        history_batch_max: PHYSICAL_HISTORY_BATCH_MAX.load(Ordering::Acquire),
+    }
+}
+
+fn is_physical_bound_name(name: &str) -> bool {
+    name.starts_with(PHYSICAL_BOUND_PREFIX)
+}
+
+struct HistoricalWindowTestControl {
+    pause_once: std::sync::atomic::AtomicBool,
+    pause_resource_version: std::sync::atomic::AtomicI64,
+    pause_event_id: std::sync::atomic::AtomicI64,
+    reached: tokio::sync::Semaphore,
+    resume: tokio::sync::Semaphore,
+    candidate_windows: std::sync::atomic::AtomicU64,
+    history_windows: std::sync::atomic::AtomicU64,
+}
+
+fn historical_window_test_control() -> &'static HistoricalWindowTestControl {
+    static CONTROL: OnceLock<HistoricalWindowTestControl> = OnceLock::new();
+    CONTROL.get_or_init(|| HistoricalWindowTestControl {
+        pause_once: std::sync::atomic::AtomicBool::new(false),
+        pause_resource_version: std::sync::atomic::AtomicI64::new(0),
+        pause_event_id: std::sync::atomic::AtomicI64::new(0),
+        reached: tokio::sync::Semaphore::new(0),
+        resume: tokio::sync::Semaphore::new(0),
+        candidate_windows: std::sync::atomic::AtomicU64::new(0),
+        history_windows: std::sync::atomic::AtomicU64::new(0),
+    })
+}
+
+pub fn arm_historical_window_pause_for_test(position: WatchReplayPosition) {
+    use std::sync::atomic::Ordering;
+    let c = historical_window_test_control();
+    c.pause_resource_version
+        .store(position.resource_version, Ordering::Release);
+    c.pause_event_id.store(position.event_id, Ordering::Release);
+    c.pause_once.store(true, Ordering::Release);
+    c.candidate_windows.store(0, Ordering::Release);
+    c.history_windows.store(0, Ordering::Release);
+}
+pub async fn wait_for_historical_window_pause_for_test() {
+    historical_window_test_control()
+        .reached
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+}
+pub fn resume_historical_window_pause_for_test() {
+    historical_window_test_control().resume.add_permits(1);
+}
+pub fn historical_window_counts_for_test() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    let c = historical_window_test_control();
+    (
+        c.candidate_windows.load(Ordering::Acquire),
+        c.history_windows.load(Ordering::Acquire),
+    )
+}
 
 #[derive(Clone)]
 pub struct RedbReadCore {
@@ -82,7 +179,14 @@ pub enum RedbSnapshotRead {
         items: Vec<Resource>,
         position: WatchReplayPosition,
     },
-    Expired,
+    Expired {
+        oldest_available: i64,
+    },
+}
+
+pub enum RedbHistoricalListRead {
+    Page(ResourceListPage),
+    Expired { oldest_available: i64 },
 }
 
 #[derive(Deserialize)]
@@ -117,6 +221,25 @@ impl RedbReadCore {
         self.call("redb-read:allocator-position", |database| {
             let read = database.begin_read()?;
             replay_position_in_read(&read)
+        })
+        .await
+    }
+
+    pub async fn exact_resource_version_position(
+        &self,
+        resource_version: i64,
+    ) -> Result<WatchReplayPosition> {
+        self.call("redb-read:historical-exact-position", move |database| {
+            let read = database.begin_read()?;
+            let head = replay_position_in_read(&read)?;
+            // Establish an exact RV boundary without reverse-scanning the
+            // global watch log: through this fixed apply-order head, rows are
+            // filtered by RV. A continuation carries this immutable boundary.
+            Ok(WatchReplayPosition {
+                resource_version,
+                event_id: 0,
+                resource_version_filter_through_event_id: head.event_id,
+            })
         })
         .await
     }
@@ -196,11 +319,37 @@ impl RedbReadCore {
             {
                 return list_namespaces_in_read(&read, labels, fields, limit, cursor, position);
             }
+            if !has_selectors && !matches!(scope, RedbCollectionScope::LegacyAny) {
+                return list_current_identity_page_in_read(
+                    &read,
+                    &api_version,
+                    &kind,
+                    &scope,
+                    limit,
+                    cursor,
+                    position,
+                );
+            }
             if matches!(scope, RedbCollectionScope::AllNamespaces) {
                 let table = read.open_table(tables::RES_NS)?;
                 let prefix = resource_prefix(&api_version, &kind, None);
-                let mut start = prefix.clone();
-                start.push(0);
+                let start = cursor
+                    .as_ref()
+                    .and_then(|cursor| {
+                        cursor.namespace().and_then(|namespace| {
+                            lex_next(&resource_key(
+                                &api_version,
+                                &kind,
+                                Some(namespace),
+                                cursor.name(),
+                            ))
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        let mut start = prefix.clone();
+                        start.push(0);
+                        start
+                    });
                 let end = lex_next(&prefix).unwrap_or_else(|| {
                     let mut end = prefix;
                     end.push(0xff);
@@ -208,6 +357,9 @@ impl RedbReadCore {
                 });
                 let mut items = Vec::new();
                 for entry in table.range(start.as_slice()..end.as_slice())? {
+                    if limit.is_some_and(|limit| items.len() > limit) {
+                        break;
+                    }
                     let (_, value) = entry?;
                     let (resource_version, body) = value.value();
                     let data: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -230,17 +382,7 @@ impl RedbReadCore {
                         items.push(resource);
                     }
                 }
-                items.sort_by(|left, right| {
-                    (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
-                });
-                if let Some(cursor) = cursor.as_ref() {
-                    items.retain(|item| {
-                        (item.namespace.as_deref(), item.name.as_str())
-                            > (cursor.namespace(), cursor.name())
-                    });
-                }
-                let total = items.len();
-                let has_more = limit.is_some_and(|limit| total > limit);
+                let has_more = limit.is_some_and(|limit| items.len() > limit);
                 if let Some(limit) = limit {
                     items.truncate(limit);
                 }
@@ -252,13 +394,10 @@ impl RedbReadCore {
                     items,
                     position,
                     continuation,
-                    remaining_item_count: if has_more && !has_selectors {
-                        limit
-                            .and_then(|limit| total.checked_sub(limit))
-                            .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
-                    } else {
-                        None
-                    },
+                    // The exact count is optional in Kubernetes. Computing it
+                    // would require draining the rest of this ordered range,
+                    // which violates a bounded page read.
+                    remaining_item_count: None,
                 });
             }
 
@@ -278,7 +417,6 @@ impl RedbReadCore {
                 usize::MAX
             };
             let mut items = Vec::with_capacity(target.min(4096));
-            let mut remaining = 0_i64;
             let mut has_more = false;
 
             for (table_definition, namespace_filter) in scans {
@@ -336,11 +474,12 @@ impl RedbReadCore {
                             break;
                         }
                         items.push(resource);
-                    } else if limit.is_some_and(|limit| items.len() >= limit) {
-                        has_more = true;
-                        remaining = remaining.saturating_add(1);
                     } else {
                         items.push(resource);
+                        if limit.is_some_and(|limit| items.len() > limit) {
+                            has_more = true;
+                            break;
+                        }
                     }
                 }
                 if has_selectors && items.len() == target {
@@ -353,6 +492,11 @@ impl RedbReadCore {
                 if let Some(limit) = limit {
                     items.truncate(limit);
                 }
+            } else if let Some(limit) = limit {
+                // The selector-free loop deliberately reads one probe row to
+                // establish continuation.  Never expose that probe as an
+                // extra Kubernetes item.
+                items.truncate(limit);
             }
             let continuation = has_more.then(|| {
                 let item = items.last().expect("non-empty limited Redb page");
@@ -362,10 +506,473 @@ impl RedbReadCore {
                 items,
                 position,
                 continuation,
-                remaining_item_count: (!has_selectors && has_more).then_some(remaining),
+                // See the all-namespace branch above: an exact remaining
+                // count would force a collection-sized scan after the page.
+                remaining_item_count: None,
             })
         })
         .await
+    }
+
+    /// Bounded historical LIST state machine. Candidate identities are walked
+    /// from the derived identity index and each reverse-history DB turn is
+    /// capped independently. The public cursor is only the last emitted key.
+    pub async fn bounded_historical_list(
+        &self,
+        request: ResourceListRequest,
+        position: WatchReplayPosition,
+    ) -> std::result::Result<RedbHistoricalListRead, ResourceReadError> {
+        let labels = request
+            .query()
+            .label_selector()
+            .filter(|value| !value.trim().is_empty())
+            .map(klights_types::parse_label_selector)
+            .transpose()
+            .map_err(|error| ResourceReadError::InvalidSelector {
+                message: error.to_string(),
+            })?;
+        let fields = request
+            .query()
+            .field_selector()
+            .filter(|value| !value.trim().is_empty())
+            .map(klights_types::FieldSelector::parse)
+            .transpose()
+            .map_err(|error| ResourceReadError::InvalidSelector {
+                message: error.to_string(),
+            })?;
+        let target =
+            durable_target_for_scope(request.api_version(), request.kind(), request.scope());
+        let limit = request
+            .query()
+            .limit()
+            .and_then(|value| usize::try_from(value).ok());
+        let probe = limit.map_or(usize::MAX, |value| value.saturating_add(1));
+        let mut emitted = Vec::with_capacity(probe.min(HISTORICAL_CANDIDATE_CAP));
+        let mut after = request.query().start_after().cloned();
+        let mut more_candidates: bool;
+        let mut instrument_test_windows = false;
+        loop {
+            let candidates = match self
+                .historical_candidate_window(
+                    request.api_version(),
+                    request.kind(),
+                    request.scope(),
+                    &target,
+                    position,
+                    after.clone(),
+                )
+                .await?
+            {
+                RedbHistoricalCandidates::Items(items) => items,
+                RedbHistoricalCandidates::Expired { oldest_available } => {
+                    return Ok(RedbHistoricalListRead::Expired { oldest_available });
+                }
+            };
+            if candidates
+                .iter()
+                .all(|candidate| is_physical_bound_name(candidate.name()))
+            {
+                PHYSICAL_CANDIDATE_BATCH_MAX
+                    .fetch_max(candidates.len() as u64, std::sync::atomic::Ordering::AcqRel);
+            }
+            {
+                use std::sync::atomic::Ordering;
+                let control = historical_window_test_control();
+                let pause_matches_position = control.pause_resource_version.load(Ordering::Acquire)
+                    == position.resource_version
+                    && control.pause_event_id.load(Ordering::Acquire) == position.event_id;
+                if pause_matches_position
+                    && control
+                        .pause_once
+                        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    instrument_test_windows = true;
+                    control.reached.add_permits(1);
+                    control.resume.acquire().await.unwrap().forget();
+                }
+                if instrument_test_windows {
+                    control.candidate_windows.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            if candidates.is_empty() {
+                more_candidates = false;
+                break;
+            }
+            more_candidates = candidates.len() == HISTORICAL_CANDIDATE_CAP;
+            for candidate in candidates {
+                after = Some(candidate.clone());
+                match self
+                    .historical_identity_at_position(
+                        request.api_version(),
+                        request.kind(),
+                        &target,
+                        position,
+                        &candidate,
+                        instrument_test_windows,
+                    )
+                    .await?
+                {
+                    RedbHistoricalIdentity::Absent => continue,
+                    RedbHistoricalIdentity::Expired { oldest_available } => {
+                        return Ok(RedbHistoricalListRead::Expired { oldest_available });
+                    }
+                    RedbHistoricalIdentity::Resource(resource) => {
+                        if !labels.as_ref().is_none_or(|requirements| {
+                            requirements.iter().all(|requirement| {
+                                requirement.matches(
+                                    resource
+                                        .data
+                                        .pointer("/metadata/labels")
+                                        .and_then(Value::as_object),
+                                )
+                            })
+                        }) || fields.as_ref().is_some_and(|selector| {
+                            !selector.matches_resource_with_identity(
+                                &resource.api_version,
+                                &resource.kind,
+                                &resource.data,
+                            )
+                        }) {
+                            continue;
+                        }
+                        emitted.push(resource);
+                        if emitted.len() == probe {
+                            break;
+                        }
+                    }
+                }
+            }
+            if emitted.len() == probe || !more_candidates {
+                break;
+            }
+        }
+        let has_more = limit.is_some_and(|value| emitted.len() > value)
+            || (limit.is_none() && more_candidates);
+        if let Some(limit) = limit {
+            emitted.truncate(limit);
+        }
+        let snapshot = ResourceListSnapshot::try_new(position)?;
+        let continuation = has_more
+            .then(|| {
+                emitted.last().map(|resource| {
+                    ResourceContinuation::new(
+                        ResourceCollectionKey::new(
+                            resource.namespace.clone(),
+                            resource.name.clone(),
+                        ),
+                        snapshot,
+                    )
+                })
+            })
+            .flatten();
+        Ok(RedbHistoricalListRead::Page(ResourceListPage::try_new(
+            emitted,
+            snapshot,
+            continuation,
+            None,
+        )?))
+    }
+
+    async fn historical_candidate_window(
+        &self,
+        api_version: &str,
+        kind: &str,
+        scope: &ResourceCollectionScope,
+        target: &DurableWatchTarget,
+        position: WatchReplayPosition,
+        after: Option<ResourceCollectionKey>,
+    ) -> std::result::Result<RedbHistoricalCandidates, ResourceReadError> {
+        let api_version = api_version.to_string();
+        let kind = kind.to_string();
+        let scope = scope.clone();
+        let target = target.clone();
+        self.call("redb-read:historical-candidate-window", move |database| {
+            let read = database.begin_read()?;
+            let current = replay_position_in_read(&read)?;
+            if historical_position_unavailable(position, current) {
+                return Ok(RedbHistoricalCandidates::Expired {
+                    oldest_available: current.resource_version,
+                });
+            }
+            if position_expired_for_targets(&read, std::slice::from_ref(&target), position)? {
+                return Ok(RedbHistoricalCandidates::Expired {
+                    oldest_available: oldest_available_for_targets(
+                        &read,
+                        std::slice::from_ref(&target),
+                        position.resource_version,
+                    )?,
+                });
+            }
+            let (prefix, namespaced) = history_prefix(&api_version, &kind, &scope);
+            let end = lex_next(&prefix).unwrap_or_else(|| vec![0xff]);
+            let start = after
+                .as_ref()
+                .map(|key| {
+                    history_identity_prefix(
+                        &api_version,
+                        &kind,
+                        key.namespace(),
+                        key.name(),
+                        namespaced,
+                    )
+                })
+                .and_then(|key| lex_next(&key))
+                .unwrap_or(prefix);
+            let history = read.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY)?;
+            let current = read.open_table(tables::RESOURCE_CURRENT_BY_IDENTITY)?;
+            let events = read.open_table(tables::WATCH_EVENTS)?;
+            // Merge two independently seekable lexical streams.  Advancing a
+            // history identity skips every event for that identity before the
+            // next seek, so churn cannot turn this into a global event scan.
+            let mut history_start = start.clone();
+            let mut current_start = start;
+            let mut history_next = None;
+            let mut current_next = None;
+            let mut history_done = false;
+            let mut current_done = false;
+            let mut candidates = Vec::with_capacity(HISTORICAL_CANDIDATE_CAP);
+            while candidates.len() < HISTORICAL_CANDIDATE_CAP {
+                if history_next.is_none() && !history_done {
+                    let Some(entry) = history
+                        .range(history_start.as_slice()..end.as_slice())?
+                        .next()
+                    else {
+                        history_done = true;
+                        continue;
+                    };
+                    let (key, _) = entry?;
+                    let encoded = key.value();
+                    let Some((namespace, name, identity_end)) =
+                        decode_history_identity(encoded, namespaced)
+                    else {
+                        return Err(anyhow!("malformed derived resource-history identity key"));
+                    };
+                    history_start =
+                        lex_next(&encoded[..identity_end]).unwrap_or_else(|| end.clone());
+                    // An identity is a historical candidate only when its
+                    // latest retained mutation is not represented by P.  The
+                    // event id is monotonic for an identity, so a represented
+                    // latest mutation means every older retained mutation is
+                    // already part of the positioned state.  Skipping it here
+                    // prevents an empty page from walking every pre-P
+                    // tombstone in retained history.
+                    let identity_prefix = &encoded[..identity_end];
+                    let identity_end_key = lex_next(identity_prefix).unwrap_or_else(|| end.clone());
+                    let Some(latest) = history
+                        .range(identity_prefix..identity_end_key.as_slice())?
+                        .next_back()
+                    else {
+                        continue;
+                    };
+                    let (_, latest_event_id) = latest?;
+                    let latest_event_id = latest_event_id.value();
+                    let Some(stored) = events.get(latest_event_id)? else {
+                        return Err(anyhow!(
+                            "derived history index points at a missing watch event"
+                        ));
+                    };
+                    let stored: StoredWatchEvent<'_> = serde_json::from_slice(stored.value())?;
+                    let latest_resource_version = stored
+                        .resource_version
+                        .ok_or_else(|| anyhow!("watch event is missing resourceVersion"))?;
+                    if position.represents_event(latest_event_id as i64, latest_resource_version) {
+                        continue;
+                    }
+                    history_next = Some(ResourceCollectionKey::new(namespace, name));
+                }
+                if current_next.is_none() && !current_done {
+                    let Some(entry) = current
+                        .range(current_start.as_slice()..end.as_slice())?
+                        .next()
+                    else {
+                        current_done = true;
+                        continue;
+                    };
+                    let (key, _) = entry?;
+                    let mut synthetic = key.value().to_vec();
+                    synthetic.extend_from_slice(&0_u64.to_be_bytes());
+                    let Some((namespace, name, _)) =
+                        decode_history_identity(&synthetic, namespaced)
+                    else {
+                        return Err(anyhow!("malformed current resource identity key"));
+                    };
+                    current_start = lex_next(key.value()).unwrap_or_else(|| end.clone());
+                    current_next = Some(ResourceCollectionKey::new(namespace, name));
+                }
+                match (&history_next, &current_next) {
+                    (None, None) => break,
+                    (Some(history), None) => {
+                        candidates.push(history.clone());
+                        history_next = None;
+                    }
+                    (None, Some(current)) => {
+                        candidates.push(current.clone());
+                        current_next = None;
+                    }
+                    (Some(history), Some(current)) => match history.cmp(current) {
+                        std::cmp::Ordering::Less => {
+                            candidates.push(history.clone());
+                            history_next = None;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            candidates.push(current.clone());
+                            current_next = None;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            candidates.push(history.clone());
+                            history_next = None;
+                            current_next = None;
+                        }
+                    },
+                }
+            }
+            Ok(RedbHistoricalCandidates::Items(candidates))
+        })
+        .await
+        .map_err(|error| ResourceReadError::retryable(error.to_string()))
+    }
+
+    async fn historical_identity_at_position(
+        &self,
+        api_version: &str,
+        kind: &str,
+        target: &DurableWatchTarget,
+        position: WatchReplayPosition,
+        candidate: &ResourceCollectionKey,
+        instrument_test_windows: bool,
+    ) -> std::result::Result<RedbHistoricalIdentity, ResourceReadError> {
+        let api_version = api_version.to_string();
+        let kind = kind.to_string();
+        let namespace = candidate.namespace().map(str::to_string);
+        let name = candidate.name().to_string();
+        let target = target.clone();
+        let namespaced = namespace.is_some();
+        let identity =
+            history_identity_prefix(&api_version, &kind, namespace.as_deref(), &name, namespaced);
+        let identity_end = lex_next(&identity).unwrap_or_else(|| vec![0xff]);
+        let mut before = identity_end;
+        let mut initialized = false;
+        let mut reconstructor = None;
+        loop {
+            let api_version = api_version.clone();
+            let kind = kind.clone();
+            let namespace = namespace.clone();
+            let name = name.clone();
+            let physical_bound_identity = is_physical_bound_name(&name);
+            let closure_identity = identity.clone();
+            let closure_before = before.clone();
+            let target = target.clone();
+            let batch = self
+                .call("redb-read:historical-identity-history", move |database| {
+                    let read = database.begin_read()?;
+                    let current_position = replay_position_in_read(&read)?;
+                    if historical_position_unavailable(position, current_position) {
+                        return Ok(RedbHistoricalHistory::Expired {
+                            oldest_available: current_position.resource_version,
+                        });
+                    }
+                    if position_expired_for_targets(&read, std::slice::from_ref(&target), position)?
+                    {
+                        return Ok(RedbHistoricalHistory::Expired {
+                            oldest_available: oldest_available_for_targets(
+                                &read,
+                                std::slice::from_ref(&target),
+                                position.resource_version,
+                            )?,
+                        });
+                    }
+                    let current = read_current_identity(
+                        &read,
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                    )?;
+                    let index = read.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY)?;
+                    let events_table = read.open_table(tables::WATCH_EVENTS)?;
+                    let mut events = Vec::with_capacity(HISTORICAL_IDENTITY_HISTORY_CAP);
+                    for entry in index
+                        .range(closure_identity.as_slice()..closure_before.as_slice())?
+                        .rev()
+                    {
+                        let (_, event_id) = entry?;
+                        let id = event_id.value();
+                        let Some(encoded) = events_table.get(id)? else {
+                            return Err(anyhow!(
+                                "derived history index points at a missing watch event"
+                            ));
+                        };
+                        let stored: StoredWatchEvent<'_> = serde_json::from_slice(encoded.value())?;
+                        let event = durable_event_from_stored(stored)?;
+                        events.push(MembershipHistoryEvent {
+                            event_id: id as i64,
+                            event_type: event.event_type().to_string(),
+                            resource: event.into_resource(),
+                        });
+                        if events.len() == HISTORICAL_IDENTITY_HISTORY_CAP {
+                            break;
+                        }
+                    }
+                    Ok(RedbHistoricalHistory::Events { current, events })
+                })
+                .await
+                .map_err(|error| ResourceReadError::retryable(error.to_string()))?;
+            let RedbHistoricalHistory::Events { current, events } = batch else {
+                let RedbHistoricalHistory::Expired { oldest_available } = batch else {
+                    unreachable!()
+                };
+                return Ok(RedbHistoricalIdentity::Expired { oldest_available });
+            };
+            if instrument_test_windows {
+                historical_window_test_control()
+                    .history_windows
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            if !initialized {
+                reconstructor = Some(MembershipReconstructor::new(
+                    current.into_iter().collect(),
+                    position,
+                ));
+                initialized = true;
+            }
+            let short = events.len() < HISTORICAL_IDENTITY_HISTORY_CAP;
+            if physical_bound_identity {
+                PHYSICAL_EVENT_DECODES
+                    .fetch_add(events.len() as u64, std::sync::atomic::Ordering::AcqRel);
+                PHYSICAL_HISTORY_BATCH_MAX
+                    .fetch_max(events.len() as u64, std::sync::atomic::Ordering::AcqRel);
+            }
+            if let Some(last) = events.last() {
+                let mut key = identity.clone();
+                key.extend_from_slice(&(last.event_id as u64).to_be_bytes());
+                before = key;
+            }
+            let reconstructor = reconstructor
+                .as_mut()
+                .expect("first history window initializes reverse state");
+            for event in &events {
+                reconstructor.observe(event);
+            }
+            if short
+                || reconstructor.can_stop_before(events.last().map_or(0, |event| event.event_id))
+            {
+                return match std::mem::replace(
+                    reconstructor,
+                    MembershipReconstructor::new(Vec::new(), position),
+                )
+                .finish()
+                {
+                    ReconstructedMembership::Items(mut items) => Ok(items.pop().map_or(
+                        RedbHistoricalIdentity::Absent,
+                        RedbHistoricalIdentity::Resource,
+                    )),
+                    ReconstructedMembership::Expired => Ok(RedbHistoricalIdentity::Expired {
+                        oldest_available: position.resource_version,
+                    }),
+                };
+            }
+        }
     }
 
     pub async fn list_resources_for_watch_targets(
@@ -514,15 +1121,9 @@ fn list_namespaces_in_read(
 ) -> Result<RedbResourceList> {
     let table = read.open_table(tables::NAMESPACES)?;
     let mut items = Vec::new();
-    for entry in table.iter()? {
-        let (name, body) = entry?;
-        if cursor
-            .as_ref()
-            .is_some_and(|cursor| name.value() <= cursor.name())
-        {
-            continue;
-        }
-        let resource = namespace_from_body(name.value(), body.value());
+    let probe = limit.map(|value| value.saturating_add(1));
+    let mut include = |name: &str, body: &[u8]| {
+        let resource = namespace_from_body(name, body);
         if labels.iter().all(|requirement| {
             requirement.matches(
                 resource
@@ -535,9 +1136,27 @@ fn list_namespaces_in_read(
         }) {
             items.push(resource);
         }
+        probe.is_some_and(|probe| items.len() >= probe)
+    };
+    if let Some(cursor) = cursor.as_ref() {
+        for entry in table.range(cursor.name()..)? {
+            let (name, body) = entry?;
+            if name.value() <= cursor.name() {
+                continue;
+            }
+            if include(name.value(), body.value()) {
+                break;
+            }
+        }
+    } else {
+        for entry in table.iter()? {
+            let (name, body) = entry?;
+            if include(name.value(), body.value()) {
+                break;
+            }
+        }
     }
-    let total = items.len();
-    let has_more = limit.is_some_and(|limit| total > limit);
+    let has_more = limit.is_some_and(|limit| items.len() > limit);
     if let Some(limit) = limit {
         items.truncate(limit);
     }
@@ -551,13 +1170,7 @@ fn list_namespaces_in_read(
         items,
         position,
         continuation,
-        remaining_item_count: if has_more && labels.is_empty() && fields.is_none() {
-            limit
-                .and_then(|limit| total.checked_sub(limit))
-                .map(|remaining| i64::try_from(remaining).unwrap_or(i64::MAX))
-        } else {
-            None
-        },
+        remaining_item_count: None,
     })
 }
 
@@ -637,6 +1250,9 @@ fn resource_from_data(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if is_physical_bound_name(&name) {
+        PHYSICAL_RESOURCE_DECODES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
     Resource {
         id: 0,
         api_version: api_version.to_string(),
@@ -1156,6 +1772,23 @@ fn target_rv_floor(
         .or(scoped))
 }
 
+/// Returns the strongest real resourceVersion retention boundary across the
+/// collections participating in a positioned read. A cursor beyond an
+/// uncompacted head reports that observed head, never a fabricated zero.
+fn oldest_available_for_targets(
+    read: &redb::ReadTransaction,
+    targets: &[DurableWatchTarget],
+    current_resource_version: i64,
+) -> Result<i64> {
+    let mut oldest = None;
+    for target in targets {
+        if let Some(floor) = target_rv_floor(read, target)? {
+            oldest = Some(oldest.map_or(floor, |current: i64| current.max(floor)));
+        }
+    }
+    Ok(oldest.unwrap_or(current_resource_version))
+}
+
 fn position_expired_for_targets(
     read: &redb::ReadTransaction,
     targets: &[DurableWatchTarget],
@@ -1334,7 +1967,9 @@ impl RedbReadCore {
                     && position.resource_version_filter_through_event_id == 0
                     && position.resource_version > current_position.resource_version)
             {
-                return Ok(RedbSnapshotRead::Expired);
+                return Ok(RedbSnapshotRead::Expired {
+                    oldest_available: current_position.resource_version,
+                });
             }
             let current = read_current_targets(&read, &targets)?;
             let raw = if cursor_covers_current(position, current_position) {
@@ -1345,7 +1980,13 @@ impl RedbReadCore {
                 reconstruct_membership_in_read(&read, &targets, current, position)?
             };
             let ReconstructedMembership::Items(mut items) = raw else {
-                return Ok(RedbSnapshotRead::Expired);
+                return Ok(RedbSnapshotRead::Expired {
+                    oldest_available: oldest_available_for_targets(
+                        &read,
+                        &targets,
+                        current_position.resource_version,
+                    )?,
+                });
             };
             apply_selectors(&mut items, labels.as_deref(), fields.as_deref())?;
             sort_for_targets(&mut items, &sort_targets);
@@ -1425,6 +2066,229 @@ impl RedbReadCore {
         })
         .await
     }
+}
+
+enum RedbHistoricalCandidates {
+    Items(Vec<ResourceCollectionKey>),
+    Expired { oldest_available: i64 },
+}
+
+enum RedbHistoricalIdentity {
+    Resource(Resource),
+    Absent,
+    Expired { oldest_available: i64 },
+}
+
+enum RedbHistoricalHistory {
+    Events {
+        current: Option<Resource>,
+        events: Vec<MembershipHistoryEvent>,
+    },
+    Expired {
+        oldest_available: i64,
+    },
+}
+
+fn durable_target_for_scope(
+    api_version: &str,
+    kind: &str,
+    scope: &ResourceCollectionScope,
+) -> DurableWatchTarget {
+    match scope {
+        ResourceCollectionScope::Cluster => DurableWatchTarget::cluster(api_version, kind),
+        ResourceCollectionScope::AllNamespaces => DurableWatchTarget::namespaced(api_version, kind),
+        ResourceCollectionScope::Namespace(namespace) => {
+            DurableWatchTarget::namespaced_in_namespace(api_version, kind, namespace)
+        }
+    }
+}
+
+fn history_prefix(
+    api_version: &str,
+    kind: &str,
+    scope: &ResourceCollectionScope,
+) -> (Vec<u8>, bool) {
+    match scope {
+        ResourceCollectionScope::Cluster => {
+            let mut prefix = vec![b'C'];
+            push_history_component(&mut prefix, api_version);
+            push_history_component(&mut prefix, kind);
+            push_history_component(&mut prefix, "");
+            (prefix, false)
+        }
+        ResourceCollectionScope::AllNamespaces => {
+            let mut prefix = vec![b'N'];
+            push_history_component(&mut prefix, api_version);
+            push_history_component(&mut prefix, kind);
+            (prefix, true)
+        }
+        ResourceCollectionScope::Namespace(namespace) => {
+            let mut prefix = vec![b'N'];
+            push_history_component(&mut prefix, api_version);
+            push_history_component(&mut prefix, kind);
+            push_history_component(&mut prefix, namespace);
+            (prefix, true)
+        }
+    }
+}
+
+fn history_identity_prefix(
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    namespaced: bool,
+) -> Vec<u8> {
+    let mut key = vec![if namespaced { b'N' } else { b'C' }];
+    push_history_component(&mut key, api_version);
+    push_history_component(&mut key, kind);
+    push_history_component(&mut key, namespace.unwrap_or_default());
+    push_history_component(&mut key, name);
+    key
+}
+
+fn list_current_identity_page_in_read(
+    read: &redb::ReadTransaction,
+    api_version: &str,
+    kind: &str,
+    scope: &RedbCollectionScope,
+    limit: Option<usize>,
+    cursor: Option<ResourceCollectionKey>,
+    position: WatchReplayPosition,
+) -> Result<RedbResourceList> {
+    let logical_scope = match scope {
+        RedbCollectionScope::Cluster => ResourceCollectionScope::Cluster,
+        RedbCollectionScope::AllNamespaces => ResourceCollectionScope::AllNamespaces,
+        RedbCollectionScope::Namespace(namespace) => {
+            ResourceCollectionScope::Namespace(namespace.clone())
+        }
+        RedbCollectionScope::LegacyAny => {
+            unreachable!("legacy path does not use current identity index")
+        }
+    };
+    let (prefix, namespaced) = history_prefix(api_version, kind, &logical_scope);
+    let end = lex_next(&prefix).unwrap_or_else(|| vec![0xff]);
+    let start = cursor
+        .as_ref()
+        .map(|after| {
+            history_identity_prefix(
+                api_version,
+                kind,
+                after.namespace(),
+                after.name(),
+                namespaced,
+            )
+        })
+        .and_then(|key| lex_next(&key))
+        .unwrap_or(prefix);
+    let probe = limit.map_or(usize::MAX, |value| value.saturating_add(1));
+    let index = read.open_table(tables::RESOURCE_CURRENT_BY_IDENTITY)?;
+    let mut items = Vec::with_capacity(probe.min(64));
+    for entry in index.range(start.as_slice()..end.as_slice())? {
+        if items.len() == probe {
+            break;
+        }
+        let (key, _) = entry?;
+        let mut synthetic_history_key = key.value().to_vec();
+        synthetic_history_key.extend_from_slice(&0_u64.to_be_bytes());
+        let Some((namespace, name, _)) =
+            decode_history_identity(&synthetic_history_key, namespaced)
+        else {
+            return Err(anyhow!("malformed current resource identity key"));
+        };
+        if let Some(resource) =
+            read_current_identity(read, api_version, kind, namespace.as_deref(), &name)?
+        {
+            items.push(resource);
+        }
+    }
+    let has_more = limit.is_some_and(|value| items.len() > value);
+    if let Some(limit) = limit {
+        items.truncate(limit);
+    }
+    let continuation = has_more.then(|| {
+        let item = items.last().expect("positive page has a final identity");
+        ResourceCollectionKey::new(item.namespace.clone(), item.name.clone())
+    });
+    Ok(RedbResourceList {
+        items,
+        position,
+        continuation,
+        remaining_item_count: None,
+    })
+}
+
+fn push_history_component(key: &mut Vec<u8>, value: &str) {
+    key.extend_from_slice(value.as_bytes());
+    key.push(0);
+}
+
+fn decode_history_identity(
+    encoded: &[u8],
+    namespaced: bool,
+) -> Option<(Option<String>, String, usize)> {
+    let identity_end = encoded.len().checked_sub(8)?;
+    let identity = encoded.get(..identity_end)?;
+    let (&scope, encoded_components) = identity.split_first()?;
+    if (scope == b'N') != namespaced {
+        return None;
+    }
+    let mut parts = encoded_components.split(|byte| *byte == 0);
+    let api_version = std::str::from_utf8(parts.next()?).ok()?;
+    let kind = std::str::from_utf8(parts.next()?).ok()?;
+    let namespace = std::str::from_utf8(parts.next()?).ok()?;
+    let name = std::str::from_utf8(parts.next()?).ok()?;
+    if api_version.is_empty() || kind.is_empty() || name.is_empty() || parts.next().is_none() {
+        return None;
+    }
+    Some((
+        namespaced.then(|| namespace.to_string()),
+        name.to_string(),
+        identity_end,
+    ))
+}
+
+fn read_current_identity(
+    read: &redb::ReadTransaction,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<Option<Resource>> {
+    if api_version == "v1" && kind == "Namespace" && namespace.is_none() {
+        let table = read.open_table(tables::NAMESPACES)?;
+        return Ok(table
+            .get(name)?
+            .map(|body| namespace_from_body(name, body.value())));
+    }
+    let table = read.open_table(if namespace.is_some() {
+        tables::RES_NS
+    } else {
+        tables::RES_CLUSTER
+    })?;
+    let key = resource_key(api_version, kind, namespace, name);
+    Ok(table.get(key.as_slice())?.map(|value| {
+        let (resource_version, body) = value.value();
+        resource_from_body(
+            api_version,
+            kind,
+            namespace.map(str::to_string),
+            name,
+            resource_version as i64,
+            body,
+        )
+    }))
+}
+
+fn historical_position_unavailable(
+    position: WatchReplayPosition,
+    current: WatchReplayPosition,
+) -> bool {
+    position.event_id > current.event_id
+        || position.resource_version_filter_through_event_id > current.event_id
+        || (position.event_id == 0
+            && position.resource_version_filter_through_event_id == 0
+            && position.resource_version > current.resource_version)
 }
 
 fn cursor_covers_current(position: WatchReplayPosition, current: WatchReplayPosition) -> bool {

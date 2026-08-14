@@ -98,7 +98,7 @@ async fn delete_collection_ingressclasses(
         state.resource_mutation().resource_command.as_ref(),
         "networking.k8s.io/v1",
         "IngressClass",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;

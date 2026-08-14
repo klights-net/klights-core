@@ -94,7 +94,6 @@ fn watch_event_selection_combines_identity_and_selectors() {
     assert!(selection.matches(&event));
     assert!(
         !selection
-            .clone()
             .field_selector(Some("spec.nodeName=worker-b"))
             .matches(&event)
     );

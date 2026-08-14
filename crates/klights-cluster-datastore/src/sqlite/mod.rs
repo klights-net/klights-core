@@ -36,6 +36,11 @@ pub use read_store::SqliteReadStore;
 pub use resource_read::ListResourcesSnapshotPause;
 pub use schema::init_schema_in_conn;
 pub use snapshot::ExactSnapshotRead;
+pub use snapshot::{
+    arm_historical_window_pause_for_test, historical_window_counts_for_test,
+    physical_bound_counters_for_test, reset_physical_bound_counters_for_test,
+    resume_historical_window_pause_for_test, wait_for_historical_window_pause_for_test,
+};
 
 #[cfg(test)]
 pub use open::open_in_memory_with_default_supervisor;

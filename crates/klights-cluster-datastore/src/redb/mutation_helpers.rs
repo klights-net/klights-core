@@ -4,6 +4,7 @@
 //! transactions, JSON values, or byte slices.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::redb::ReadableTable;
 use anyhow::Result;
@@ -13,8 +14,25 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::tables;
+use super::{key_codec::decode_resource_key, tables};
 use klights_cluster_core::{Resource, ResourcePreconditions};
+
+const RESOURCE_HISTORY_INDEX_HIGH_WATER_META_KEY: &str = "resource_history_index_v2_high_water";
+const RESOURCE_CURRENT_INDEX_HIGH_WATER_META_KEY: &str = "resource_current_index_v1_high_water";
+
+// Integration certifications observe this narrow lifecycle counter to prove a
+// correct high-water marker avoids an unnecessary persistent-open rebuild.
+// The counter is diagnostic only; index correctness remains owned by the
+// durable marker and the same-transaction event/index writes.
+static RESOURCE_HISTORY_INDEX_REBUILD_COUNT_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_resource_history_index_rebuild_count_for_test() {
+    RESOURCE_HISTORY_INDEX_REBUILD_COUNT_FOR_TEST.store(0, Ordering::Release);
+}
+
+pub fn resource_history_index_rebuild_count_for_test() -> u64 {
+    RESOURCE_HISTORY_INDEX_REBUILD_COUNT_FOR_TEST.load(Ordering::Acquire)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn log_noop_resource_write(
@@ -300,7 +318,199 @@ pub fn watch_insert(w: &::redb::WriteTransaction, rv: i64, event: &Value) -> Res
     }
     let mut we = w.open_table(tables::WATCH_EVENTS)?;
     we.insert(event_id, serde_json::to_vec(&stored)?.as_slice())?;
+    drop(we);
+    let history_key = resource_history_key(&stored, event_id)?;
+    w.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY)?
+        .insert(history_key.as_slice(), event_id)?;
+    let identity = &history_key[..history_key.len() - std::mem::size_of::<u64>()];
+    let deleted = stored
+        .get("eventType")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type == "DELETED");
+    let mut current = w.open_table(tables::RESOURCE_CURRENT_BY_IDENTITY)?;
+    if deleted {
+        current.remove(identity)?;
+    } else {
+        current.insert(identity, 1)?;
+    }
+    w.open_table(tables::META)?.insert(
+        RESOURCE_HISTORY_INDEX_HIGH_WATER_META_KEY,
+        event_id.to_string().as_bytes(),
+    )?;
+    w.open_table(tables::META)?.insert(
+        RESOURCE_CURRENT_INDEX_HIGH_WATER_META_KEY,
+        event_id.to_string().as_bytes(),
+    )?;
     Ok(())
+}
+
+/// Ordered derived-history key: scope, canonical resource identity, then the
+/// apply-order event ID.  This is deliberately *not* `resource_key`: that
+/// storage key length-prefixes strings, while LIST requires lexical namespace
+/// / name order. Kubernetes identity components cannot contain NUL, so NUL
+/// separators give the derived scan its required bytewise keyset ordering.
+pub fn resource_history_key(event: &Value, event_id: u64) -> Result<Vec<u8>> {
+    let api_version = event
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("watch event missing apiVersion for history index"))?;
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("watch event missing kind for history index"))?;
+    let name = event
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("watch event missing name for history index"))?;
+    let namespace = event.get("namespace").and_then(Value::as_str);
+    let mut key = Vec::with_capacity(
+        api_version.len() + kind.len() + name.len() + namespace.map_or(0, str::len) + 16,
+    );
+    key.push(if namespace.is_some() { b'N' } else { b'C' });
+    for component in [api_version, kind, namespace.unwrap_or_default(), name] {
+        key.extend_from_slice(component.as_bytes());
+        key.push(0);
+    }
+    key.extend_from_slice(&event_id.to_be_bytes());
+    Ok(key)
+}
+
+/// Rebuild the derived identity index from the authoritative durable event
+/// log. This runs in the same write transaction as open migration/restore so
+/// an opened database never exposes a partially populated derived index.
+pub fn rebuild_resource_history_index(w: &::redb::WriteTransaction) -> Result<()> {
+    RESOURCE_HISTORY_INDEX_REBUILD_COUNT_FOR_TEST.fetch_add(1, Ordering::AcqRel);
+    let entries: Vec<(u64, Vec<u8>)> = {
+        let events = w.open_table(tables::WATCH_EVENTS)?;
+        events
+            .iter()?
+            .map(|entry| entry.map(|(id, body)| (id.value(), body.value().to_vec())))
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let existing: Vec<Vec<u8>> = {
+        let index = w.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY)?;
+        index
+            .iter()?
+            .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let mut index = w.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY)?;
+    for key in existing {
+        index.remove(key.as_slice())?;
+    }
+    let mut high_water = 0_u64;
+    for (event_id, body) in entries {
+        let event: Value = serde_json::from_slice(&body)?;
+        let key = resource_history_key(&event, event_id)?;
+        index.insert(key.as_slice(), event_id)?;
+        high_water = high_water.max(event_id);
+    }
+    drop(index);
+    w.open_table(tables::META)?.insert(
+        RESOURCE_HISTORY_INDEX_HIGH_WATER_META_KEY,
+        high_water.to_string().as_bytes(),
+    )?;
+    Ok(())
+}
+
+/// An index built by this version is transactionally current when its durable
+/// high-water equals the authoritative event log's high-water. Both the event
+/// row, derived row, and marker are written in one Redb transaction, so an
+/// interrupted write cannot make this a false positive.
+pub fn resource_history_index_is_current(w: &::redb::WriteTransaction) -> Result<bool> {
+    let high_water = w
+        .open_table(tables::WATCH_EVENTS)?
+        .last()?
+        .map_or(0, |(id, _)| id.value());
+    let marker = w
+        .open_table(tables::META)?
+        .get(RESOURCE_HISTORY_INDEX_HIGH_WATER_META_KEY)?
+        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok());
+    Ok(marker == Some(high_water))
+}
+
+/// Rebuild the lexical current-identity index from authoritative current
+/// rows. It is intentionally independent of watch retention: compaction may
+/// remove every old watch event while a stable resource remains listable.
+pub fn rebuild_resource_current_index(w: &::redb::WriteTransaction) -> Result<()> {
+    let mut identities = Vec::new();
+    for (table_definition, namespaced) in [(tables::RES_CLUSTER, false), (tables::RES_NS, true)] {
+        let table = w.open_table(table_definition)?;
+        for entry in table.iter()? {
+            let (key, _) = entry?;
+            let Some((api_version, kind, namespace, name)) =
+                decode_resource_key(key.value(), namespaced)
+            else {
+                return Err(anyhow::anyhow!(
+                    "malformed resource key while rebuilding current identity index"
+                ));
+            };
+            identities.push(resource_current_identity_key(
+                api_version,
+                kind,
+                namespace,
+                name,
+            ));
+        }
+    }
+    for entry in w.open_table(tables::NAMESPACES)?.iter()? {
+        let (name, _) = entry?;
+        identities.push(resource_current_identity_key(
+            "v1",
+            "Namespace",
+            None,
+            name.value(),
+        ));
+    }
+    let existing: Vec<Vec<u8>> = w
+        .open_table(tables::RESOURCE_CURRENT_BY_IDENTITY)?
+        .iter()?
+        .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
+        .collect::<std::result::Result<_, _>>()?;
+    let mut index = w.open_table(tables::RESOURCE_CURRENT_BY_IDENTITY)?;
+    for key in existing {
+        index.remove(key.as_slice())?;
+    }
+    for key in identities {
+        index.insert(key.as_slice(), 1)?;
+    }
+    drop(index);
+    let high_water = w
+        .open_table(tables::META)?
+        .get("watch_event_id")?
+        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok())
+        .unwrap_or(0);
+    w.open_table(tables::META)?.insert(
+        RESOURCE_CURRENT_INDEX_HIGH_WATER_META_KEY,
+        high_water.to_string().as_bytes(),
+    )?;
+    Ok(())
+}
+
+pub fn resource_current_index_is_current(w: &::redb::WriteTransaction) -> Result<bool> {
+    let meta = w.open_table(tables::META)?;
+    let high_water = meta
+        .get("watch_event_id")?
+        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok())
+        .unwrap_or(0);
+    let marker = meta
+        .get(RESOURCE_CURRENT_INDEX_HIGH_WATER_META_KEY)?
+        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok());
+    Ok(marker == Some(high_water))
+}
+
+fn resource_current_identity_key(
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> Vec<u8> {
+    let mut key = vec![if namespace.is_some() { b'N' } else { b'C' }];
+    for component in [api_version, kind, namespace.unwrap_or_default(), name] {
+        key.extend_from_slice(component.as_bytes());
+        key.push(0);
+    }
+    key
 }
 
 /// Extract owner UIDs from a resource body.

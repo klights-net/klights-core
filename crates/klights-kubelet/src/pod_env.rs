@@ -86,7 +86,7 @@ impl ServiceEnvSource for LeaderApiEnvSourceReader {
             .list_resources(ResourceListRequest::try_new(
                 "v1",
                 "Service",
-                Some(namespace.to_string()),
+                klights_leader_api::ResourceListScope::Namespace(namespace.to_string()),
                 None,
                 None,
                 None,

@@ -413,6 +413,41 @@ pub enum ResourceQueryConsistency {
     LeaderFresh,
 }
 
+/// The private LIST continuation contract. A continuation's spelling is
+/// opaque to this crate; its mode is explicit so an expired pinned snapshot
+/// is never retried as an unpinned current read by accident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceListContinuationMode {
+    Initial,
+    Pinned,
+    Recovery,
+}
+
+/// Exact Kubernetes collection scope. `AllNamespaces` is deliberately
+/// distinct from `Cluster`: both have no namespace string on the wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResourceListScope {
+    Cluster,
+    AllNamespaces,
+    Namespace(String),
+}
+
+impl ResourceListScope {
+    fn validate(&self) -> Result<(), ResourceQueryError> {
+        if let Self::Namespace(namespace) = self {
+            require_nonempty(namespace, "list.scope.namespace")?;
+        }
+        Ok(())
+    }
+
+    pub fn namespace(&self) -> Option<&str> {
+        match self {
+            Self::Namespace(namespace) => Some(namespace),
+            Self::Cluster | Self::AllNamespaces => None,
+        }
+    }
+}
+
 /// Failure returned by the focused leader resource-query capability.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -423,6 +458,14 @@ pub enum ResourceQueryError {
     },
     NotFound {
         key: ResourceKey,
+    },
+    Expired {
+        requested: i64,
+        oldest_available: i64,
+        replacement_continue_token: Option<String>,
+    },
+    Conflict {
+        message: String,
     },
     QueryFailed {
         message: String,
@@ -465,6 +508,18 @@ impl ResourceQueryError {
             message: message.into(),
         }
     }
+
+    pub fn expired(
+        requested: i64,
+        oldest_available: i64,
+        replacement_continue_token: Option<String>,
+    ) -> Self {
+        Self::Expired {
+            requested,
+            oldest_available,
+            replacement_continue_token,
+        }
+    }
 }
 
 impl fmt::Display for ResourceQueryError {
@@ -484,7 +539,16 @@ impl fmt::Display for ResourceQueryError {
                     .unwrap_or_default(),
                 key.name
             ),
-            Self::QueryFailed { message }
+            Self::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => write!(
+                formatter,
+                "LIST snapshot at resourceVersion {requested} expired; oldest available is {oldest_available}"
+            ),
+            Self::Conflict { message }
+            | Self::QueryFailed { message }
             | Self::CorruptResponse { message }
             | Self::Unsupported { message }
             | Self::Retryable { message } => formatter.write_str(message),
@@ -548,12 +612,61 @@ impl ResourceGetRequest {
 pub struct ResourceListRequest {
     api_version: String,
     kind: String,
-    namespace: Option<String>,
+    scope: ResourceListScope,
     label_selector: Option<String>,
     field_selector: Option<String>,
     limit: Option<i64>,
     continue_token: Option<String>,
+    continuation_mode: ResourceListContinuationMode,
+    resource_version_match: ResourceListResourceVersionMatch,
+    custom_resource_identity: Option<CustomResourceListIdentity>,
     consistency: ResourceQueryConsistency,
+}
+
+/// Route-owned identity for a custom-resource LIST. It identifies the public
+/// collection without exposing a datastore plan or interpreting its cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomResourceListIdentity {
+    group: String,
+    plural: String,
+    requested_version: String,
+}
+
+impl CustomResourceListIdentity {
+    pub fn try_new(
+        group: impl Into<String>,
+        plural: impl Into<String>,
+        requested_version: impl Into<String>,
+    ) -> Result<Self, ResourceQueryError> {
+        let group = group.into();
+        let plural = plural.into();
+        let requested_version = requested_version.into();
+        require_nonempty(&group, "list.custom_resource.group")?;
+        require_nonempty(&plural, "list.custom_resource.plural")?;
+        require_nonempty(&requested_version, "list.custom_resource.requested_version")?;
+        Ok(Self {
+            group,
+            plural,
+            requested_version,
+        })
+    }
+
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+    pub fn plural(&self) -> &str {
+        &self.plural
+    }
+    pub fn requested_version(&self) -> &str {
+        &self.requested_version
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceListResourceVersionMatch {
+    Any,
+    NotOlderThan(i64),
+    Exact(i64),
 }
 
 impl ResourceListRequest {
@@ -561,20 +674,48 @@ impl ResourceListRequest {
     pub fn try_new(
         api_version: impl Into<String>,
         kind: impl Into<String>,
-        namespace: Option<String>,
+        scope: ResourceListScope,
         label_selector: Option<String>,
         field_selector: Option<String>,
         limit: Option<i64>,
         continue_token: Option<String>,
         consistency: ResourceQueryConsistency,
     ) -> Result<Self, ResourceQueryError> {
+        let continuation_mode = if continue_token.is_some() {
+            ResourceListContinuationMode::Pinned
+        } else {
+            ResourceListContinuationMode::Initial
+        };
+        Self::try_new_with_continuation_mode(
+            api_version,
+            kind,
+            scope,
+            label_selector,
+            field_selector,
+            limit,
+            continue_token,
+            continuation_mode,
+            consistency,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_continuation_mode(
+        api_version: impl Into<String>,
+        kind: impl Into<String>,
+        scope: ResourceListScope,
+        label_selector: Option<String>,
+        field_selector: Option<String>,
+        limit: Option<i64>,
+        continue_token: Option<String>,
+        continuation_mode: ResourceListContinuationMode,
+        consistency: ResourceQueryConsistency,
+    ) -> Result<Self, ResourceQueryError> {
         let api_version = api_version.into();
         let kind = kind.into();
         require_nonempty(&api_version, "list.api_version")?;
         require_nonempty(&kind, "list.kind")?;
-        if let Some(namespace) = namespace.as_deref() {
-            require_nonempty(namespace, "list.namespace")?;
-        }
+        scope.validate()?;
         if limit.is_some_and(|limit| limit < 0) {
             return Err(ResourceQueryError::invalid(
                 "list.limit",
@@ -589,14 +730,34 @@ impl ResourceListRequest {
                 ResourceQueryError::invalid("list.field_selector", error.to_string())
             })?;
         }
+        match (continuation_mode, continue_token.as_deref()) {
+            (ResourceListContinuationMode::Initial, None)
+            | (ResourceListContinuationMode::Pinned, Some(_))
+            | (ResourceListContinuationMode::Recovery, Some(_)) => {}
+            (ResourceListContinuationMode::Initial, Some(_)) => {
+                return Err(ResourceQueryError::invalid(
+                    "list.continuation_mode",
+                    "initial LIST requests must not carry a continuation",
+                ));
+            }
+            (_, None) => {
+                return Err(ResourceQueryError::invalid(
+                    "list.continue_token",
+                    "pinned and recovery LIST requests require an opaque continuation",
+                ));
+            }
+        }
         Ok(Self {
             api_version,
             kind,
-            namespace,
+            scope,
             label_selector,
             field_selector,
             limit,
             continue_token,
+            continuation_mode,
+            resource_version_match: ResourceListResourceVersionMatch::Any,
+            custom_resource_identity: None,
             consistency,
         })
     }
@@ -610,7 +771,10 @@ impl ResourceListRequest {
     }
 
     pub fn namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
+        self.scope.namespace()
+    }
+    pub const fn scope(&self) -> &ResourceListScope {
+        &self.scope
     }
 
     pub fn label_selector(&self) -> Option<&str> {
@@ -628,6 +792,46 @@ impl ResourceListRequest {
     pub fn continue_token(&self) -> Option<&str> {
         self.continue_token.as_deref()
     }
+    pub const fn continuation_mode(&self) -> ResourceListContinuationMode {
+        self.continuation_mode
+    }
+    pub fn with_resource_version_match(
+        mut self,
+        resource_version_match: ResourceListResourceVersionMatch,
+    ) -> Result<Self, ResourceQueryError> {
+        if self.continuation_mode != ResourceListContinuationMode::Initial
+            && resource_version_match != ResourceListResourceVersionMatch::Any
+        {
+            return Err(ResourceQueryError::invalid(
+                "list.resource_version_match",
+                "continuations require Any resourceVersionMatch",
+            ));
+        }
+        self.resource_version_match = resource_version_match;
+        Ok(self)
+    }
+    pub const fn resource_version_match(&self) -> ResourceListResourceVersionMatch {
+        self.resource_version_match
+    }
+
+    pub fn with_custom_resource_identity(
+        mut self,
+        identity: CustomResourceListIdentity,
+    ) -> Result<Self, ResourceQueryError> {
+        let expected_api_version = format!("{}/{}", identity.group, identity.requested_version);
+        if self.api_version != expected_api_version {
+            return Err(ResourceQueryError::invalid(
+                "list.custom_resource",
+                "identity does not match requested apiVersion",
+            ));
+        }
+        self.custom_resource_identity = Some(identity);
+        Ok(self)
+    }
+
+    pub fn custom_resource_identity(&self) -> Option<&CustomResourceListIdentity> {
+        self.custom_resource_identity.as_ref()
+    }
 
     pub const fn consistency(&self) -> ResourceQueryConsistency {
         self.consistency
@@ -643,6 +847,8 @@ pub struct ResourceListResult {
     watch_replay_position: Option<WatchReplayPosition>,
     continue_token: Option<String>,
     remaining_item_count: Option<i64>,
+    frozen_custom_resource_definition: Option<Resource>,
+    candidate_continue_tokens: Vec<Option<String>>,
 }
 
 impl ResourceListResult {
@@ -676,6 +882,8 @@ impl ResourceListResult {
             watch_replay_position,
             continue_token,
             remaining_item_count,
+            frozen_custom_resource_definition: None,
+            candidate_continue_tokens: Vec::new(),
         })
     }
 
@@ -701,6 +909,24 @@ impl ResourceListResult {
 
     pub const fn remaining_item_count(&self) -> Option<i64> {
         self.remaining_item_count
+    }
+
+    pub fn with_frozen_custom_resource_definition(mut self, definition: Resource) -> Self {
+        self.frozen_custom_resource_definition = Some(definition);
+        self
+    }
+
+    pub fn frozen_custom_resource_definition(&self) -> Option<&Resource> {
+        self.frozen_custom_resource_definition.as_ref()
+    }
+
+    pub fn with_candidate_continue_tokens(mut self, tokens: Vec<Option<String>>) -> Self {
+        self.candidate_continue_tokens = tokens;
+        self
+    }
+
+    pub fn candidate_continue_tokens(&self) -> &[Option<String>] {
+        &self.candidate_continue_tokens
     }
 
     pub fn into_parts(
@@ -3685,7 +3911,7 @@ pub fn pods_on_node_list_request(
     ResourceListRequest::try_new(
         "v1",
         "Pod",
-        None,
+        ResourceListScope::AllNamespaces,
         None,
         Some(format!("spec.nodeName={node_name}")),
         None,

@@ -1372,7 +1372,15 @@ pub async fn delete_collection_inner<S: GenericCommandState + 'static>(
     namespace: &str,
     query: DeleteCollectionQuery,
 ) -> Result<Json<Value>, AppError> {
-    delete_collection_shared_inner(state, identity, api_version, kind, Some(namespace), query).await
+    delete_collection_shared_inner(
+        state,
+        identity,
+        api_version,
+        kind,
+        klights_leader_api::ResourceListScope::Namespace(namespace.to_string()),
+        query,
+    )
+    .await
 }
 
 pub async fn delete_collection_shared_inner<S: GenericCommandState + 'static>(
@@ -1380,15 +1388,16 @@ pub async fn delete_collection_shared_inner<S: GenericCommandState + 'static>(
     _identity: &klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
-    namespace: Option<&str>,
+    scope: klights_leader_api::ResourceListScope,
     query: DeleteCollectionQuery,
 ) -> Result<Json<Value>, AppError> {
     let dry_run = DryRunMode::from_delete_collection_query(&query)?;
+    let namespace = scope.namespace();
     let list = crate::generic_read::list_resources(
         state.command_store().resource_query(),
         api_version,
         kind,
-        namespace,
+        scope.clone(),
         query.label_selector.as_deref(),
         None,
         None,

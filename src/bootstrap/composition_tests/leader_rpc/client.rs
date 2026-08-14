@@ -1726,7 +1726,7 @@ mod cases {
                 klights_leader_api::ResourceListRequest::try_new(
                     "v1",
                     "Pod",
-                    None,
+                    klights_leader_api::ResourceListScope::AllNamespaces,
                     None,
                     None,
                     None,

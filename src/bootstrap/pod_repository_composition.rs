@@ -534,7 +534,10 @@ impl klights_pod_api::PodRepositoryReadPersistence for WorkerPodPersistence {
                     klights_leader_api::ResourceListRequest::try_new(
                         "v1",
                         "Pod",
-                        request.namespace,
+                        request
+                            .namespace
+                            .map(klights_leader_api::ResourceListScope::Namespace)
+                            .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces),
                         request.label_selector,
                         request.field_selector,
                         request.limit,
@@ -1158,7 +1161,14 @@ impl klights_pod_api::PodQuery for RootPodQueryWriter {
                         klights_leader_api::ResourceListRequest::try_new(
                             "v1",
                             "Pod",
-                            request.namespace().map(str::to_string),
+                            request
+                                .namespace()
+                                .map(|namespace| {
+                                    klights_leader_api::ResourceListScope::Namespace(
+                                        namespace.to_string(),
+                                    )
+                                })
+                                .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces),
                             request.label_selector().map(str::to_string),
                             request.field_selector().map(str::to_string),
                             request.limit(),

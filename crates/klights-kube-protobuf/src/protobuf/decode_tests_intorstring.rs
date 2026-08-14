@@ -451,8 +451,8 @@ pub fn test_event_legacy_timestamps_decode_as_rfc3339_in_both_versions() {
         nanos: Some(0),
     };
     let core_event = k8s_pb::api::core::v1::Event {
-        first_timestamp: Some(first.clone()),
-        last_timestamp: Some(last.clone()),
+        first_timestamp: Some(first),
+        last_timestamp: Some(last),
         ..Default::default()
     };
     let events_v1_event = k8s_pb::api::events::v1::Event {

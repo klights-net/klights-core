@@ -1455,5 +1455,8 @@ impl klights_leader_api::LeaderResourceQuery for IntegrationResourceQuery {
 pub fn resource_query_for_test_datastore(
     db: klights_cluster_datastore::test_support::ResourceTestStore,
 ) -> Arc<dyn klights_leader_api::LeaderResourceQuery> {
-    Arc::new(IntegrationResourceQuery { db })
+    crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        db.focused_resource_reads_for_test_support(),
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+    )
 }

@@ -25,8 +25,8 @@ use klights_leader_api::{
     PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
     PodCleanupIntentListRequest, ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
     ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandRequest,
-    ResourceCommandResult, ResourceEvent, ResourceListRequest, ResourceListResult,
-    ResourceQueryError, WatchRequest, WatchStream,
+    ResourceCommandResult, ResourceEvent, ResourceListContinuationMode, ResourceListRequest,
+    ResourceListResult, ResourceListScope, ResourceQueryError, WatchRequest, WatchStream,
 };
 use klights_node_api::{
     BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecStreamChannel,
@@ -810,7 +810,15 @@ impl ReplicationGrpcClient {
     ) -> std::result::Result<ResourceListResult, ResourceQueryError> {
         let expected_api_version = req.api_version().to_string();
         let expected_kind = req.kind().to_string();
+        let expected_scope = req.scope().clone();
         let expected_namespace = req.namespace().map(str::to_owned);
+        let custom_identity = req.custom_resource_identity().map(|identity| {
+            (
+                identity.group().to_string(),
+                identity.plural().to_string(),
+                identity.requested_version().to_string(),
+            )
+        });
         let request = klights_internal_protobuf::ListResourcesRequest {
             api_version: expected_api_version.clone(),
             kind: expected_kind.clone(),
@@ -819,6 +827,44 @@ impl ReplicationGrpcClient {
             field_selector: req.field_selector().map(str::to_owned),
             limit: req.limit(),
             continue_token: req.continue_token().map(str::to_owned),
+            continuation_mode: match req.continuation_mode() {
+                ResourceListContinuationMode::Initial => {
+                    klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationInitial as i32
+                }
+                ResourceListContinuationMode::Pinned => {
+                    klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationPinned as i32
+                }
+                ResourceListContinuationMode::Recovery => {
+                    klights_internal_protobuf::ResourceListContinuationMode::ResourceListContinuationRecovery as i32
+                }
+            },
+            scope: match req.scope() {
+                ResourceListScope::Cluster => {
+                    klights_internal_protobuf::ResourceListScope::Cluster as i32
+                }
+                ResourceListScope::AllNamespaces => {
+                    klights_internal_protobuf::ResourceListScope::AllNamespaces as i32
+                }
+                ResourceListScope::Namespace(_) => {
+                    klights_internal_protobuf::ResourceListScope::Namespace as i32
+                }
+            },
+            resource_version_match: match req.resource_version_match() {
+                klights_leader_api::ResourceListResourceVersionMatch::Any => klights_internal_protobuf::ResourceListResourceVersionMatch::Any as i32,
+                klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(_) => klights_internal_protobuf::ResourceListResourceVersionMatch::NotOlderThan as i32,
+                klights_leader_api::ResourceListResourceVersionMatch::Exact(_) => klights_internal_protobuf::ResourceListResourceVersionMatch::Exact as i32,
+            },
+            requested_resource_version: match req.resource_version_match() {
+                klights_leader_api::ResourceListResourceVersionMatch::Any => None,
+                klights_leader_api::ResourceListResourceVersionMatch::NotOlderThan(rv) | klights_leader_api::ResourceListResourceVersionMatch::Exact(rv) => Some(rv),
+            },
+            custom_resource: req.custom_resource_identity().map(|identity| {
+                klights_internal_protobuf::CustomResourceListIdentity {
+                    group: identity.group().to_string(),
+                    plural: identity.plural().to_string(),
+                    requested_version: identity.requested_version().to_string(),
+                }
+            }),
         };
         let response = self
             .unary_call(
@@ -832,23 +878,92 @@ impl ReplicationGrpcClient {
             .await
             .map_err(resource_query_error_from_unary)?;
         validate_list_response_metadata(&response)?;
+        let frozen_custom_resource_definition = response
+            .frozen_custom_resource_definition
+            .map(resource_from_proto)
+            .transpose()?;
+        let allowed_custom_api_versions = match (
+            &custom_identity,
+            &frozen_custom_resource_definition,
+        ) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(ResourceQueryError::corrupt_response(
+                    "ordinary ListResources response unexpectedly contains a CRD definition",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(ResourceQueryError::corrupt_response(
+                    "custom ListResources response is missing its frozen CRD definition",
+                ));
+            }
+            (Some((group, plural, requested_version)), Some(definition)) => {
+                // `resource_from_proto` establishes only protobuf/header
+                // consistency.  A remote peer must not be able to use an
+                // arbitrary CRD-shaped object to broaden the versions it
+                // is authorised to return for this collection.
+                if definition.api_version != "apiextensions.k8s.io/v1"
+                    || definition.kind != "CustomResourceDefinition"
+                    || definition.namespace.is_some()
+                    || definition.name != format!("{plural}.{group}")
+                {
+                    return Err(ResourceQueryError::corrupt_response(
+                        "frozen custom resource definition identity does not match the requested collection",
+                    ));
+                }
+                let infos = klights_leader_api::resource_infos_from_value(definition.data.as_ref())
+                    .map_err(ResourceQueryError::corrupt_response)?;
+                let requested = infos.iter().find(|info| {
+                    info.group == *group
+                        && info.plural == *plural
+                        && info.version == *requested_version
+                        && info.kind == expected_kind
+                });
+                let Some(requested) = requested else {
+                    return Err(ResourceQueryError::corrupt_response(
+                        "frozen CRD definition does not serve the requested collection",
+                    ));
+                };
+                let requested_namespaced = requested.namespaced;
+                let request_is_namespaced = !matches!(expected_scope, ResourceListScope::Cluster);
+                if requested_namespaced != request_is_namespaced {
+                    return Err(ResourceQueryError::corrupt_response(
+                        "frozen CRD definition scope does not match the request",
+                    ));
+                }
+                Some(
+                    infos
+                        .into_iter()
+                        .filter(|info| {
+                            info.group == *group
+                                && info.plural == *plural
+                                && info.kind == expected_kind
+                                && info.namespaced == requested_namespaced
+                        })
+                        .map(|info| format!("{}/{}", info.group, info.version))
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+            }
+        };
         let items = response
             .items
             .into_iter()
             .map(resource_from_proto)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if items.iter().any(|resource| {
-            resource.api_version != expected_api_version
+            (allowed_custom_api_versions
+                .as_ref()
+                .is_some_and(|versions| !versions.contains(&resource.api_version))
+                || (allowed_custom_api_versions.is_none()
+                    && resource.api_version != expected_api_version))
                 || resource.kind != expected_kind
-                || expected_namespace
-                    .as_ref()
-                    .is_some_and(|namespace| resource.namespace.as_ref() != Some(namespace))
+                || !resource_matches_list_scope(resource, &expected_scope)
         }) {
             return Err(ResourceQueryError::corrupt_response(
                 "ListResources item identity is outside the requested scope",
             ));
         }
-        ResourceListResult::try_new(
+        let result = ResourceListResult::try_new(
             items,
             response.resource_version,
             response
@@ -857,7 +972,14 @@ impl ReplicationGrpcClient {
                 .map(watch_replay_position_from_proto),
             response.continue_token,
             response.remaining_item_count,
-        )
+        )?;
+        let candidate_continue_tokens =
+            candidate_continue_tokens_from_wire(response.candidate_continuations);
+        let result = result.with_candidate_continue_tokens(candidate_continue_tokens);
+        match frozen_custom_resource_definition {
+            Some(definition) => Ok(result.with_frozen_custom_resource_definition(definition)),
+            None => Ok(result),
+        }
     }
 
     pub async fn submit_resource_command_rpc(
@@ -2173,6 +2295,15 @@ impl ReplicationGrpcClient {
     }
 }
 
+fn candidate_continue_tokens_from_wire(
+    candidates: Vec<klights_internal_protobuf::CandidateContinuation>,
+) -> Vec<Option<String>> {
+    candidates
+        .into_iter()
+        .map(|candidate| candidate.continue_token)
+        .collect()
+}
+
 async fn run_connect_reader(
     mut inbound: tonic::codec::Streaming<klights_internal_protobuf::LeaderMessage>,
     outbound: mpsc::Sender<klights_internal_protobuf::FollowerMessage>,
@@ -2901,6 +3032,19 @@ fn validate_list_response_metadata(
     Ok(())
 }
 
+fn resource_matches_list_scope(resource: &Resource, scope: &ResourceListScope) -> bool {
+    match scope {
+        ResourceListScope::Cluster => resource.namespace.is_none(),
+        ResourceListScope::AllNamespaces => resource
+            .namespace
+            .as_deref()
+            .is_some_and(|namespace| !namespace.is_empty()),
+        ResourceListScope::Namespace(namespace) => {
+            resource.namespace.as_deref() == Some(namespace.as_str())
+        }
+    }
+}
+
 fn resource_from_proto(
     resource: klights_internal_protobuf::ResourceObject,
 ) -> std::result::Result<Resource, ResourceQueryError> {
@@ -2930,18 +3074,30 @@ fn resource_from_proto(
 fn resource_query_error_from_unary(error: UnaryRpcError) -> ResourceQueryError {
     match error {
         UnaryRpcError::Retryable(message) => ResourceQueryError::retryable(message),
-        UnaryRpcError::Status(status) => match status.code() {
-            tonic::Code::InvalidArgument => ResourceQueryError::InvalidRequest {
-                field: "rpc.request",
-                message: status.message().to_string(),
-            },
-            tonic::Code::DeadlineExceeded => ResourceQueryError::Timeout,
-            tonic::Code::Cancelled => ResourceQueryError::Cancelled,
-            tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
-                ResourceQueryError::retryable(status.to_string())
+        UnaryRpcError::Status(status) => {
+            if let Some(details) = crate::resource_list_expired_details(&status) {
+                return ResourceQueryError::expired(
+                    details.requested_resource_version,
+                    details.oldest_available_resource_version,
+                    details.replacement_continue_token,
+                );
             }
-            _ => ResourceQueryError::query_failed(status.to_string()),
-        },
+            match status.code() {
+                tonic::Code::InvalidArgument => ResourceQueryError::InvalidRequest {
+                    field: "rpc.request",
+                    message: status.message().to_string(),
+                },
+                tonic::Code::DeadlineExceeded => ResourceQueryError::Timeout,
+                tonic::Code::Cancelled => ResourceQueryError::Cancelled,
+                tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
+                    ResourceQueryError::retryable(status.to_string())
+                }
+                tonic::Code::Aborted => ResourceQueryError::Conflict {
+                    message: status.message().to_string(),
+                },
+                _ => ResourceQueryError::query_failed(status.to_string()),
+            }
+        }
     }
 }
 

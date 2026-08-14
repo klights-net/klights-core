@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use k8s_native_service::ports::{
-    CustomResourceListSnapshot, CustomResourceProjection, CustomResourceReadFuture,
-    CustomResourceReadPort, CustomResourceSnapshotRequest, CustomResourceWaitFuture,
-    CustomResourceWatchTarget,
+    CustomResourceProjection, CustomResourceReadFuture, CustomResourceReadPort,
+    CustomResourceWaitFuture, CustomResourceWatchTarget,
 };
 
 pub(crate) struct CustomResourceReadAdapter {
@@ -72,41 +71,6 @@ fn leader_list_result(
 }
 
 impl CustomResourceReadPort for CustomResourceReadAdapter {
-    fn snapshot_resources_at_rv(
-        &self,
-        request: CustomResourceSnapshotRequest,
-    ) -> CustomResourceReadFuture<'_, CustomResourceListSnapshot> {
-        Box::pin(async move {
-            let query = klights_cluster_store::ResourceListOptions::new(
-                request.label_selector.as_deref(),
-                request.field_selector.as_deref(),
-                request.limit,
-                request.continue_token.as_deref(),
-            );
-            match self
-                .db
-                .snapshot_resources_at_rv(
-                    &request.api_version,
-                    &request.kind,
-                    request.namespace.as_deref(),
-                    query,
-                    request.resource_version,
-                )
-                .await?
-            {
-                klights_cluster_store::SnapshotAtRv::Current => {
-                    Ok(CustomResourceListSnapshot::Current)
-                }
-                klights_cluster_store::SnapshotAtRv::Expired => {
-                    Ok(CustomResourceListSnapshot::Expired)
-                }
-                klights_cluster_store::SnapshotAtRv::List(list) => {
-                    leader_list_result(list).map(CustomResourceListSnapshot::List)
-                }
-            }
-        })
-    }
-
     fn list_resources_for_watch_targets(
         &self,
         targets: Vec<CustomResourceWatchTarget>,
@@ -297,6 +261,7 @@ impl klights_watch::ProjectedWatchBaselineRead for CrdProjectedWatchBaseline {
                     Ok(klights_cluster_store::ResourceListRead::Expired {
                         requested: request.position().resource_version,
                         oldest_available: request.position().resource_version.saturating_add(1),
+                        replacement: None,
                     })
                 }
                 klights_cluster_store::SnapshotAtRv::Current => {

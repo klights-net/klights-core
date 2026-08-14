@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use klights_cluster_core::Resource;
-use klights_leader_api::{LeaderResourceQuery, ResourceListRequest, ResourceQueryConsistency};
+use klights_leader_api::{
+    LeaderResourceQuery, ResourceListRequest, ResourceListScope, ResourceQueryConsistency,
+};
 use klights_pod_api::{
     PodControlPlaneEventRequest, PodControlPlaneEventSink, PodDeleteOrchestration, PodGetRequest,
     PodListRequest, PodPersistence, PodPersistenceReplaceRequest, PodPlacement, PodQuery,
@@ -173,17 +175,29 @@ impl SchedulerService {
     }
 
     async fn scheduler_snapshot(&self) -> Result<PodSchedulingView, PodRepositoryError> {
-        let nodes = list_controller_resources(self.resource_query.as_ref(), "v1", "Node").await?;
+        let nodes = list_controller_resources(
+            self.resource_query.as_ref(),
+            "v1",
+            "Node",
+            ResourceListScope::Cluster,
+        )
+        .await?;
         let pods = self
             .pod_query
             .list_pods(pod_list_request(None, None, None)?)
             .await?;
-        let namespaces =
-            list_controller_resources(self.resource_query.as_ref(), "v1", "Namespace").await?;
+        let namespaces = list_controller_resources(
+            self.resource_query.as_ref(),
+            "v1",
+            "Namespace",
+            ResourceListScope::Cluster,
+        )
+        .await?;
         let pdbs = list_controller_resources(
             self.resource_query.as_ref(),
             "policy/v1",
             "PodDisruptionBudget",
+            ResourceListScope::AllNamespaces,
         )
         .await?;
         Ok(PodSchedulingView {
@@ -449,11 +463,12 @@ async fn list_controller_resources(
     query: &dyn LeaderResourceQuery,
     api_version: &str,
     kind: &str,
+    scope: ResourceListScope,
 ) -> Result<Vec<Resource>, PodRepositoryError> {
     let request = ResourceListRequest::try_new(
         api_version,
         kind,
-        None,
+        scope,
         None,
         None,
         None,
@@ -654,9 +669,17 @@ async fn schedule_pod_on_available_nodes(
         });
     }
 
-    let nodes = list_controller_resources(resources, "v1", "Node").await?;
-    let namespaces = list_controller_resources(resources, "v1", "Namespace").await?;
-    let pdbs = list_controller_resources(resources, "policy/v1", "PodDisruptionBudget").await?;
+    let nodes =
+        list_controller_resources(resources, "v1", "Node", ResourceListScope::Cluster).await?;
+    let namespaces =
+        list_controller_resources(resources, "v1", "Namespace", ResourceListScope::Cluster).await?;
+    let pdbs = list_controller_resources(
+        resources,
+        "policy/v1",
+        "PodDisruptionBudget",
+        ResourceListScope::AllNamespaces,
+    )
+    .await?;
     let all_pods = query.list_pods(pod_list_request(None, None, None)?).await?;
 
     let mut node_names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();

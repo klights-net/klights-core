@@ -3220,11 +3220,10 @@ async fn test_list_pagination_metadata_for_selector_free_and_label_selector_requ
             .as_str()
             .is_some()
     );
-    assert!(
-        selector_free_page1_json["metadata"]["remainingItemCount"]
-            .as_i64()
-            .unwrap()
-            >= 1
+    assert_eq!(
+        selector_free_page1_json["metadata"]["remainingItemCount"].as_i64(),
+        None,
+        "bounded keyset pages omit the optional inexact remaining count"
     );
 
     let selector_page1 = app
@@ -8525,7 +8524,8 @@ async fn test_protobuf_selector_watch_delivers_actor_finalized_stateful_pods_in_
 }
 
 /// Plain LIST must validate `resourceVersionMatch`: an unsupported value is a
-/// 400, and a valid `Exact` match pins the reported list `resourceVersion`.
+/// 400, and an `Exact` value ahead of the current history is expired rather
+/// than fabricating a snapshot at that resourceVersion.
 #[tokio::test]
 async fn test_list_resource_version_match_validation_and_exact() {
     use axum::body::{Body, to_bytes};
@@ -8560,7 +8560,8 @@ async fn test_list_resource_version_match_validation_and_exact() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Valid Exact match pins the reported resourceVersion.
+    // A syntactically valid but future Exact value has no corresponding
+    // datastore snapshot and must not be echoed as if it existed.
     let resp = app
         .clone()
         .oneshot(
@@ -8571,10 +8572,10 @@ async fn test_list_resource_version_match_validation_and_exact() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::GONE);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(list["metadata"]["resourceVersion"], "123");
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["reason"], "Expired");
 }
 
 /// T1.2: `resourceVersionMatch=Exact` must serve a true historical snapshot
@@ -8693,6 +8694,30 @@ async fn test_list_exact_serves_snapshot_protobuf_and_410_when_too_old() {
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["reason"], "Expired");
     assert_eq!(status["code"], 410);
+    assert!(
+        status.pointer("/metadata/continue").is_none(),
+        "an Exact request has no continuation boundary, so 410 must omit metadata.continue: {status}"
+    );
+
+    let protobuf_expired = app
+        .oneshot(
+            Request::builder()
+                .uri(&exact_uri)
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protobuf_expired.status(), StatusCode::GONE);
+    let protobuf_body = to_bytes(protobuf_expired.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let protobuf_status = k8s_pb::decode_protobuf(&protobuf_body)
+        .expect("protobuf 410 must be a Kubernetes protobuf Status envelope");
+    assert_eq!(protobuf_status["reason"], "Expired");
+    assert_eq!(protobuf_status["code"], 410);
+    assert!(protobuf_status.pointer("/metadata/continue").is_none());
 }
 
 /// Regression for Sonobuoy chunking:
@@ -8765,10 +8790,8 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     let first_token_data = decode_continue_token(&first_token);
     assert!(first_token_data.ts.is_some());
 
-    // Same-scope PodTemplate churn can compact the historical snapshot while
-    // a client still holds a fresh continue token. The token must still make
-    // progress by downgrading to an inconsistent continuation rather than
-    // returning an early 410.
+    // Same-scope PodTemplate churn can compact the pinned snapshot. The
+    // leader returns a typed 410 replacement cursor, never a silent restart.
     let changed_name = "template-0020";
     db.update_resource(
         "v1",
@@ -8806,88 +8829,54 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         )
         .await
         .unwrap();
-    assert_eq!(
-        compacted_resp.status(),
-        StatusCode::OK,
-        "fresh continue token must not fail after unrelated watch history compaction"
-    );
+    assert_eq!(compacted_resp.status(), StatusCode::GONE);
     let compacted_body = to_bytes(compacted_resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let compacted_list: serde_json::Value = serde_json::from_slice(&compacted_body).unwrap();
-    assert_eq!(
-        compacted_list["metadata"]["resourceVersion"], first_rv,
-        "fresh continue fallback must keep the original consistent list RV"
-    );
-    assert_eq!(compacted_list["items"].as_array().unwrap().len(), 20);
-    let fallback_token = compacted_list["metadata"]["continue"]
+    let compacted_status: serde_json::Value = serde_json::from_slice(&compacted_body).unwrap();
+    let recovery_token = compacted_status["metadata"]["continue"]
         .as_str()
-        .expect("fallback page should still have another page");
-    let fallback_token_data = decode_continue_token(fallback_token);
-    assert!(fallback_token_data.ts.is_none());
+        .expect("410 Expired must include a typed recovery cursor");
     assert!(
-        fallback_token_data.session,
-        "continuations after a compacted snapshot fallback must remain inconsistent"
+        recovery_token.is_ascii(),
+        "native must wrap the opaque root recovery cursor in an ASCII outer envelope: {recovery_token:?}"
     );
-    assert_eq!(fallback_token_data.rv.to_string(), first_rv);
-
-    // TTL-expired tokens still return the Kubernetes 410 response with a
-    // recovery token. The page served from that recovery token must also keep
-    // subsequent tokens inconsistent.
-    let expired_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&k8s_native_service::generic_read::ContinueTokenData {
-            n: first_token_data.n,
-            rv: first_token_data.rv,
-            ts: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64
-                    - k8s_native_service::generic_read::CONTINUE_TOKEN_TTL_SECS
-                    - 1,
-            ),
-            session: false,
-        })
-        .unwrap(),
+    assert!(
+        matches!(
+            k8s_native_service::generic_read::process_generic_list_continue_token(Some(
+                recovery_token.to_string(),
+            )),
+            Ok((
+                _,
+                klights_leader_api::ResourceListContinuationMode::Recovery
+            ))
+        ),
+        "unexpected recovery token {recovery_token:?}"
     );
-
-    let expired_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "/api/v1/namespaces/default/podtemplates?limit=20&continue={expired_token}"
-                ))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(expired_resp.status(), StatusCode::GONE);
-    let expired_body = to_bytes(expired_resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let expired_status: serde_json::Value = serde_json::from_slice(&expired_body).unwrap();
-    let recovery_token = expired_status["metadata"]["continue"]
-        .as_str()
-        .expect("410 Expired must include a recovery continue token");
+    let recovery_query = urlencoding::encode(recovery_token);
 
     let recovery_resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/api/v1/namespaces/default/podtemplates?limit=20&continue={recovery_token}"
+                    "/api/v1/namespaces/default/podtemplates?limit=20&continue={recovery_query}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(recovery_resp.status(), StatusCode::OK);
+    let recovery_status = recovery_resp.status();
     let recovery_body = to_bytes(recovery_resp.into_body(), usize::MAX)
         .await
         .unwrap();
+    assert_eq!(
+        recovery_status,
+        StatusCode::OK,
+        "recovery request failed: {}",
+        String::from_utf8_lossy(&recovery_body)
+    );
     let recovery_list: serde_json::Value = serde_json::from_slice(&recovery_body).unwrap();
     let recovery_rv = recovery_list["metadata"]["resourceVersion"]
         .as_str()
@@ -8895,17 +8884,13 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .to_string();
     assert_ne!(
         recovery_rv, first_rv,
-        "410 recovery must start a fresh inconsistent list RV"
+        "410 recovery must start a fresh snapshot RV"
     );
     let recovery_next = recovery_list["metadata"]["continue"]
         .as_str()
         .expect("recovery page should still have another page");
     let recovery_next_data = decode_continue_token(recovery_next);
-    assert!(recovery_next_data.ts.is_none());
-    assert!(
-        recovery_next_data.session,
-        "continuations after a 410 recovery token must remain inconsistent"
-    );
+    assert!(recovery_next_data.ts.is_some());
     assert_eq!(recovery_next_data.rv.to_string(), recovery_rv);
 }
 
@@ -9063,6 +9048,7 @@ async fn test_namespace_pagination_serves_consistent_snapshot_across_pages() {
                 .uri(format!(
                     "/api/v1/namespaces?labelSelector=snaptest%3Dyes&limit=2&continue={token}"
                 ))
+                .header("accept", "application/vnd.kubernetes.protobuf")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -9070,7 +9056,8 @@ async fn test_namespace_pagination_serves_consistent_snapshot_across_pages() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let page2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let page2 = k8s_native_service::test_protobuf::decode_protobuf(&body)
+        .expect("Namespace page two must honor protobuf Accept");
     assert_eq!(
         list_item_names(&page2),
         vec!["ns-c", "ns-d"],
@@ -9168,6 +9155,68 @@ async fn test_cluster_wide_pagination_serves_consistent_snapshot_across_pages() 
         page2["metadata"]["resourceVersion"].as_str().unwrap(),
         rv1,
         "paginated cluster-wide pages must keep the snapshot resourceVersion"
+    );
+}
+
+/// An all-namespaces cursor is ordered by `(namespace, name)`, not name alone.
+/// Equal names in different namespaces must therefore both survive page two.
+#[tokio::test]
+async fn test_cluster_wide_pagination_keeps_equal_names_in_distinct_namespaces() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    for namespace in ["equal-a", "equal-b"] {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some(namespace),
+            "shared",
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"namespace": namespace, "name": "shared"},
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/configmaps?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let token = first["metadata"]["continue"]
+        .as_str()
+        .expect("first page must continue");
+    let second = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/configmaps?limit=1&continue={token}"))
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = k8s_native_service::test_protobuf::decode_protobuf(
+        &to_bytes(second.into_body(), usize::MAX).await.unwrap(),
+    )
+    .expect("protobuf page two must decode as a Kubernetes List envelope");
+    assert_eq!(first["items"][0]["metadata"]["name"], "shared");
+    assert_eq!(second["items"][0]["metadata"]["name"], "shared");
+    assert_ne!(
+        first["items"][0]["metadata"]["namespace"], second["items"][0]["metadata"]["namespace"],
+        "all-namespaces continuation must not skip an equal name in another namespace"
     );
 }
 
@@ -9281,6 +9330,24 @@ spec:
     .await
     .unwrap();
 
+    let exact = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/default/widgets?resourceVersion={rv1}&resourceVersionMatch=Exact"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.status(), StatusCode::OK);
+    let exact: serde_json::Value =
+        serde_json::from_slice(&to_bytes(exact.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(list_item_names(&exact), ["w-00", "w-01", "w-02", "w-03"]);
+    assert_eq!(exact["metadata"]["resourceVersion"], rv1);
+
     let resp = app
         .clone()
         .oneshot(
@@ -9305,6 +9372,120 @@ spec:
         page2["metadata"]["resourceVersion"].as_str().unwrap(),
         rv1,
         "paginated CRD pages must keep the snapshot resourceVersion"
+    );
+}
+
+/// Cluster-scoped CRDs must use the explicit `Cluster` LIST scope rather than
+/// treating their absent namespace as an all-namespaces collection.
+#[tokio::test]
+async fn test_cluster_crd_pagination_serves_consistent_snapshot_across_pages() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use hyper::header::CONTENT_TYPE;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    let crd_yaml = r#"
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterwidgets.example.com
+spec:
+  group: example.com
+  scope: Cluster
+  names:
+    kind: ClusterWidget
+    plural: clusterwidgets
+    singular: clusterwidget
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+"#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/clusterwidgets.example.com")
+                .header(CONTENT_TYPE, "application/apply-patch+yaml")
+                .body(Body::from(crd_yaml))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "CRD apply failed: {}",
+        resp.status()
+    );
+
+    let body = |name: &str| {
+        serde_json::json!({
+            "apiVersion": "example.com/v1",
+            "kind": "ClusterWidget",
+            "metadata": {"name": name},
+        })
+    };
+    for index in 0..4 {
+        let name = format!("cw-{index:02}");
+        db.create_resource("example.com/v1", "ClusterWidget", None, &name, body(&name))
+            .await
+            .unwrap();
+    }
+
+    let page1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/apis/example.com/v1/clusterwidgets?limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.status(), StatusCode::OK);
+    let page1: serde_json::Value =
+        serde_json::from_slice(&to_bytes(page1.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(list_item_names(&page1), vec!["cw-00", "cw-01"]);
+    let rv = page1["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = page1["metadata"]["continue"].as_str().unwrap().to_string();
+
+    db.create_resource(
+        "example.com/v1",
+        "ClusterWidget",
+        None,
+        "cw-01a",
+        body("cw-01a"),
+    )
+    .await
+    .unwrap();
+
+    let page2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/apis/example.com/v1/clusterwidgets?limit=2&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.status(), StatusCode::OK);
+    let page2: serde_json::Value =
+        serde_json::from_slice(&to_bytes(page2.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(list_item_names(&page2), vec!["cw-02", "cw-03"]);
+    assert_eq!(
+        page2["metadata"]["resourceVersion"].as_str(),
+        Some(rv.as_str())
     );
 }
 

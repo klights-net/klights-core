@@ -62,7 +62,7 @@ pub(crate) async fn start_worker_store_adapter(
                             .list_resources(
                                 "v1",
                                 "Node",
-                                None,
+                                klights_leader_api::ResourceListScope::Cluster,
                                 None,
                                 None,
                                 klights_kubelet::worker_store::WorkerListPage::unbounded(),

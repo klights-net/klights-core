@@ -253,12 +253,32 @@ impl ResourceContinuation {
     }
 }
 
+/// A typed keyset boundary for the replacement cursor returned after a
+/// pinned snapshot has expired. Unlike [`ResourceContinuation`], this value
+/// deliberately has no replay position: it starts a new current snapshot
+/// strictly after the composite collection key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceListRecoveryContinuation {
+    after: ResourceCollectionKey,
+}
+
+impl ResourceListRecoveryContinuation {
+    pub fn new(after: ResourceCollectionKey) -> Self {
+        Self { after }
+    }
+
+    pub const fn after(&self) -> &ResourceCollectionKey {
+        &self.after
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResourceListQuery {
     label_selector: Option<String>,
     field_selector: Option<String>,
     limit: Option<i64>,
     continuation: Option<ResourceContinuation>,
+    recovery_continuation: Option<ResourceListRecoveryContinuation>,
     resource_version_match: ResourceVersionMatch,
 }
 
@@ -272,6 +292,39 @@ impl ResourceListQuery {
         continuation: Option<ResourceContinuation>,
         resource_version_match: ResourceVersionMatch,
     ) -> Result<Self, ResourceReadError> {
+        Self::try_new_with_recovery(
+            label_selector,
+            field_selector,
+            limit,
+            continuation,
+            None,
+            resource_version_match,
+        )
+    }
+
+    /// Builds a query with either a pinned continuation or an explicit
+    /// unpinned recovery boundary. The two modes are mutually exclusive so a
+    /// compacted pinned snapshot can never be silently retried as current.
+    pub fn try_new_with_recovery(
+        label_selector: Option<String>,
+        field_selector: Option<String>,
+        limit: Option<i64>,
+        continuation: Option<ResourceContinuation>,
+        recovery_continuation: Option<ResourceListRecoveryContinuation>,
+        resource_version_match: ResourceVersionMatch,
+    ) -> Result<Self, ResourceReadError> {
+        if continuation.is_some() && recovery_continuation.is_some() {
+            return Err(ResourceReadError::InvalidContinuation {
+                message: "pinned and recovery continuations are mutually exclusive".to_string(),
+            });
+        }
+        if recovery_continuation.is_some()
+            && !matches!(resource_version_match, ResourceVersionMatch::Any)
+        {
+            return Err(ResourceReadError::InvalidContinuation {
+                message: "a recovery continuation must start a new current snapshot".to_string(),
+            });
+        }
         let limit = match limit {
             None | Some(0) => None,
             Some(v) if v > 0 => Some(v),
@@ -322,6 +375,7 @@ impl ResourceListQuery {
             field_selector,
             limit,
             continuation,
+            recovery_continuation,
             resource_version_match,
         })
     }
@@ -333,11 +387,12 @@ impl ResourceListQuery {
         continuation: Option<ResourceContinuation>,
         resource_version_match: ResourceVersionMatch,
     ) -> Result<Self, ResourceReadError> {
-        Self::try_new(
+        Self::try_new_with_recovery(
             label_selector.map(str::to_owned),
             field_selector.map(str::to_owned),
             limit,
             continuation,
+            None,
             resource_version_match,
         )
     }
@@ -348,6 +403,7 @@ impl ResourceListQuery {
             field_selector: None,
             limit: None,
             continuation: None,
+            recovery_continuation: None,
             resource_version_match: ResourceVersionMatch::Any,
         }
     }
@@ -362,6 +418,20 @@ impl ResourceListQuery {
     }
     pub const fn continuation(&self) -> Option<&ResourceContinuation> {
         self.continuation.as_ref()
+    }
+    pub const fn recovery_continuation(&self) -> Option<&ResourceListRecoveryContinuation> {
+        self.recovery_continuation.as_ref()
+    }
+    /// The typed keyset boundary for either pagination mode. Callers needing
+    /// a replay position must use [`Self::continuation`] and cannot
+    /// accidentally treat an unpinned recovery cursor as historical.
+    pub fn start_after(&self) -> Option<&ResourceCollectionKey> {
+        match (&self.continuation, &self.recovery_continuation) {
+            (Some(continuation), None) => Some(continuation.after()),
+            (None, Some(recovery)) => Some(recovery.after()),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!("validated continuation modes are exclusive"),
+        }
     }
     pub const fn resource_version_match(&self) -> ResourceVersionMatch {
         self.resource_version_match
@@ -464,6 +534,9 @@ pub enum ResourceListRead {
     Expired {
         requested: i64,
         oldest_available: i64,
+        /// Explicitly unpinned keyset boundary for a replacement LIST. Exact
+        /// historical reads have no safe replacement, so this is optional.
+        replacement: Option<ResourceListRecoveryContinuation>,
     },
 }
 
@@ -493,6 +566,12 @@ impl ResourceListRead {
         match self.page() {
             Some(page) => page.remaining_item_count(),
             None => None,
+        }
+    }
+    pub const fn replacement_continuation(&self) -> Option<&ResourceListRecoveryContinuation> {
+        match self {
+            Self::Expired { replacement, .. } => replacement.as_ref(),
+            Self::Current(_) | Self::Historical(_) => None,
         }
     }
 }

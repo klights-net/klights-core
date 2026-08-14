@@ -732,7 +732,7 @@ async fn select_matching_flow_schema(
         resource_query,
         FLOWCONTROL_API_VERSION,
         "FlowSchema",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
     )
     .await
     .ok()?;

@@ -11,7 +11,7 @@ use klights_cluster_store::{
 };
 use klights_leader_api::{
     CacheReadinessRequest, LeaderWatch, ResourceListRequest as LeaderListRequest,
-    ResourceQueryConsistency, WatchEventType, WatchRequest,
+    ResourceListScope, ResourceQueryConsistency, WatchEventType, WatchRequest,
 };
 use klights_types::ResourceKey;
 use klights_watch::{
@@ -305,7 +305,7 @@ async fn watch_cache_coordinates_filtered_scope_readiness_and_event_application(
     let list_request = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         Some("track=yes".to_string()),
         None,
         None,
@@ -352,7 +352,7 @@ async fn watch_cache_matches_omitted_node_unschedulable_as_false() {
     let request = LeaderListRequest::try_new(
         "v1",
         "Node",
-        None,
+        ResourceListScope::Cluster,
         None,
         Some("spec.unschedulable=false".to_string()),
         None,
@@ -394,7 +394,7 @@ async fn cache_rejects_unready_reads() {
     let request = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -423,7 +423,7 @@ async fn readiness_requires_a_scope_baseline_and_never_exposes_global_entries() 
     let request = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         Some("track=yes".to_string()),
         None,
         None,
@@ -449,7 +449,7 @@ async fn replacement_rejects_duplicate_keys_and_bodies_newer_than_the_position()
     let request = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -485,7 +485,7 @@ async fn equal_event_id_with_changed_cursor_cannot_replace_a_ready_snapshot() {
     let request = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -520,7 +520,7 @@ async fn cache_advances_the_scope_position_after_apply() {
     let request = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -561,7 +561,7 @@ async fn replacing_an_older_overlapping_scope_does_not_evict_newer_scope_state()
     let selected = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         Some("track=yes".to_string()),
         None,
         None,
@@ -572,7 +572,7 @@ async fn replacing_an_older_overlapping_scope_does_not_evict_newer_scope_state()
     let unfiltered = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -618,7 +618,7 @@ async fn overlapping_scopes_keep_atomic_bodies_at_their_own_frontiers_in_both_or
         let selected = LeaderListRequest::try_new(
             "v1",
             "ConfigMap",
-            Some("default".to_string()),
+            ResourceListScope::Namespace("default".to_string()),
             Some("track=yes".to_string()),
             None,
             None,
@@ -629,7 +629,7 @@ async fn overlapping_scopes_keep_atomic_bodies_at_their_own_frontiers_in_both_or
         let broad = LeaderListRequest::try_new(
             "v1",
             "ConfigMap",
-            Some("default".to_string()),
+            ResourceListScope::Namespace("default".to_string()),
             None,
             None,
             None,
@@ -714,7 +714,7 @@ async fn delete_frontier_tombstone_prevents_stale_resurrection_in_every_scope() 
     let selected = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         Some("track=yes".to_string()),
         None,
         None,
@@ -725,7 +725,7 @@ async fn delete_frontier_tombstone_prevents_stale_resurrection_in_every_scope() 
     let broad = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         None,
         None,
         None,
@@ -788,7 +788,7 @@ async fn delete_tombstone_prevents_an_older_new_scope_snapshot_from_resurrecting
     let stale_scope = LeaderListRequest::try_new(
         "v1",
         "ConfigMap",
-        Some("default".to_string()),
+        ResourceListScope::Namespace("default".to_string()),
         Some("track=yes".to_string()),
         None,
         None,

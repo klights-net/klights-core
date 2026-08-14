@@ -27,8 +27,8 @@ use klights_cluster_store::{
 };
 
 use super::read_core::{
-    RedbCheckedWatchRead, RedbCollectionScope, RedbListQuery, RedbPositionedWatchRead,
-    RedbReadCore, RedbResourceList, RedbSnapshotRead,
+    RedbCheckedWatchRead, RedbCollectionScope, RedbHistoricalListRead, RedbListQuery,
+    RedbPositionedWatchRead, RedbReadCore, RedbResourceList, RedbSnapshotRead,
 };
 
 #[derive(Clone)]
@@ -53,29 +53,23 @@ impl RedbReadStore {
         position: WatchReplayPosition,
     ) -> ResourceReadFuture<'_, ResourceListRead> {
         Box::pin(async move {
-            let target = durable_target_for_collection(
-                request.api_version(),
-                request.kind(),
-                request.scope(),
-            );
             match self
                 .core
-                .snapshot_at_position(
-                    &[target],
-                    request.query().label_selector(),
-                    request.query().field_selector(),
-                    position,
-                )
-                .await
-                .map_err(map_resource_error)?
+                .bounded_historical_list(request.clone(), position)
+                .await?
             {
-                RedbSnapshotRead::Expired => Err(ResourceReadError::Expired {
-                    requested: position.resource_version,
-                    oldest_available: 0,
-                }),
-                RedbSnapshotRead::Historical { items, position } => Ok(
-                    ResourceListRead::Historical(page_items(items, request.query(), position)?),
-                ),
+                RedbHistoricalListRead::Expired { oldest_available } => {
+                    Ok(ResourceListRead::Expired {
+                        requested: position.resource_version,
+                        oldest_available,
+                        replacement: request.query().continuation().map(|cursor| {
+                            klights_cluster_store::ResourceListRecoveryContinuation::new(
+                                cursor.after().clone(),
+                            )
+                        }),
+                    })
+                }
+                RedbHistoricalListRead::Page(page) => Ok(ResourceListRead::Historical(page)),
             }
         })
     }
@@ -103,7 +97,7 @@ impl RedbReadStore {
                         label_selector: query.label_selector().map(str::to_string),
                         field_selector: query.field_selector().map(str::to_string),
                         limit: query.limit(),
-                        cursor: None,
+                        cursor: query.start_after().cloned(),
                     },
                 )
                 .await
@@ -167,17 +161,64 @@ impl ClusterResourceRead for RedbReadStore {
             return self.historical_list(request, position);
         }
         match request.query().resource_version_match() {
-            ResourceVersionMatch::Exact(resource_version) => self.historical_list(
-                request,
-                WatchReplayPosition {
-                    resource_version,
-                    event_id: 0,
-                    resource_version_filter_through_event_id: 0,
-                },
-            ),
+            ResourceVersionMatch::Exact(resource_version) => Box::pin(async move {
+                let position = self
+                    .core
+                    .exact_resource_version_position(resource_version)
+                    .await
+                    .map_err(map_resource_error)?;
+                self.historical_list(request, position).await
+            }),
             ResourceVersionMatch::AtPosition(position) => self.historical_list(request, position),
             ResourceVersionMatch::Any | ResourceVersionMatch::NotOlderThan(_) => {
-                self.current_list(request)
+                if request.query().limit().is_some_and(|limit| limit > 0)
+                    && (request.query().label_selector().is_some()
+                        || request.query().field_selector().is_some())
+                {
+                    Box::pin(async move {
+                        let position = self
+                            .core
+                            .allocator_position()
+                            .await
+                            .map_err(map_resource_error)?;
+                        if let ResourceVersionMatch::NotOlderThan(requested) =
+                            request.query().resource_version_match()
+                            && position.resource_version < requested
+                        {
+                            return Err(ResourceReadError::Conflict {
+                                message: format!(
+                                    "current resourceVersion {} is older than requested {requested}",
+                                    position.resource_version
+                                ),
+                            });
+                        }
+                        let snapshot = ResourceListSnapshot::try_new(position)?;
+                        let continuation = request
+                            .query()
+                            .start_after()
+                            .cloned()
+                            .map(|after| ResourceContinuation::new(after, snapshot));
+                        let query = klights_cluster_store::ResourceListQuery::try_new(
+                            request.query().label_selector().map(str::to_string),
+                            request.query().field_selector().map(str::to_string),
+                            request.query().limit(),
+                            continuation,
+                            ResourceVersionMatch::AtPosition(position),
+                        )?;
+                        self.historical_list(
+                            ResourceListRequest::new(
+                                request.api_version().to_string(),
+                                request.kind().to_string(),
+                                request.scope().clone(),
+                                query,
+                            ),
+                            position,
+                        )
+                        .await
+                    })
+                } else {
+                    self.current_list(request)
+                }
             }
         }
     }
@@ -235,7 +276,7 @@ impl ClusterResourceScopeRead for RedbReadStore {
                 .await
                 .map_err(map_resource_error)?
             {
-                RedbSnapshotRead::Expired => Ok(ResourceSnapshotRead::Expired),
+                RedbSnapshotRead::Expired { .. } => Ok(ResourceSnapshotRead::Expired),
                 RedbSnapshotRead::Historical { items, position } => {
                     ResourceScopeSnapshot::try_new(items, position)
                         .map(ResourceSnapshotRead::Historical)
@@ -566,66 +607,6 @@ fn focused_page(page: RedbResourceList) -> Result<ResourceListPage, ResourceRead
         continuation,
         page.remaining_item_count,
     )
-}
-
-fn page_items(
-    mut items: Vec<Resource>,
-    query: &klights_cluster_store::ResourceListQuery,
-    position: WatchReplayPosition,
-) -> Result<ResourceListPage, ResourceReadError> {
-    items
-        .sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
-    if let Some(cursor) = query.continuation() {
-        items.retain(|item| {
-            (item.namespace.as_deref(), item.name.as_str())
-                > (cursor.after().namespace(), cursor.after().name())
-        });
-    }
-    let limit = query.limit().and_then(|value| usize::try_from(value).ok());
-    let total = items.len();
-    let has_more = limit.is_some_and(|limit| total > limit);
-    let remaining =
-        if has_more && query.label_selector().is_none() && query.field_selector().is_none() {
-            limit
-                .and_then(|limit| total.checked_sub(limit))
-                .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
-        } else {
-            None
-        };
-    if let Some(limit) = limit {
-        items.truncate(limit);
-    }
-    let snapshot = ResourceListSnapshot::try_new(position)?;
-    let continuation = has_more.then(|| {
-        let item = items.last().expect("non-empty historical Redb page");
-        ResourceContinuation::new(
-            ResourceCollectionKey::new(item.namespace.clone(), item.name.clone()),
-            snapshot,
-        )
-    });
-    ResourceListPage::try_new(items, snapshot, continuation, remaining)
-}
-
-fn durable_target_for_collection(
-    api_version: &str,
-    kind: &str,
-    scope: &ResourceCollectionScope,
-) -> klights_cluster_store::DurableWatchTarget {
-    match scope {
-        ResourceCollectionScope::Cluster => {
-            klights_cluster_store::DurableWatchTarget::cluster(api_version, kind)
-        }
-        ResourceCollectionScope::AllNamespaces => {
-            klights_cluster_store::DurableWatchTarget::namespaced(api_version, kind)
-        }
-        ResourceCollectionScope::Namespace(namespace) => {
-            klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
-                api_version,
-                kind,
-                namespace,
-            )
-        }
-    }
 }
 
 fn map_resource_error(error: anyhow::Error) -> ResourceReadError {

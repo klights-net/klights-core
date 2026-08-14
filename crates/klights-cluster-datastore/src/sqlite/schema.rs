@@ -212,6 +212,16 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
          ON watch_events(api_version, kind, COALESCE(namespace, '#cluster'), name, resource_version)",
         [],
     )?;
+    // A positioned resource page first chooses a small ordered identity window
+    // and then reverses each identity independently.  Keep that lookup off
+    // the scope-wide watch index: `(identity, id DESC)` lets SQLite seek the
+    // predecessor for one resource without decoding or sorting history for
+    // unrelated identities.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watch_events_identity_id_desc
+         ON watch_events(api_version, kind, COALESCE(namespace, '#cluster'), name, id DESC)",
+        [],
+    )?;
     // resource_version-leading index for rv-ordered reads: the raft
     // snapshot streamer (`WATCH_EVENTS_LIST_ALL_SINCE[_PAGED]`), the deleted-
     // event sweep, and watch catch-up all read `ORDER BY resource_version,
@@ -861,6 +871,20 @@ mod tests {
         assert!(
             !plan.contains("SCAN watch_events"),
             "rv-ordered watch_events read must seek an index, not full-scan. Plan:\n{plan}"
+        );
+    }
+
+    /// Positioned resource pages reverse only the identities in their bounded
+    /// key window.  The lookup therefore needs to seek an identity and walk
+    /// its history newest-first; the generic scope/RV indexes cannot provide
+    /// that access path without scanning unrelated objects.
+    #[test]
+    fn watch_event_identity_history_reads_have_a_descending_event_index() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        init_schema_in_conn(&mut conn).expect("init schema");
+        assert!(
+            index_exists(&conn, "idx_watch_events_identity_id_desc"),
+            "positioned resource pages require an identity/event history index"
         );
     }
 

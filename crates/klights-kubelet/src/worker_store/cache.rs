@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use klights_cluster_core::{Resource, WatchReplayPosition};
-use klights_leader_api::{ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency};
+use klights_leader_api::{
+    ResourceGetRequest, ResourceListRequest, ResourceListScope, ResourceQueryConsistency,
+};
 use klights_types::ResourceKey;
 use serde_json::Value;
 
@@ -74,7 +76,7 @@ impl WorkerStoreAdapter {
         &self,
         api_version: &str,
         kind: &str,
-        namespace: Option<&str>,
+        scope: ResourceListScope,
         label_selector: Option<&str>,
         field_selector: Option<&str>,
         page: WorkerListPage,
@@ -89,7 +91,7 @@ impl WorkerStoreAdapter {
             .list_resources(ResourceListRequest::try_new(
                 api_version,
                 kind,
-                namespace.map(str::to_string),
+                scope,
                 label_selector.map(str::to_string),
                 field_selector,
                 None,
@@ -142,7 +144,11 @@ impl WorkerStoreAdapter {
             .list_resources(
                 api_version,
                 kind,
-                None,
+                if namespaced {
+                    ResourceListScope::AllNamespaces
+                } else {
+                    ResourceListScope::Cluster
+                },
                 None,
                 None,
                 WorkerListPage::unbounded(),

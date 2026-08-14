@@ -40,19 +40,19 @@ fn spawn_raw_create_with_watch_event(
         )?;
         crate::sqlite::selector_index::upsert_index_entries(
             &tx,
-            &api_version,
-            &kind,
-            &namespace,
-            &name,
+            api_version,
+            kind,
+            namespace,
+            name,
             &row_data,
         )?;
         crate::sqlite::mutation_helpers::insert_watch_event_in_conn(
             &tx,
             crate::sqlite::mutation_helpers::WatchEventInsert::new(
-                &api_version,
-                &kind,
-                Some(&namespace),
-                &name,
+                api_version,
+                kind,
+                Some(namespace),
+                name,
                 rv,
                 "ADDED",
                 &row_data,

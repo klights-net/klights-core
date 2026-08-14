@@ -153,9 +153,9 @@ pub mod test_protobuf {
 /// Focused root-adapter contracts used to compose the current native service.
 pub mod ports {
     pub use crate::current::custom_resource_ports::{
-        CustomResourceListSnapshot, CustomResourceProjection, CustomResourceReadFuture,
-        CustomResourceReadPort, CustomResourceSnapshotRequest, CustomResourceWaitFuture,
-        CustomResourceWatchTarget, added_watch_event, resource_event_to_watch_event,
+        CustomResourceProjection, CustomResourceReadFuture, CustomResourceReadPort,
+        CustomResourceWaitFuture, CustomResourceWatchTarget, added_watch_event,
+        resource_event_to_watch_event,
     };
     pub use crate::current::generated_handler_ports::{GeneratedWatchPort, GeneratedWatchRequest};
     pub use crate::current::helpers::AdmissionResourceStore;

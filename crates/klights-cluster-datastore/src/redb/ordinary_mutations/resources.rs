@@ -141,6 +141,10 @@ impl RedbOrdinaryResourceStore {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the replicated create fixture preserves the storage command fields explicitly"
+    )]
     async fn apply_replicated_create_resource(
         &self,
         av: &str,

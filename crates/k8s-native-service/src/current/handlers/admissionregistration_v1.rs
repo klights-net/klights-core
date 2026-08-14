@@ -95,7 +95,7 @@ async fn delete_collection_mutatingwebhookconfigurations(
         state.resource_mutation().resource_command.as_ref(),
         "admissionregistration.k8s.io/v1",
         "MutatingWebhookConfiguration",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;
@@ -113,7 +113,7 @@ async fn delete_collection_validatingwebhookconfigurations(
         state.resource_mutation().resource_command.as_ref(),
         "admissionregistration.k8s.io/v1",
         "ValidatingWebhookConfiguration",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;
@@ -131,7 +131,7 @@ async fn delete_collection_validatingadmissionpolicies(
         state.resource_mutation().resource_command.as_ref(),
         "admissionregistration.k8s.io/v1",
         "ValidatingAdmissionPolicy",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;
@@ -149,7 +149,7 @@ async fn delete_collection_validatingadmissionpolicybindings(
         state.resource_mutation().resource_command.as_ref(),
         "admissionregistration.k8s.io/v1",
         "ValidatingAdmissionPolicyBinding",
-        None,
+        klights_leader_api::ResourceListScope::Cluster,
         query.label_selector.as_deref(),
     )
     .await?;

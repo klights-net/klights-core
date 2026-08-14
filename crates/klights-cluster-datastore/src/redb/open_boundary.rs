@@ -9,6 +9,10 @@ use crate::errors::OpenError;
 use klights_supervisor::TaskSupervisor;
 
 use super::meta;
+use super::mutation_helpers::{
+    rebuild_resource_current_index, rebuild_resource_history_index,
+    resource_current_index_is_current, resource_history_index_is_current,
+};
 use super::opener::RedbOpenOpts;
 use super::tables;
 
@@ -151,6 +155,8 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::NAMESPACES);
         let _ = w.open_table(tables::WATCH_EVENTS_LEGACY);
         let _ = w.open_table(tables::WATCH_EVENTS);
+        let _ = w.open_table(tables::RESOURCE_HISTORY_BY_IDENTITY);
+        let _ = w.open_table(tables::RESOURCE_CURRENT_BY_IDENTITY);
         let _ = w.open_table(tables::WATCH_REPLAY_FLOORS);
         let _ = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS);
         let _ = w.open_table(tables::APPLIED_OUTBOX);
@@ -164,6 +170,12 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::KLIGHTS_META);
     }
     migrate_watch_events_v2(&w)?;
+    if !resource_history_index_is_current(&w)? {
+        rebuild_resource_history_index(&w)?;
+    }
+    if !resource_current_index_is_current(&w)? {
+        rebuild_resource_current_index(&w)?;
+    }
     w.commit()?;
     Ok(())
 }
