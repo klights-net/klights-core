@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use klights_node_datastore::{
     SqliteNodeIdentity, SqliteNodeNetworkStateStore, SqliteRuntimeWorkStore,
@@ -77,23 +77,30 @@ async fn node_local_schema_has_only_slim_uid_bound_tables() {
         .await
         .unwrap();
 
-    for required in [
+    let actual: BTreeSet<_> = tables.iter().map(String::as_str).collect();
+    let expected: BTreeSet<_> = [
+        "_node_meta",
         "outbox",
         "outbox_dead_letter",
-        "pod_runtime",
-        "pod_status_checkpoints",
-        "pod_networks",
+        "outbox_stream_sequences",
         "pod_endpoints",
+        "pod_networks",
+        "pod_runtime",
+        "pod_runtime_observation_checkpoints",
+        "pod_slot_admissions",
+        "pod_status_checkpoints",
         "pod_workqueue",
         "probe_state",
+        "raft_log_entries",
+        "raft_meta",
         "replication_checkpoint",
-        "_node_meta",
-    ] {
-        assert!(
-            tables.iter().any(|table| table == required),
-            "missing {required}"
-        );
-    }
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        actual, expected,
+        "node SQLite schema table inventory changed"
+    );
     for forbidden in [
         "namespaced_resources",
         "cluster_resources",
@@ -147,6 +154,15 @@ async fn node_local_schema_has_only_slim_uid_bound_tables() {
                     !columns
                         .iter()
                         .any(|(name, ty)| { name == "data" && ty.eq_ignore_ascii_case("BLOB") })
+                );
+
+                let foreign_keys = conn
+                    .prepare(&format!("PRAGMA foreign_key_list(\"{table}\")"))?
+                    .query_map([], |row| row.get::<_, String>(2))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(
+                    foreign_keys.is_empty(),
+                    "node-local table {table} must not reference a cluster table: {foreign_keys:?}"
                 );
             }
             Ok(())

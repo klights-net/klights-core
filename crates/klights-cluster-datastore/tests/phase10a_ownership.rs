@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use klights_cluster_datastore::{
     errors::{DatastoreError, OpenError},
@@ -46,10 +46,30 @@ async fn explicit_sqlite_open_owns_the_current_cluster_schema() {
         .await
         .expect("read current cluster schema");
 
-    assert_eq!(tables.len(), 15);
-    assert!(tables.iter().any(|name| name == "outbox_stream_watermarks"));
-    assert!(tables.iter().any(|name| name == "watch_events"));
-    assert!(!tables.iter().any(|name| name == "pod_sandboxes"));
+    let actual: BTreeSet<_> = tables.iter().map(String::as_str).collect();
+    let expected: BTreeSet<_> = [
+        "_klights_meta",
+        "applied_outbox",
+        "cluster_resources",
+        "metadata",
+        "namespaced_resources",
+        "namespaces",
+        "node_dataplane",
+        "node_subnets",
+        "outbox_stream_watermarks",
+        "pod_cleanup_intents",
+        "resource_fields",
+        "resource_labels",
+        "resource_owner_refs",
+        "watch_events",
+        "watch_replay_floors",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        actual, expected,
+        "cluster SQLite schema table inventory changed"
+    );
 }
 
 #[tokio::test]
@@ -65,8 +85,20 @@ async fn explicit_redb_open_owns_current_tables_and_supervised_calls() {
             let read = database.begin_read()?;
             let metadata = read.open_table(tables::META)?;
             assert!(metadata.get("resource_version")?.is_none());
-            read.open_table(tables::OUTBOX_STREAM_WATERMARKS)?;
+            read.open_table(tables::RES_CLUSTER)?;
+            read.open_table(tables::RES_NS)?;
+            read.open_table(tables::NAMESPACES)?;
             read.open_table(tables::WATCH_EVENTS)?;
+            read.open_table(tables::WATCH_REPLAY_FLOORS)?;
+            read.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+            read.open_table(tables::APPLIED_OUTBOX)?;
+            read.open_table(tables::OUTBOX_STREAM_WATERMARKS)?;
+            read.open_table(tables::RESOURCES_BY_OWNER)?;
+            read.open_table(tables::RV_TO_KEY)?;
+            read.open_table(tables::NODE_SUBNETS)?;
+            read.open_table(tables::NODE_DATAPLANE)?;
+            read.open_table(tables::POD_CLEANUP_INTENTS)?;
+            read.open_table(tables::KLIGHTS_META)?;
             Ok(())
         })
         .await

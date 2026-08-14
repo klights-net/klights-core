@@ -7,10 +7,9 @@
 //!
 //! ## Design invariants
 //!
-//! * **Node-local operations are excluded.**  Only `ClusterReplicated` and
-//!   `ConfigReplicated` operations (per the domain map in `domain.rs`) have
-//!   command variants.  Node-local ops (`pod_sandboxes`, `pod_networks`,
-//!   `pod_workqueue`, `pod_endpoints`) stay as direct local backend calls.
+//! * **Node-local operations are excluded.** `StorageCommand` owns logical
+//!   cluster mutations; runtime, network, workqueue, and endpoint state stay
+//!   behind the focused `klights-node-store` capabilities.
 //! * **Deterministic metadata.**  In HA mode the leader fills `CommandMeta`
 //!   (RV, UID, timestamp, authoring node) before replication.  SingleNode
 //!   mode generates them locally before building the command.
@@ -98,10 +97,9 @@ pub struct CommandMeta {
 
 /// A versioned storage command representing a logical mutation.
 ///
-/// Only **ClusterReplicated** and **ConfigReplicated** operations have
-/// command variants.  Node-local operations (sandbox, pod network,
-/// workqueue, endpoints) are excluded — they stay as direct local
-/// backend calls per the domain map in `domain.rs`.
+/// `StorageCommand` contains only logical cluster mutations. Node-local
+/// sandbox, pod-network, workqueue, and endpoint operations remain owned by
+/// focused `klights-node-store` capabilities and never cross this boundary.
 ///
 /// Read operations (get/list/find) are also excluded — they never
 /// cross the replication boundary.
