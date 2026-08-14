@@ -183,29 +183,44 @@ impl ClusterResourceRead for SqliteReadStore {
                 let kind = request.kind().to_string();
                 let after = query.start_after().cloned();
                 let limit = usize::try_from(query.limit().unwrap()).unwrap_or(usize::MAX);
-                let (mut items, position) = self.read_db_call("cluster-read:all-namespaces-keyset", move |connection| {
+                let (mut items, position, total) = self.read_db_call("cluster-read:all-namespaces-keyset", move |connection| {
                     let mut sql = String::from("SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2");
+                    let mut count_sql = String::from(
+                        "SELECT COUNT(*) FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2",
+                    );
                     let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(av), Box::new(kind)];
                     if let Some(after) = after {
-                        sql.push_str(&format!(" AND (namespace > ?{} OR (namespace = ?{} AND name > ?{}))", values.len()+1, values.len()+2, values.len()+3));
+                        let after_clause = format!(" AND (namespace > ?{} OR (namespace = ?{} AND name > ?{}))", values.len()+1, values.len()+2, values.len()+3);
+                        sql.push_str(&after_clause);
+                        count_sql.push_str(&after_clause);
                         let namespace = after.namespace().unwrap_or_default().to_string();
                         values.push(Box::new(namespace.clone())); values.push(Box::new(namespace)); values.push(Box::new(after.name().to_string()));
                     }
+                    let count_refs = values.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
+                    let total: i64 = connection.query_row(&count_sql, count_refs.as_slice(), |row| row.get(0))?;
                     sql.push_str(&format!(" ORDER BY namespace, name LIMIT ?{}", values.len()+1));
-                    values.push(Box::new(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)));
+                    values.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
                     let refs = values.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
                     let mut statement = connection.prepare(&sql)?;
                     let rows = statement.query_map(refs.as_slice(), row_to_namespaced_resource)?;
                     let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok((items, sqlite_replay_position(connection)?))
+                    Ok((items, sqlite_replay_position(connection)?, total))
                 }).await.map_err(|error| map_resource_error(anyhow::Error::new(error)))?;
-                let has_more = items.len() > limit;
+                let has_more = total > i64::try_from(items.len()).unwrap_or(i64::MAX);
                 items.truncate(limit);
+                let remaining_item_count = has_more
+                    .then(|| {
+                        total
+                            .checked_sub(i64::try_from(items.len()).unwrap_or(i64::MAX))
+                            .ok_or(rusqlite::Error::InvalidQuery)
+                    })
+                    .transpose()
+                    .map_err(|error| map_resource_error(anyhow::Error::new(error)))?;
                 let snapshot = ResourceListSnapshot::try_new(position)?;
                 let continuation = if has_more {
                     let last = items
                         .last()
-                        .expect("probe means a bounded page has a last item");
+                        .expect("a nonempty remainder means a bounded page has a last item");
                     Some(ResourceContinuation::new(
                         ResourceCollectionKey::new(last.namespace.clone(), last.name.clone()),
                         snapshot,
@@ -217,7 +232,7 @@ impl ClusterResourceRead for SqliteReadStore {
                     items,
                     snapshot,
                     continuation,
-                    None,
+                    remaining_item_count,
                 )?));
             }
             let mut page = SqliteReadStore::list_resources(

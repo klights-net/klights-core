@@ -524,9 +524,7 @@ async fn test_list_with_limit_returns_correct_count() {
         "continue token must be set when items remain beyond the limit"
     );
 
-    // Kubernetes makes remainingItemCount optional. Bounded keyset readers
-    // omit it rather than scanning the rest of the collection.
-    assert_eq!(list["metadata"]["remainingItemCount"].as_i64(), None);
+    assert_eq!(list["metadata"]["remainingItemCount"].as_i64(), Some(3));
 
     // All returned items must have resourceVersion
     for item in items {

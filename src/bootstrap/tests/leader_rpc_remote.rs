@@ -678,7 +678,7 @@ async fn grpc_paginated_list_preserves_namespace_scope_and_pinned_mode_on_page_t
                 ResourceListScope::Namespace("default".to_string()),
                 None,
                 None,
-                Some(2),
+                Some(1),
                 None,
                 ResourceQueryConsistency::LeaderFresh,
             )
@@ -686,6 +686,11 @@ async fn grpc_paginated_list_preserves_namespace_scope_and_pinned_mode_on_page_t
         )
         .await
         .expect("first direct RPC page");
+    assert_eq!(
+        first.remaining_item_count(),
+        Some(2),
+        "unfiltered RPC page one must preserve the exact datastore remaining count"
+    );
     let continuation = first
         .continue_token()
         .expect("first page must carry typed private continuation")
@@ -698,7 +703,7 @@ async fn grpc_paginated_list_preserves_namespace_scope_and_pinned_mode_on_page_t
                 ResourceListScope::Namespace("default".to_string()),
                 None,
                 None,
-                Some(2),
+                Some(1),
                 Some(continuation),
                 klights_leader_api::ResourceListContinuationMode::Pinned,
                 ResourceQueryConsistency::LeaderFresh,
@@ -713,10 +718,15 @@ async fn grpc_paginated_list_preserves_namespace_scope_and_pinned_mode_on_page_t
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>(),
-        ["cm-c"]
+        ["cm-b"]
     );
     assert_eq!(second.resource_version(), first.resource_version());
-    assert!(second.continue_token().is_none());
+    assert_eq!(
+        second.remaining_item_count(),
+        Some(1),
+        "unfiltered pinned RPC page two must preserve the exact datastore remaining count"
+    );
+    assert!(second.continue_token().is_some());
     handle.abort();
 }
 

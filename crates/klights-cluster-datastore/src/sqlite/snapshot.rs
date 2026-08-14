@@ -729,8 +729,10 @@ pub(crate) async fn bounded_historical_list(
         .query()
         .limit()
         .and_then(|value| usize::try_from(value).ok());
+    let count_exact_remaining = limit.is_some() && labels.is_none() && fields.is_none();
     let probe = limit.map_or(usize::MAX, |value| value.saturating_add(1));
     let mut emitted = Vec::with_capacity(probe.min(HISTORICAL_CANDIDATE_CAP));
+    let mut matched_count = 0_i64;
     let mut candidate_after = request.query().start_after().cloned();
     let mut more_candidates: bool;
 
@@ -804,8 +806,11 @@ pub(crate) async fn bounded_historical_list(
                     {
                         continue;
                     }
-                    emitted.push(resource);
-                    if emitted.len() == probe {
+                    matched_count = matched_count.saturating_add(1);
+                    if !count_exact_remaining || emitted.len() < limit.unwrap_or(usize::MAX) {
+                        emitted.push(resource);
+                    }
+                    if !count_exact_remaining && emitted.len() == probe {
                         break;
                     }
                     continue;
@@ -823,13 +828,16 @@ pub(crate) async fn bounded_historical_list(
                 }
             }
         }
-        if emitted.len() == probe || !more_candidates {
+        if (!count_exact_remaining && emitted.len() == probe) || !more_candidates {
             break;
         }
     }
 
-    let has_more =
-        limit.is_some_and(|value| emitted.len() > value) || (more_candidates && limit.is_none());
+    let has_more = if count_exact_remaining {
+        limit.is_some_and(|value| matched_count > i64::try_from(value).unwrap_or(i64::MAX))
+    } else {
+        limit.is_some_and(|value| emitted.len() > value) || (more_candidates && limit.is_none())
+    };
     if let Some(limit) = limit {
         emitted.truncate(limit);
     }
@@ -847,12 +855,21 @@ pub(crate) async fn bounded_historical_list(
     // A selector may underfill an internal candidate window.  Its next public
     // token is still the last *emitted* identity; callers never see the
     // request-local scan cursor.
+    let remaining_item_count = (count_exact_remaining && has_more)
+        .then(|| {
+            matched_count
+                .checked_sub(i64::try_from(emitted.len()).unwrap_or(i64::MAX))
+                .ok_or_else(|| ResourceReadError::CorruptData {
+                    message: "historical LIST remaining item count underflowed".to_string(),
+                })
+        })
+        .transpose()?;
     let _ = all_namespaces;
     Ok(ResourceListRead::Historical(ResourceListPage::try_new(
         emitted,
         snapshot,
         continuation,
-        None,
+        remaining_item_count,
     )?))
 }
 

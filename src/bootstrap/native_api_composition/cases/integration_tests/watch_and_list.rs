@@ -3222,8 +3222,8 @@ async fn test_list_pagination_metadata_for_selector_free_and_label_selector_requ
     );
     assert_eq!(
         selector_free_page1_json["metadata"]["remainingItemCount"].as_i64(),
-        None,
-        "bounded keyset pages omit the optional inexact remaining count"
+        Some(3),
+        "an unfiltered page with continue must report its exact remaining item count"
     );
 
     let selector_page1 = app
@@ -8770,7 +8770,7 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/namespaces/default/podtemplates?limit=20")
+                .uri("/api/v1/podtemplates?limit=20")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8787,6 +8787,11 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .as_str()
         .expect("first page must return a continue token")
         .to_string();
+    assert_eq!(
+        first_list["metadata"]["remainingItemCount"].as_i64(),
+        Some(25),
+        "an unfiltered cluster-wide first page with continue must report its exact remaining item count"
+    );
     let first_token_data = decode_continue_token(&first_token);
     assert!(first_token_data.ts.is_some());
 
@@ -8822,7 +8827,7 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/api/v1/namespaces/default/podtemplates?limit=20&continue={first_token}"
+                    "/api/v1/podtemplates?limit=20&continue={first_token}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -8860,7 +8865,7 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/api/v1/namespaces/default/podtemplates?limit=20&continue={recovery_query}"
+                    "/api/v1/podtemplates?limit=20&continue={recovery_query}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -8889,6 +8894,11 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     let recovery_next = recovery_list["metadata"]["continue"]
         .as_str()
         .expect("recovery page should still have another page");
+    assert_eq!(
+        recovery_list["metadata"]["remainingItemCount"].as_i64(),
+        Some(5),
+        "an unfiltered recovery page with continue must report its exact remaining item count"
+    );
     let recovery_next_data = decode_continue_token(recovery_next);
     assert!(recovery_next_data.ts.is_some());
     assert_eq!(recovery_next_data.rv.to_string(), recovery_rv);
@@ -9092,7 +9102,7 @@ async fn test_cluster_wide_pagination_serves_consistent_snapshot_across_pages() 
             "data": {"k": "v"}
         })
     };
-    for i in 0..4 {
+    for i in 0..5 {
         let name = format!("cm-{i:02}");
         db.create_resource("v1", "ConfigMap", Some("default"), &name, cm_body(&name))
             .await
@@ -9121,6 +9131,11 @@ async fn test_cluster_wide_pagination_serves_consistent_snapshot_across_pages() 
         .as_str()
         .expect("page 1 continue token")
         .to_string();
+    assert_eq!(
+        page1["metadata"]["remainingItemCount"].as_i64(),
+        Some(3),
+        "an unfiltered cluster-wide JSON page with continue must report its exact remaining item count"
+    );
 
     // Mutate mid-pagination: create a ConfigMap sorting into the page-2 window.
     db.create_resource(
@@ -9138,6 +9153,7 @@ async fn test_cluster_wide_pagination_serves_consistent_snapshot_across_pages() 
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/configmaps?limit=2&continue={token}"))
+                .header("accept", "application/vnd.kubernetes.protobuf")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -9145,7 +9161,8 @@ async fn test_cluster_wide_pagination_serves_consistent_snapshot_across_pages() 
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let page2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let page2 = k8s_native_service::test_protobuf::decode_protobuf(&body)
+        .expect("cluster-wide page two must honor protobuf Accept");
     assert_eq!(
         list_item_names(&page2),
         vec!["cm-02", "cm-03"],
@@ -9155,6 +9172,11 @@ async fn test_cluster_wide_pagination_serves_consistent_snapshot_across_pages() 
         page2["metadata"]["resourceVersion"].as_str().unwrap(),
         rv1,
         "paginated cluster-wide pages must keep the snapshot resourceVersion"
+    );
+    assert_eq!(
+        page2["metadata"]["remainingItemCount"].as_i64(),
+        Some(1),
+        "an unfiltered pinned protobuf page with continue must report its exact remaining item count"
     );
 }
 

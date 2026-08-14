@@ -4388,8 +4388,8 @@ async fn test_list_configmaps_returns_continue_and_remaining_when_more_pages_exi
 
     assert_eq!(
         page1["metadata"]["remainingItemCount"].as_i64(),
-        None,
-        "bounded keyset pages omit the optional inexact remaining count"
+        Some(2),
+        "continued pages report the exact number of items remaining"
     );
 
     // Fetch second page using continue token
