@@ -97,6 +97,7 @@ fn open_persistent_blocking(opts: &RedbOpenOpts) -> Result<Database, OpenError> 
         path: opts.path.display().to_string(),
         details: format!("failed to create/open redb database: {e}"),
     })?;
+    meta::schema_check_existing(&db).map_err(|e| attach_path(opts, e))?;
     initialize_tables(&db).map_err(|e| OpenError::Corrupt {
         path: opts.path.display().to_string(),
         details: format!("failed to initialize redb tables: {e}"),
@@ -157,6 +158,7 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::RESOURCES_BY_OWNER);
         let _ = w.open_table(tables::RV_TO_KEY);
         let _ = w.open_table(tables::NODE_SUBNETS);
+        let _ = w.open_table(tables::NODE_DATAPLANE);
         let _ = w.open_table(tables::POD_CLEANUP_INTENTS);
         let _ = w.open_table(tables::META);
         let _ = w.open_table(tables::KLIGHTS_META);
@@ -234,7 +236,7 @@ mod tests {
 
     use super::*;
     use klights_supervisor::{TaskCategory, TaskCategoryConfig};
-    use redb::{ReadableDatabase, TableHandle};
+    use redb::{ReadableDatabase, ReadableTableMetadata, TableDefinition, TableHandle};
     use tempfile::TempDir;
 
     fn temp_db_dir() -> (TempDir, PathBuf) {
@@ -393,6 +395,7 @@ mod tests {
             "resources_by_owner",
             "rv_to_key",
             "node_subnets",
+            "node_dataplane",
             "pod_cleanup_intents",
             "meta",
         ] {
@@ -424,6 +427,99 @@ mod tests {
         };
         open_persistent_blocking(&opts).expect("first open");
         open_persistent_blocking(&opts).expect("reopen");
+    }
+
+    #[test]
+    fn persistent_pre_feature_database_preserves_metadata_and_adds_node_dataplane() {
+        let (_dir, path) = temp_db_dir();
+        {
+            let db = Database::builder()
+                .create(&path)
+                .expect("create legacy database");
+            let write = db.begin_write().expect("write transaction");
+            {
+                let mut metadata = write.open_table(tables::META).expect("legacy metadata");
+                metadata
+                    .insert("sentinel", b"keep".as_slice())
+                    .expect("write sentinel");
+            }
+            write.commit().expect("commit legacy sentinel");
+        }
+
+        let db = open_persistent_blocking(&RedbOpenOpts {
+            path,
+            cache_size: 40 * 1024 * 1024,
+        })
+        .expect("upgrade persistent database");
+        let read = db.begin_read().expect("read upgraded database");
+        assert_eq!(
+            read.open_table(tables::META)
+                .expect("metadata table")
+                .get("sentinel")
+                .expect("read sentinel")
+                .expect("sentinel remains")
+                .value(),
+            b"keep"
+        );
+        assert!(
+            read.open_table(tables::NODE_DATAPLANE)
+                .expect("typed node dataplane table")
+                .is_empty()
+                .expect("empty node dataplane table")
+        );
+    }
+
+    #[test]
+    fn persistent_open_rejects_wrong_typed_node_dataplane_table() {
+        let (_dir, path) = temp_db_dir();
+        {
+            let db = Database::builder().create(&path).expect("create database");
+            let write = db.begin_write().expect("write transaction");
+            const WRONG_NODE_DATAPLANE: TableDefinition<&str, u64> =
+                TableDefinition::new("node_dataplane");
+            write
+                .open_table(WRONG_NODE_DATAPLANE)
+                .expect("create wrong typed table");
+            write.commit().expect("commit wrong typed table");
+        }
+
+        let error = open_persistent_blocking(&RedbOpenOpts {
+            path,
+            cache_size: 40 * 1024 * 1024,
+        })
+        .expect_err("wrong typed node dataplane table must fail closed");
+        assert!(matches!(error, OpenError::SchemaMismatch { .. }));
+    }
+
+    #[test]
+    fn fresh_typed_node_dataplane_table_round_trips_before_network_writes() {
+        let (_dir, path) = temp_db_dir();
+        let db = open_persistent_blocking(&RedbOpenOpts {
+            path,
+            cache_size: 40 * 1024 * 1024,
+        })
+        .expect("open fresh database");
+        let write = db.begin_write().expect("write transaction");
+        {
+            let mut dataplane = write
+                .open_table(tables::NODE_DATAPLANE)
+                .expect("typed node dataplane table");
+            dataplane
+                .insert("node-a", br#"{\"mode\":\"root\"}"#.as_slice())
+                .expect("write dataplane row");
+        }
+        write.commit().expect("commit dataplane row");
+
+        let read = db.begin_read().expect("read transaction");
+        assert_eq!(
+            read.open_table(tables::NODE_DATAPLANE)
+                .expect("typed node dataplane table")
+                .get("node-a")
+                .expect("read dataplane row")
+                .expect("dataplane row")
+                .value(),
+            br#"{\"mode\":\"root\"}"#
+        );
     }
 
     #[test]
