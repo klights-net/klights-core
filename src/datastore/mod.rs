@@ -9,7 +9,6 @@ pub mod backend;
 pub mod backend_kind;
 pub mod redb;
 pub(crate) mod selector;
-pub(crate) mod snapshot_export;
 pub mod sqlite;
 
 #[cfg(test)]
