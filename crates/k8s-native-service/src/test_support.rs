@@ -2,3 +2,5 @@
 
 pub mod admission;
 pub mod resource;
+#[path = "streaming/test_support.rs"]
+pub mod streaming;

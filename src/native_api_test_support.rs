@@ -67,44 +67,6 @@ impl IntegrationFollowerSession {
     }
 }
 
-/// Feature-only executor for the native exec-sync WebSocket adapter backed by
-/// the same real replication service registered through the parent harness.
-#[derive(Clone)]
-pub struct IntegrationRemoteExecSync {
-    node_exec: Arc<dyn klights_node_api::NodeExec>,
-    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-}
-
-impl IntegrationRemoteExecSync {
-    pub async fn run<S>(
-        self,
-        io: S,
-        target: k8s_native_service::streaming::ExecTarget,
-        subprotocol: String,
-        node_name: String,
-    ) where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    {
-        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            io,
-            tokio_tungstenite::tungstenite::protocol::Role::Server,
-            None,
-        )
-        .await;
-        k8s_native_service::streaming::handle_remote_exec_websocket_sync(
-            socket,
-            k8s_native_service::streaming::RemoteExecWebSocketSyncRequest {
-                node_exec: self.node_exec,
-                target,
-                subprotocol,
-                node_name,
-                task_supervisor: self.task_supervisor,
-            },
-        )
-        .await;
-    }
-}
-
 /// In-process leader delivery for the native API fixture. This keeps the real
 /// node outbox codec, authorization, watermark, proposal, and committed-apply
 /// path while keeping the authenticated worker identity fixed by fixture
@@ -1303,18 +1265,23 @@ impl NativeApiTestHarness {
         })
     }
 
-    pub fn integration_remote_exec_sync(&self) -> anyhow::Result<IntegrationRemoteExecSync> {
+    pub fn integration_remote_exec_sync(
+        &self,
+    ) -> anyhow::Result<k8s_native_service::test_support::streaming::RemoteExecSyncWebSocketFixture>
+    {
         let replication = self
             .operational_replication
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("operational replication is not installed"))?
             .clone();
-        Ok(IntegrationRemoteExecSync {
-            node_exec: crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
-                replication,
+        Ok(
+            k8s_native_service::test_support::streaming::RemoteExecSyncWebSocketFixture::new(
+                crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+                    replication,
+                ),
+                self.task_supervisor.clone(),
             ),
-            task_supervisor: self.task_supervisor.clone(),
-        })
+        )
     }
 
     /// Canonical narrow persistence fixture bound to this router's exact store.
