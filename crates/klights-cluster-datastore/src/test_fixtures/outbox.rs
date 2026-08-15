@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use std::sync::Arc;
 

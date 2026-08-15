@@ -3,38 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreBackend;
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 
 struct LeaderCrdRegistryRuntime {
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     positioned_watch: klights_watch::PositionedWatchService,
-}
-
-#[async_trait]
-impl CrdRegistryReader for dyn DatastoreBackend + '_ {
-    async fn list_crd_values(
-        &self,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<serde_json::Value>> {
-        self.list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            klights_cluster_store::ResourceListOptions::all(),
-        )
-        .await
-        .map(|listing| {
-            listing
-                .items
-                .into_iter()
-                .map(|resource| Arc::unwrap_or_clone(resource.data))
-                .collect()
-        })
-        .map_err(map_controller_store_error)
-    }
 }
 
 #[async_trait]
@@ -161,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn datastore_reader_is_registry_source_of_truth() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let registry = CrdRegistry::new();
@@ -175,9 +149,19 @@ mod tests {
         .await
         .unwrap();
 
-        sync_registry_from_datastore(&db as &dyn DatastoreBackend, &registry)
-            .await
-            .unwrap();
+        sync_registry_from_datastore(
+            new_runtime(
+                db.focused_read_store(),
+                crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                    &crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db),
+                    &db,
+                ),
+            )
+            .as_ref(),
+            &registry,
+        )
+        .await
+        .unwrap();
         assert!(
             registry
                 .get("sync.example.com", "v1", "syncwidgets")
@@ -193,9 +177,19 @@ mod tests {
         )
         .await
         .unwrap();
-        sync_registry_from_datastore(&db as &dyn DatastoreBackend, &registry)
-            .await
-            .unwrap();
+        sync_registry_from_datastore(
+            new_runtime(
+                db.focused_read_store(),
+                crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                    &crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db),
+                    &db,
+                ),
+            )
+            .as_ref(),
+            &registry,
+        )
+        .await
+        .unwrap();
         assert!(
             registry
                 .get("sync.example.com", "v1", "syncwidgets")
@@ -206,10 +200,9 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_runtime_syncs_datastore_applied_crds() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let handle: DatastoreHandle = Arc::new(db.clone());
         let passive_reads =
             crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db);
         let registry = CrdRegistry::new();
@@ -219,7 +212,7 @@ mod tests {
                 db.focused_read_store(),
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
                     &passive_reads,
-                    handle,
+                    &db,
                 ),
             ),
             registry.clone(),

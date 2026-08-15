@@ -8,8 +8,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::hpa::HpaSideEffectStore;
 
 struct RootHpaSideEffectStore {
@@ -45,28 +43,4 @@ impl HpaSideEffectStore for RootHpaSideEffectStore {
 
 pub(crate) fn port(resource_reads: Arc<dyn ClusterResourceRead>) -> Arc<dyn HpaSideEffectStore> {
     Arc::new(RootHpaSideEffectStore { resource_reads })
-}
-
-#[cfg(test)]
-struct DirectHpaSideEffectStore {
-    db: DatastoreHandle,
-}
-#[cfg(test)]
-#[async_trait]
-impl HpaSideEffectStore for DirectHpaSideEffectStore {
-    async fn list_hpas(&self, api_version: &'static str, namespace: &str) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources(
-                api_version,
-                "HorizontalPodAutoscaler",
-                Some(namespace),
-                klights_cluster_store::ResourceListOptions::all(),
-            )
-            .await
-            .map(|page| page.items)
-    }
-}
-#[cfg(test)]
-pub(crate) fn port_for_test(db: DatastoreHandle) -> Arc<dyn HpaSideEffectStore> {
-    Arc::new(DirectHpaSideEffectStore { db })
 }

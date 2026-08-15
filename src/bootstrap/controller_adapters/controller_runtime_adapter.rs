@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_cluster_store::{
     ClusterOwnershipRead, ClusterResourceRead, OwnerNameKindRequest, OwnerUidRequest,
     ResourceCollectionScope, ResourceGetRequest, ResourceListQuery, ResourceListRead,
@@ -25,8 +23,6 @@ fn validate_controller_effect() -> Result<()> {
 }
 
 pub(crate) struct RootControllerLeaderPort {
-    #[cfg(test)]
-    store: Option<DatastoreHandle>,
     resource_reads: Option<Arc<dyn ClusterResourceRead>>,
     ownership_reads: Option<Arc<dyn ClusterOwnershipRead>>,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
@@ -34,22 +30,37 @@ pub(crate) struct RootControllerLeaderPort {
 
 impl RootControllerLeaderPort {
     #[cfg(test)]
-    pub(crate) fn new(store: DatastoreHandle) -> Self {
-        let commands = Self::resource_commands_for_test(store.clone());
-        Self::new_for_test_with_commands(store, commands)
+    pub(crate) fn new_for_test(
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        ownership_reads: Arc<dyn ClusterOwnershipRead>,
+    ) -> Self {
+        let commands = Self::resource_commands_for_test(
+            applied_outbox,
+            committed_apply,
+            resource_reads.clone(),
+        );
+        Self::new_with_commands(resource_reads, ownership_reads, commands)
     }
 
     #[cfg(test)]
     pub(crate) fn resource_commands_for_test(
-        store: DatastoreHandle,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn ClusterResourceRead>,
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(store.clone(), authority.clone());
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(resource_reads.clone(), authority.clone());
         Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 Arc::new(
-                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(store),
+                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                        applied_outbox,
+                        committed_apply,
+                        resource_reads,
+                    ),
                 ),
                 query,
                 authority,
@@ -57,26 +68,12 @@ impl RootControllerLeaderPort {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test_with_commands(
-        store: DatastoreHandle,
-        commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
-    ) -> Self {
-        Self {
-            store: Some(store),
-            resource_reads: None,
-            ownership_reads: None,
-            commands,
-        }
-    }
     pub(crate) fn new_with_commands(
         resource_reads: Arc<dyn ClusterResourceRead>,
         ownership_reads: Arc<dyn ClusterOwnershipRead>,
         commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Self {
         Self {
-            #[cfg(test)]
-            store: None,
             resource_reads: Some(resource_reads),
             ownership_reads: Some(ownership_reads),
             commands,
@@ -90,13 +87,6 @@ impl RootControllerLeaderPort {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        #[cfg(test)]
-        if let Some(store) = &self.store {
-            return store
-                .get_resource(api_version, kind, namespace, name)
-                .await
-                .map_err(map_controller_store_error);
-        }
         self.resource_reads
             .as_ref()
             .expect("focused controller resource reads")
@@ -117,28 +107,6 @@ impl RootControllerLeaderPort {
         scope: ResourceCollectionScope,
         label_selector: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        #[cfg(test)]
-        if let Some(store) = &self.store {
-            let namespace = match &scope {
-                ResourceCollectionScope::Namespace(namespace) => Some(namespace.as_str()),
-                _ => None,
-            };
-            return store
-                .list_resources(
-                    api_version,
-                    kind,
-                    namespace,
-                    klights_cluster_store::ResourceListOptions::new(
-                        label_selector,
-                        None,
-                        None,
-                        None,
-                    ),
-                )
-                .await
-                .map(|list| list.items)
-                .map_err(map_controller_store_error);
-        }
         match self
             .resource_reads
             .as_ref()
@@ -173,15 +141,6 @@ impl RootControllerLeaderPort {
     }
 
     async fn read_owned(&self, uid: &str, namespace: Option<&str>) -> Result<Vec<Resource>> {
-        #[cfg(test)]
-        if let Some(store) = &self.store {
-            return klights_controllers::gc::GcResourceStore::find_owned_resources(
-                store.as_ref(),
-                uid,
-                namespace,
-            )
-            .await;
-        }
         self.ownership_reads
             .as_ref()
             .expect("focused controller ownership reads")
@@ -200,17 +159,6 @@ impl RootControllerLeaderPort {
         kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        #[cfg(test)]
-        if let Some(store) = &self.store {
-            return klights_controllers::gc::GcResourceStore::find_owned_by_name_kind_empty_uid(
-                store.as_ref(),
-                api_version,
-                name,
-                kind,
-                namespace,
-            )
-            .await;
-        }
         self.ownership_reads
             .as_ref()
             .expect("focused controller ownership reads")
@@ -1454,18 +1402,22 @@ pub(crate) fn inject_resource_version(
 
 #[cfg(test)]
 fn runtime_dependencies_for_test(
-    db: &crate::datastore::sqlite::Datastore,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     node_name: &str,
 ) -> klights_controllers::ControllerRuntimeDependencies {
-    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+    let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-        db_handle.clone(),
+    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        ports.read_ports.resource_reads(),
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
-    let resource_commands = RootControllerLeaderPort::resource_commands_for_test(db_handle.clone());
+    let resource_commands = RootControllerLeaderPort::resource_commands_for_test(
+        ports.applied_outbox.clone(),
+        ports.committed_apply.clone(),
+        ports.read_ports.resource_reads(),
+    );
     let (
         pod_query,
         _pod_snapshot,
@@ -1493,10 +1445,10 @@ fn runtime_dependencies_for_test(
     ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
         crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             resource_query,
-            ownership_reads: db.focused_read_store(),
-            resource_reads: db.focused_read_store(),
-            namespace_content_reads: db.focused_read_store(),
-            topology_reads: db.focused_read_store(),
+            ownership_reads: ports.ownership_reads.clone(),
+            resource_reads: ports.read_ports.resource_reads(),
+            namespace_content_reads: ports.namespace_content_reads.clone(),
+            topology_reads: ports.topology_reads.clone(),
             pod_workqueue_store: None,
             supervisor,
             side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
@@ -1516,7 +1468,12 @@ fn runtime_dependencies_for_test(
         },
         None,
     );
-    let leader = Arc::new(RootControllerLeaderPort::new(db_handle.clone()));
+    let leader = Arc::new(RootControllerLeaderPort::new_for_test(
+        ports.applied_outbox.clone(),
+        ports.committed_apply.clone(),
+        ports.read_ports.resource_reads(),
+        ports.ownership_reads.clone(),
+    ));
     let pods = Arc::new(RootControllerPodPort::new_for_test(
         pod_query.clone(),
         pod_update.clone(),
@@ -1532,8 +1489,11 @@ fn runtime_dependencies_for_test(
         pods.clone(),
     ));
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
-        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-            db_handle,
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test(
+            ports.applied_outbox,
+            ports.committed_apply,
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
         ),
     );
     let services = Arc::new(klights_networking::test_support::MockServiceRouter::default());
@@ -1589,7 +1549,7 @@ impl klights_controllers::hpa::HpaReconcilePort for NoopHpaReconcilePort {
 
 #[cfg(test)]
 pub(crate) fn dispatcher_for_test(
-    db: &crate::datastore::sqlite::Datastore,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     service_ipam: Arc<klights_controllers::service::ServiceIpam>,
 ) -> Arc<klights_controllers::ControllerDispatcher> {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(

@@ -3998,7 +3998,7 @@ impl Datastore {
 
     /// Compatibility constructor for tests and helper call sites that still pass
     /// the DB root. Production bootstrap uses `new_persistent_paths`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn new_persistent(
         db_root: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
@@ -4014,7 +4014,7 @@ impl Datastore {
     }
 
     /// Test-only convenience constructor.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn new_in_memory() -> Result<Self> {
         let supervisor = std::sync::Arc::new(TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

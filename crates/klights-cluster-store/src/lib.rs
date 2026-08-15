@@ -18,7 +18,6 @@ mod ownership;
 mod persistence_contract;
 mod persistence_error;
 mod persistence_ports;
-mod pod_uid_precondition;
 mod post_commit;
 mod raw_watch_history;
 mod read_validation;
@@ -72,10 +71,6 @@ pub use persistence_ports::{
     AppliedOutboxLedger, ClusterMetadataMutation, ClusterNamespaceMutation, ClusterPodCleanupStore,
     ClusterResourceMutation, ClusterTopologyMutation, ClusterWatchMaintenance,
     CommittedOutboxApply,
-};
-pub use pod_uid_precondition::{
-    PodUidPreconditionError, PodUidPreconditionFuture, PodUidPreconditionRead,
-    PodUidPreconditionRequest, PodUidPreconditionState,
 };
 #[cfg(feature = "test-support")]
 pub use post_commit::StagedResourceEvent;

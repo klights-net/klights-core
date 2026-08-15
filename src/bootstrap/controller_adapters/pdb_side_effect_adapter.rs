@@ -64,11 +64,16 @@ pub(crate) fn port(
 mod adapter_tests {
     #[tokio::test]
     async fn test_pdb_reconcile_name() {
-        let (db, _db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let effect = klights_controllers::side_effects::pdb::effect(super::port(
-            std::sync::Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
-                std::sync::Arc::new(db.clone()),
+            std::sync::Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
+                ports.applied_outbox,
+                ports.committed_apply,
+                ports.read_ports.resource_reads(),
+                ports.ownership_reads,
             )),
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
         ));

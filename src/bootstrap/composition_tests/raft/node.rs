@@ -20,8 +20,8 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
     use super::*;
     use async_trait::async_trait;
-    use klights::datastore::DatastoreBackend;
     use klights_cluster_core::StorageCommand;
+    use klights_cluster_store::ClusterMetadataMutation;
     use klights_cluster_store::{
         COMMAND_CODEC_ACTIVATION_VERSION_META_KEY as KEY_COMMAND_CODEC_ACTIVATION_VERSION,
         COMMAND_CODEC_V3_ACTIVATION_VALUE as COMMAND_CODEC_ACTIVATION_VALUE,
@@ -359,7 +359,7 @@ mod tests {
     }
 
     struct BackendResourceQuery {
-        backend: Arc<klights::datastore::sqlite::Datastore>,
+        backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     }
 
     impl LeaderResourceQuery for BackendResourceQuery {
@@ -392,7 +392,9 @@ mod tests {
         }
     }
 
-    fn raft_store_ports(backend: Arc<klights::datastore::sqlite::Datastore>) -> RaftStorePorts {
+    fn raft_store_ports(
+        backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
+    ) -> RaftStorePorts {
         IntegrationRaftComposition::new(backend).store_ports()
     }
 
@@ -640,7 +642,10 @@ mod tests {
 
     async fn fresh_node(
         node_id: NodeId,
-    ) -> (TestRaftNode, Arc<klights::datastore::sqlite::Datastore>) {
+    ) -> (
+        TestRaftNode,
+        Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
+    ) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -650,8 +655,8 @@ mod tests {
         .await
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(node_executor));
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -733,7 +738,7 @@ mod tests {
     /// the shared registry so the test can hold and shut them down cleanly.
     async fn fresh_three_voter_cluster() -> (
         Vec<TestRaftNode>,
-        Vec<Arc<klights::datastore::sqlite::Datastore>>,
+        Vec<Arc<klights_cluster_datastore::sqlite::embedded::Datastore>>,
         LoopbackRegistry,
     ) {
         let registry = LoopbackRegistry::new();
@@ -749,8 +754,8 @@ mod tests {
             .await
             .expect("open node-local executor");
             let node_local = Arc::new(SqliteRaftDurability::new(exec));
-            let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-                klights::datastore::sqlite::Datastore::new_in_memory()
+            let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+                klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                     .await
                     .unwrap(),
             );
@@ -916,8 +921,8 @@ mod tests {
             .await
             .expect("open node-local executor");
             let node_local = Arc::new(SqliteRaftDurability::new(exec));
-            let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-                klights::datastore::sqlite::Datastore::new_in_memory()
+            let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+                klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                     .await
                     .unwrap(),
             );
@@ -1033,8 +1038,8 @@ mod tests {
         .await
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(exec));
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1108,7 +1113,10 @@ mod tests {
     async fn fresh_voter_in_registry_with_backend(
         id: NodeId,
         registry: &LoopbackRegistry,
-    ) -> (TestRaftNode, Arc<klights::datastore::sqlite::Datastore>) {
+    ) -> (
+        TestRaftNode,
+        Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
+    ) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -1118,8 +1126,8 @@ mod tests {
         .await
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(exec));
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -2028,9 +2036,9 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    async fn test_db() -> Arc<klights::datastore::sqlite::Datastore> {
+    async fn test_db() -> Arc<klights_cluster_datastore::sqlite::embedded::Datastore> {
         Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         )
@@ -2653,8 +2661,8 @@ mod tests {
         .await
         .unwrap();
         let node_local = Arc::new(SqliteRaftDurability::new(executor));
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -3120,8 +3128,8 @@ mod tests {
         .await
         .unwrap();
         let nl1 = Arc::new(SqliteRaftDurability::new(exec1));
-        let be1: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let be1: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -3157,8 +3165,8 @@ mod tests {
         .await
         .unwrap();
         let nl2 = Arc::new(SqliteRaftDurability::new(exec2));
-        let be2: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let be2: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );

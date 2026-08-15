@@ -152,7 +152,6 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::datastore::DatastoreHandle;
     use klights_networking::test_support::MockNetworkProvider;
     use serde_json::Value;
     use std::net::Ipv4Addr;
@@ -171,40 +170,42 @@ mod tests {
 
     #[tokio::test]
     async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+        );
+        let bootstrap_store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+            ports.read_ports.resource_reads(), ports.topology_reads, commands,
+        );
         klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &crate::bootstrap::file_blocking::test_file_process_executor(),
-            &db,
+            &bootstrap_store,
             &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
             chrono::DateTime::UNIX_EPOCH,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
         )
         .await
         .expect("default namespaces");
-        let db_handle: DatastoreHandle = Arc::new(db);
         let mut config = KlightsConfig::test_default();
         config.service_cidr = "10.51.0.0/24".to_string();
         config.tls_port = 7679;
 
         let first_leader_datapath = MockNetworkProvider::new();
         first_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 0, 1));
-        reconcile_kubernetes_service_for_leader(
-            &config,
-            db_handle.as_ref(),
-            &first_leader_datapath,
-        )
-        .await
-        .expect("first leader should seed kubernetes service endpoints");
+        reconcile_kubernetes_service_for_leader(&config, &bootstrap_store, &first_leader_datapath)
+            .await
+            .expect("first leader should seed kubernetes service endpoints");
 
         let next_leader_datapath = MockNetworkProvider::new();
         next_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 4, 1));
-        reconcile_kubernetes_service_for_leader(&config, db_handle.as_ref(), &next_leader_datapath)
+        reconcile_kubernetes_service_for_leader(&config, &bootstrap_store, &next_leader_datapath)
             .await
             .expect("new leader should reconcile kubernetes service endpoints");
 
-        let endpoints = db_handle
+        let endpoints = db
             .get_resource("v1", "Endpoints", Some("default"), "kubernetes")
             .await
             .expect("get endpoints")
@@ -212,7 +213,7 @@ mod tests {
             .data;
         assert_eq!(endpoint_address(&endpoints), "10.50.4.1");
 
-        let endpointslice = db_handle
+        let endpointslice = db
             .get_resource(
                 "discovery.k8s.io/v1",
                 "EndpointSlice",

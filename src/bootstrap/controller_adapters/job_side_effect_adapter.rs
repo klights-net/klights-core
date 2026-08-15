@@ -8,8 +8,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::job::JobSideEffectStore;
 
 struct BorrowedJobSideEffectStore<'a> {
@@ -85,35 +83,12 @@ pub(crate) fn port(resource_reads: Arc<dyn ClusterResourceRead>) -> Arc<dyn JobS
 }
 
 #[cfg(test)]
-struct DirectJobSideEffectStore {
-    db: DatastoreHandle,
-}
-#[cfg(test)]
-#[async_trait]
-impl JobSideEffectStore for DirectJobSideEffectStore {
-    async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources(
-                "batch/v1",
-                "Job",
-                Some(namespace),
-                klights_cluster_store::ResourceListOptions::all(),
-            )
-            .await
-            .map(|page| page.items)
-    }
-}
-#[cfg(test)]
-pub(crate) fn port_for_test(db: DatastoreHandle) -> Arc<dyn JobSideEffectStore> {
-    Arc::new(DirectJobSideEffectStore { db })
-}
-
-#[cfg(test)]
 mod tests {
     #[tokio::test]
     async fn test_job_reconcile_name() {
-        let (db, _db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let effect = klights_controllers::side_effects::job::effect(
             super::port(db.focused_read_store()),
             klights_controllers::side_effects::ControllerDispatcherSlot::new(),

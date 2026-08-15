@@ -3,8 +3,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_cluster_store::{ClusterResourceRead, ResourceGetRequest};
 use klights_controllers::side_effects::node_taint_manager::NodeTaintNodeStore;
 
@@ -28,20 +26,25 @@ pub(crate) fn port(resource_reads: Arc<dyn ClusterResourceRead>) -> Arc<dyn Node
 
 #[cfg(test)]
 struct DirectNodeTaintNodeStore {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 #[cfg(test)]
 #[async_trait]
 impl NodeTaintNodeStore for DirectNodeTaintNodeStore {
     async fn get_node(&self, name: &str) -> Result<Option<klights_cluster_core::Resource>> {
-        self.db.get_resource("v1", "Node", None, name).await
+        self.resource_reads
+            .get_resource(ResourceGetRequest::new("v1", "Node", None, name))
+            .await
+            .map_err(Into::into)
     }
 }
 
 #[cfg(test)]
-pub(crate) fn port_for_test(db: DatastoreHandle) -> Arc<dyn NodeTaintNodeStore> {
-    Arc::new(DirectNodeTaintNodeStore { db })
+pub(crate) fn port_for_test(
+    resource_reads: Arc<dyn ClusterResourceRead>,
+) -> Arc<dyn NodeTaintNodeStore> {
+    Arc::new(DirectNodeTaintNodeStore { resource_reads })
 }
 
 #[cfg(test)]
@@ -210,25 +213,28 @@ mod tests {
     }
 
     async fn fixture() -> (
-        crate::datastore::sqlite::Datastore,
-        crate::datastore::DatastoreHandle,
+        klights_cluster_datastore::sqlite::embedded::Datastore,
+        Arc<dyn ClusterResourceRead>,
         PodSideEffectPortsSlot,
         Arc<TaskSupervisor>,
     ) {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        let canonical = db.clone();
+        let resource_reads = db.focused_read_store();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db_handle.clone(), authority.clone(),
+        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            resource_reads.clone(), authority.clone(),
         );
         let resource_commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 Arc::new(
                     crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-                        db_handle.clone(),
+                        Arc::new(canonical.clone()),
+                        canonical.focused_committed_apply(),
+                        canonical.focused_read_store(),
                     ),
                 ),
                 resource_query.clone(),
@@ -290,11 +296,11 @@ mod tests {
         );
         let slot = PodSideEffectPortsSlot::new();
         slot.set(pod_query, pod_delete_sink);
-        (db, db_handle, slot, supervisor)
+        (db, resource_reads, slot, supervisor)
     }
 
     async fn create_node(
-        db: &crate::datastore::sqlite::Datastore,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         taints: Vec<Value>,
     ) -> crate::datastore::Resource {
         create_node_with_status(
@@ -315,7 +321,7 @@ mod tests {
     }
 
     async fn create_node_with_status(
-        db: &crate::datastore::sqlite::Datastore,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         taints: Vec<Value>,
         status: Value,
     ) -> crate::datastore::Resource {
@@ -336,7 +342,11 @@ mod tests {
         .unwrap()
     }
 
-    async fn create_pod(db: &crate::datastore::sqlite::Datastore, name: &str, tolerations: Value) {
+    async fn create_pod(
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
+        name: &str,
+        tolerations: Value,
+    ) {
         db.create_resource(
             "v1",
             "Pod",

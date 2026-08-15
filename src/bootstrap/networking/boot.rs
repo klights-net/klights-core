@@ -218,16 +218,16 @@ mod tests {
     }
 
     fn network_port_for_test(
-        db: crate::datastore::sqlite::Datastore,
+        db: klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> Arc<
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork,
     >{
         let reads = db.focused_read_store();
-        let db: crate::datastore::DatastoreHandle = Arc::new(db);
+        let canonical = db.clone();
         Arc::new(
             crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
                 reads,
-                Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+                Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store())),
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
             ),
         )
@@ -235,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn network_boot_dispatches_rootless_mode_to_rootless_plane() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let cfg = rootless_test_config("rootless-dispatch-node");

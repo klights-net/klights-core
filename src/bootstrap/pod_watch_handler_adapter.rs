@@ -128,13 +128,14 @@ mod tests {
     use super::*;
 
     async fn seed_matching_pv_and_pvc() -> (
-        crate::datastore::sqlite::Datastore,
-        crate::datastore::DatastoreHandle,
+        klights_cluster_datastore::sqlite::embedded::Datastore,
         klights_cluster_core::Resource,
         klights_cluster_core::Resource,
     ) {
-        let (sqlite, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let pv = db
+        let sqlite = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let pv = sqlite
             .create_resource(
                 "v1",
                 "PersistentVolume",
@@ -153,7 +154,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let pvc = db
+        let pvc = sqlite
             .create_resource(
                 "v1",
                 "PersistentVolumeClaim",
@@ -171,18 +172,22 @@ mod tests {
             )
             .await
             .unwrap();
-        (sqlite, db, pv, pvc)
+        (sqlite, pv, pvc)
     }
 
     fn handler(
-        sqlite: &crate::datastore::sqlite::Datastore,
-        db: crate::datastore::DatastoreHandle,
+        sqlite: &klights_cluster_datastore::sqlite::embedded::Datastore,
         authority: tokio::sync::watch::Receiver<bool>,
     ) -> LeaderPersistentVolumeEventHandler {
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(sqlite);
         LeaderPersistentVolumeEventHandler::new(
-            sqlite.focused_read_store(),
-            sqlite.focused_read_store(),
-            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                ports.applied_outbox,
+                ports.committed_apply,
+                ports.read_ports.resource_reads(),
+            ),
             authority,
             crate::bootstrap::file_blocking::test_file_process_executor(),
             crate::KlightsConfig::test_default()
@@ -193,14 +198,14 @@ mod tests {
 
     #[tokio::test]
     async fn follower_pvc_event_does_not_reconcile_until_leadership_gained() {
-        let (sqlite, db, _pv, pvc) = seed_matching_pv_and_pvc().await;
+        let (sqlite, _pv, pvc) = seed_matching_pv_and_pvc().await;
         let (leader_tx, leader_rx) = tokio::sync::watch::channel(false);
-        let handler = handler(&sqlite, db.clone(), leader_rx);
+        let handler = handler(&sqlite, leader_rx);
 
         handler
             .handle_pvc_event(&PodWatchEvent::added((*pvc.data).clone()), "test-pvc")
             .await;
-        let follower = db
+        let follower = sqlite
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")
             .await
             .unwrap()
@@ -214,7 +219,7 @@ mod tests {
         handler
             .handle_pvc_event(&PodWatchEvent::added((*pvc.data).clone()), "test-pvc")
             .await;
-        let leader = db
+        let leader = sqlite
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")
             .await
             .unwrap()
@@ -227,18 +232,18 @@ mod tests {
 
     #[tokio::test]
     async fn leader_pv_event_binds_pending_pvc_with_claimref_agreement() {
-        let (sqlite, db, pv, _pvc) = seed_matching_pv_and_pvc().await;
+        let (sqlite, pv, _pvc) = seed_matching_pv_and_pvc().await;
         let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
-        handler(&sqlite, db.clone(), leader_rx)
+        handler(&sqlite, leader_rx)
             .handle_pv_event(&PodWatchEvent::added((*pv.data).clone()), "test-pv")
             .await;
 
-        let pvc = db
+        let pvc = sqlite
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")
             .await
             .unwrap()
             .unwrap();
-        let pv = db
+        let pv = sqlite
             .get_resource("v1", "PersistentVolume", None, "test-pv")
             .await
             .unwrap()
@@ -255,28 +260,29 @@ mod tests {
 
     #[tokio::test]
     async fn leader_pv_event_picks_smallest_sufficient_pv() {
-        let (sqlite, db, small_pv, _pvc) = seed_matching_pv_and_pvc().await;
-        db.create_resource(
-            "v1",
-            "PersistentVolume",
-            None,
-            "big-pv",
-            serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "PersistentVolume",
-                "metadata": {"name": "big-pv"},
-                "spec": {"capacity": {"storage": "5Gi"}, "accessModes": ["ReadWriteOnce"]},
-                "status": {"phase": "Available"}
-            }),
-        )
-        .await
-        .unwrap();
+        let (sqlite, small_pv, _pvc) = seed_matching_pv_and_pvc().await;
+        sqlite
+            .create_resource(
+                "v1",
+                "PersistentVolume",
+                None,
+                "big-pv",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolume",
+                    "metadata": {"name": "big-pv"},
+                    "spec": {"capacity": {"storage": "5Gi"}, "accessModes": ["ReadWriteOnce"]},
+                    "status": {"phase": "Available"}
+                }),
+            )
+            .await
+            .unwrap();
         let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
-        handler(&sqlite, db.clone(), leader_rx)
+        handler(&sqlite, leader_rx)
             .handle_pv_event(&PodWatchEvent::added((*small_pv.data).clone()), "test-pv")
             .await;
 
-        let pvc = db
+        let pvc = sqlite
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")
             .await
             .unwrap()

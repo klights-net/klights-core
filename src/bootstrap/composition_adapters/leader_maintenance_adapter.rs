@@ -260,19 +260,23 @@ mod tests {
     async fn fixture(
         is_leader: bool,
     ) -> (
-        crate::datastore::sqlite::Datastore,
+        klights_cluster_datastore::sqlite::embedded::Datastore,
         Arc<RecordingApplyingProposal>,
         ClusterStoreLeaderMaintenance,
     ) {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        let canonical = db.clone();
         let proposal = Arc::new(RecordingApplyingProposal {
-            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db_handle),
+            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                Arc::new(canonical.clone()),
+                canonical.focused_committed_apply(),
+                canonical.focused_read_store(),
+            ),
             commands: Default::default(),
         });
-        let passive = Arc::new(db.canonical_embedded_for_test_support());
+        let passive = Arc::new(db.clone());
         let adapter = ClusterStoreLeaderMaintenance::new_for_test(
             passive.focused_read_store(),
             passive.clone(),

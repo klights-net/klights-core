@@ -1222,14 +1222,15 @@ async fn stub_remote_forwarder_refuses_writes_with_retryable() {
 /// dispatch level without standing up the full bootstrap.
 #[tokio::test]
 async fn bootstrap_style_proxy_composition_dispatches_correctly() {
-    let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let concrete_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
+    let canonical = concrete_db.clone();
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&concrete_db);
     let opened =
         crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&concrete_db);
-    let db: crate::datastore::DatastoreHandle = Arc::new(concrete_db);
+    let db = Arc::new(concrete_db);
     let (tx, rx) = watch::channel(true); // simulate seed cp1
     let authority = crate::bootstrap::authority::AuthorityHandle::from(rx.clone());
     let (route_authority, route_publisher) = WatchLeaderAuthority::channel(true, None);
@@ -1245,8 +1246,13 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
             crate::bootstrap::file_blocking::test_file_process_executor(),
         ),
     );
-    let proposal =
-        Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
+    let proposal = Arc::new(
+        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+            Arc::new(canonical.clone()),
+            canonical.focused_committed_apply(),
+            canonical.focused_read_store(),
+        ),
+    );
     let network = Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             opened.topology_reads.clone(),
@@ -1263,14 +1269,14 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
     );
     let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));
     let local_resource_query =
-        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db.clone(),
+        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            opened.read_ports.resource_reads(),
             rx.clone(),
         );
     let local_watch = Arc::new(
         crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
             &passive_reads,
-            db.clone(),
+            db.as_ref(),
         ),
     );
     let local_side_effects =
@@ -1281,11 +1287,13 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         );
     let local_outbox_delivery = crate::bootstrap::composition_adapters::
         committed_outbox_delivery_adapter::test_outbox_delivery(
-            db.clone(),
             &authority,
             local_side_effects,
             "cp1".to_string(),
-    );
+            Arc::new(canonical.clone()),
+            canonical.focused_committed_apply(),
+            canonical.focused_read_store(),
+        );
     let proxy = AuthorityRoutedLeader::new(
         local_resource_query,
         local_watch,

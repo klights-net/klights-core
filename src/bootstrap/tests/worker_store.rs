@@ -39,38 +39,44 @@ fn worker_pod_watch_request() -> WatchRequest {
 }
 
 fn worker_store_from_local(
-    db: crate::datastore::DatastoreHandle,
+    sqlite: &klights_cluster_datastore::sqlite::embedded::Datastore,
     passive_reads: &crate::bootstrap::cluster_store::selector::PassiveReadPorts,
     node_name: &str,
 ) -> WorkerStoreAdapter {
+    let canonical = sqlite.clone();
     let authority =
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-    let proposal =
-        Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
+    let proposal = Arc::new(
+        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+            Arc::new(canonical.clone()),
+            canonical.focused_committed_apply(),
+            canonical.focused_read_store(),
+        ),
+    );
     let network = Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new_for_test(
-            db.clone(),
+            canonical.focused_read_store(),
             proposal.clone(),
             authority.clone(),
         ),
     );
     let cleanup = Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new_for_test(
-            db.clone(),
+            Arc::new(canonical.clone()),
             proposal,
             authority.clone(),
         ),
     );
     WorkerStoreAdapter::from_focused_ports(
         WorkerStorePorts {
-            resource_query: crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-                db.clone(),
+            resource_query: crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+                canonical.focused_read_store(),
                 authority.clone(),
             ),
             leader_watch: Arc::new(
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
                     passive_reads,
-                    db,
+                    sqlite,
                 ),
             ),
             subnet_allocation: network.clone(),
@@ -129,7 +135,7 @@ fn worker_replay_since(
 
 #[tokio::test]
 async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     let stored_dataplane = klights_cluster_store::DataplanePeerMetadata::try_new(
@@ -147,7 +153,6 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
         .expect("seed leader dataplane metadata");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -157,7 +162,7 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
 
     let worker_a = adapter
         .allocate_node_subnet("worker-a", "10.77.0.0/16", "192.0.2.10")
@@ -339,7 +344,7 @@ async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
 
 #[tokio::test]
 async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membership() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     cluster_db
@@ -366,7 +371,6 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
         .expect("create snapshot Pod");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -376,7 +380,7 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
     let backend = Arc::new(FailingPodLifecycleBackend::new(1));
     adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
         backend.clone(),
@@ -920,7 +924,7 @@ async fn worker_list_page_preserves_continuation_metadata() {
     // list no longer than the limit and cleared the leader-provided
     // continue_token / remaining_item_count — workers' LIST silently dropped
     // the rest of the collection. Pagination must be applied exactly once.
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     for name in ["cm-a", "cm-b", "cm-c"] {
@@ -941,7 +945,6 @@ async fn worker_list_page_preserves_continuation_metadata() {
     }
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -951,7 +954,7 @@ async fn worker_list_page_preserves_continuation_metadata() {
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
 
     let first = adapter
         .list_resources(
@@ -1012,7 +1015,7 @@ async fn worker_list_page_preserves_continuation_metadata() {
 
 #[tokio::test]
 async fn worker_watch_replay_respects_resume_resource_version() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     for name in ["cm-a", "cm-b", "cm-c"] {
@@ -1033,7 +1036,6 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     }
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1043,7 +1045,7 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
     for (index, name) in ["cm-a", "cm-b", "cm-c"].into_iter().enumerate() {
         adapter.publish_watch_for_test(WatchEvent::added(serde_json::json!({
             "apiVersion": "v1",
@@ -1090,7 +1092,7 @@ async fn worker_watch_replay_respects_resume_resource_version() {
 
 #[tokio::test]
 async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_state() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     cluster_db
@@ -1112,7 +1114,6 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
         .expect("create configmap");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1122,7 +1123,7 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
 
     let replay = worker_replay_since(
         &adapter,
@@ -1142,12 +1143,11 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
 
 #[tokio::test]
 async fn worker_watch_replay_preserves_mirrored_delete_events() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1157,7 +1157,7 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
 
     let deleted = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
         "apiVersion": "v1",
@@ -1198,7 +1198,7 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
 
 #[tokio::test]
 async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     let created = cluster_db
@@ -1228,7 +1228,6 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
         .expect("create pod");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1238,7 +1237,7 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
     let mut created_event = (*created.data).clone();
     created_event["metadata"]["resourceVersion"] =
         serde_json::json!(created.resource_version.to_string());
@@ -1312,7 +1311,7 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
 
 #[tokio::test]
 async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_local() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     cluster_db
@@ -1339,7 +1338,6 @@ async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_l
         .expect("create cluster pod");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1349,7 +1347,7 @@ async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_l
     )
     .await
     .expect("open node-local");
-    let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
+    let adapter = worker_store_from_local(&cluster_db, &passive_reads, "worker-a");
 
     let pod = adapter
         .get_resource("v1", "Pod", Some("default"), "web")
@@ -1384,7 +1382,7 @@ async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_l
 
 #[tokio::test]
 async fn watch_mirror_publishes_existing_node_pods_on_startup() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     cluster_db
@@ -1412,7 +1410,6 @@ async fn watch_mirror_publishes_existing_node_pods_on_startup() {
         .expect("create cluster pod");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1423,7 +1420,7 @@ async fn watch_mirror_publishes_existing_node_pods_on_startup() {
     .await
     .expect("open node-local");
     let adapter = Arc::new(worker_store_from_local(
-        cluster_db_handle,
+        &cluster_db,
         &passive_reads,
         "worker-a",
     ));
@@ -1464,7 +1461,7 @@ async fn watch_mirror_publishes_existing_node_pods_on_startup() {
 
 #[tokio::test]
 async fn watch_mirror_publishes_namespace_events_on_startup() {
-    let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let cluster_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     cluster_db
@@ -1486,7 +1483,6 @@ async fn watch_mirror_publishes_namespace_events_on_startup() {
         .expect("create terminating namespace");
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
-    let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
         crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
@@ -1497,7 +1493,7 @@ async fn watch_mirror_publishes_namespace_events_on_startup() {
     .await
     .expect("open node-local");
     let adapter = Arc::new(worker_store_from_local(
-        cluster_db_handle,
+        &cluster_db,
         &passive_reads,
         "worker-a",
     ));

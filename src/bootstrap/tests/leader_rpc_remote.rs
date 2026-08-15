@@ -4,9 +4,9 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use serde_json::json;
 
+use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore as DatastoreHandle;
 use crate::bootstrap::composition_tests::support::OutboxPayload;
 use crate::datastore::ResourcePreconditions;
-use crate::datastore::backend::DatastoreHandle;
 use klights_cluster_core::Resource;
 use klights_cluster_core::command::StorageCommand;
 use klights_leader_api::JoinRole;
@@ -132,15 +132,15 @@ async fn remote_client_and_leader_db_with_node_names(
     DatastoreHandle,
     tokio::task::JoinHandle<()>,
 ) {
-    let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let concrete_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
         .await
         .unwrap();
     let passive_reads =
             crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::passive_reads_for(
                 &concrete_db,
             );
-    let db: DatastoreHandle = Arc::new(concrete_db);
-    crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+    let db: DatastoreHandle = Arc::new(concrete_db.clone());
+    crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(db.as_ref())
         .await
         .unwrap();
     let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
@@ -150,6 +150,11 @@ async fn remote_client_and_leader_db_with_node_names(
     let composition =
             crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::new(
                 db.clone(),
+                Arc::new(concrete_db.clone()),
+                concrete_db
+                    .clone()
+                    .focused_committed_apply(),
+                concrete_db.clone().focused_read_store(),
             );
     let service = Arc::new(composition.replication_service(supervisor.clone()));
     let app = composition.mount_service_full(

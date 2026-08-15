@@ -182,7 +182,8 @@ impl DatastoreBackend for RedbDatastore {
 
     #[cfg(test)]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
-        let event = crate::datastore::staged_test_event(&pending).expect("staged test watch event");
+        let event = crate::bootstrap::watch_commit_wiring::staged_test_event(&pending)
+            .expect("staged test watch event");
         let _ = WatchSignal::from_event(&event);
         crate::bootstrap::watch_commit_wiring::publish_test_events(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)

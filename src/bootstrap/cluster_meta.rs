@@ -12,6 +12,8 @@
 use anyhow::Result;
 #[cfg(test)]
 use klights_cluster_core::{ClusterMembership, ClusterMetadata};
+#[cfg(test)]
+use klights_cluster_store::ClusterMetadataMutation;
 
 /// Generate a new random cluster ID (UUID v4).
 #[cfg(test)]
@@ -20,7 +22,7 @@ fn generate_cluster_id() -> String {
 }
 
 #[cfg(test)]
-use crate::datastore::backend::DatastoreBackend;
+type SqliteTestStore = klights_cluster_datastore::sqlite::embedded::Datastore;
 
 /// Initialize cluster metadata on first leader-compatible boot.
 ///
@@ -31,7 +33,7 @@ use crate::datastore::backend::DatastoreBackend;
 /// cluster state from raft, not local writes. Function retained for
 /// test helpers that exercise the direct-backend code path.
 #[cfg(test)]
-pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
+pub async fn ensure_cluster_metadata_sqlite(db: &SqliteTestStore) -> Result<()> {
     // Check if cluster_id already exists
     let existing = db
         .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
@@ -60,7 +62,7 @@ pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
 ///
 /// Returns an error if metadata has not been initialized.
 #[cfg(test)]
-pub async fn read_cluster_metadata(db: &dyn DatastoreBackend) -> Result<ClusterMetadata> {
+pub async fn read_cluster_metadata_sqlite(db: &SqliteTestStore) -> Result<ClusterMetadata> {
     let cluster_id = db
         .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
         .await?
@@ -83,8 +85,8 @@ pub async fn read_cluster_metadata(db: &dyn DatastoreBackend) -> Result<ClusterM
 }
 
 #[cfg(test)]
-pub async fn write_cluster_membership(
-    db: &dyn DatastoreBackend,
+pub async fn write_cluster_membership_sqlite(
+    db: &SqliteTestStore,
     membership: &ClusterMembership,
 ) -> Result<()> {
     db.set_klights_meta(
@@ -111,7 +113,7 @@ pub async fn write_cluster_membership(
 }
 
 #[cfg(test)]
-pub async fn read_cluster_membership(db: &dyn DatastoreBackend) -> Result<ClusterMembership> {
+pub async fn read_cluster_membership_sqlite(db: &SqliteTestStore) -> Result<ClusterMembership> {
     let cluster_id = db
         .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
         .await?
@@ -161,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_creates_on_first_boot() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
 
@@ -173,7 +175,7 @@ mod tests {
                 .is_none()
         );
 
-        ensure_cluster_metadata(&db).await.unwrap();
+        ensure_cluster_metadata_sqlite(&db).await.unwrap();
 
         // After ensure, all keys exist
         let cluster_id = db
@@ -221,11 +223,11 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_idempotent_on_restart() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
 
-        ensure_cluster_metadata(&db).await.unwrap();
+        ensure_cluster_metadata_sqlite(&db).await.unwrap();
         let first_id = db
             .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
             .await
@@ -240,7 +242,7 @@ mod tests {
                 .unwrap();
 
         // Second call should not change values
-        ensure_cluster_metadata(&db).await.unwrap();
+        ensure_cluster_metadata_sqlite(&db).await.unwrap();
         let second_id = db
             .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
             .await
@@ -270,12 +272,12 @@ mod tests {
 
     #[tokio::test]
     async fn read_cluster_metadata_returns_initialized_values() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        ensure_cluster_metadata(&db).await.unwrap();
+        ensure_cluster_metadata_sqlite(&db).await.unwrap();
 
-        let meta = read_cluster_metadata(&db).await.unwrap();
+        let meta = read_cluster_metadata_sqlite(&db).await.unwrap();
         assert!(!meta.cluster_id.is_empty());
         assert_eq!(meta.leader_epoch, 0);
         // current_rv may be 0 or higher depending on metadata writes
@@ -284,10 +286,10 @@ mod tests {
 
     #[tokio::test]
     async fn read_cluster_metadata_fails_before_init() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let result = read_cluster_metadata(&db).await;
+        let result = read_cluster_metadata_sqlite(&db).await;
         assert!(result.is_err());
     }
 
@@ -297,10 +299,10 @@ mod tests {
 
     #[tokio::test]
     async fn voters_row_round_trips() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        ensure_cluster_metadata(&db).await.unwrap();
+        ensure_cluster_metadata_sqlite(&db).await.unwrap();
 
         let membership = klights_cluster_core::ClusterMembership {
             cluster_id: db
@@ -312,24 +314,29 @@ mod tests {
             term: 7,
             leader_hint: Some("mn-leader-2".to_string()),
         };
-        write_cluster_membership(&db, &membership).await.unwrap();
+        write_cluster_membership_sqlite(&db, &membership)
+            .await
+            .unwrap();
 
-        assert_eq!(read_cluster_membership(&db).await.unwrap(), membership);
+        assert_eq!(
+            read_cluster_membership_sqlite(&db).await.unwrap(),
+            membership
+        );
     }
 
     #[tokio::test]
     async fn membership_change_commits_update_meta() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        ensure_cluster_metadata(&db).await.unwrap();
+        ensure_cluster_metadata_sqlite(&db).await.unwrap();
         let cluster_id = db
             .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
             .await
             .unwrap()
             .unwrap();
 
-        write_cluster_membership(
+        write_cluster_membership_sqlite(
             &db,
             &klights_cluster_core::ClusterMembership {
                 cluster_id: cluster_id.clone(),
@@ -340,7 +347,7 @@ mod tests {
         )
         .await
         .unwrap();
-        write_cluster_membership(
+        write_cluster_membership_sqlite(
             &db,
             &klights_cluster_core::ClusterMembership {
                 cluster_id: cluster_id.clone(),
@@ -352,7 +359,7 @@ mod tests {
         .await
         .unwrap();
 
-        let membership = read_cluster_membership(&db).await.unwrap();
+        let membership = read_cluster_membership_sqlite(&db).await.unwrap();
         assert_eq!(membership.cluster_id, cluster_id);
         assert_eq!(membership.voters, vec!["mn-leader", "mn-leader-2"]);
         assert_eq!(membership.term, 2);

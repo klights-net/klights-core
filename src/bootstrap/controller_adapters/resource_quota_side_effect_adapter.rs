@@ -70,114 +70,22 @@ pub(crate) fn port(
 }
 
 #[cfg(test)]
-struct DirectResourceQuotaSideEffectPort {
-    db: crate::datastore::DatastoreHandle,
-    status_store: Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
-    pod_repository: PodSideEffectPortsSlot,
-}
-
-#[cfg(test)]
-struct DirectResourceQuotaRuntime<'a> {
-    db: &'a dyn crate::datastore::DatastoreBackend,
-    status_store: &'a dyn klights_controllers::common::ControllerStatusStore,
-    pod_query: &'a dyn PodQuery,
-}
-
-#[cfg(test)]
-#[async_trait]
-impl klights_controllers::resource_quota::ResourceQuotaRuntime for DirectResourceQuotaRuntime<'_> {
-    async fn list_quota_resources(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
-        self.db
-            .list_resources(
-                api_version,
-                kind,
-                Some(namespace),
-                klights_cluster_store::ResourceListOptions::all(),
-            )
-            .await
-            .map(|page| page.items)
-            .map_err(|error| {
-                klights_reconcile_api::ControllerStoreError::unavailable(error.to_string())
-            })
-    }
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
-        let request = klights_pod_api::PodListRequest::try_new(
-            Some(namespace.to_string()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .map_err(|error| {
-            klights_reconcile_api::ControllerStoreError::internal(error.to_string())
-        })?;
-        self.pod_query
-            .list_pods(request)
-            .await
-            .map(|listing| listing.into_parts().0)
-            .map_err(|error| {
-                klights_reconcile_api::ControllerStoreError::unavailable(error.to_string())
-            })
-    }
-    async fn write_resource_quota_status(
-        &self,
-        resource: &klights_cluster_core::Resource,
-        status: &serde_json::Value,
-    ) -> klights_reconcile_api::ControllerStoreResult<()> {
-        klights_controllers::common::write_status_for_resource(self.status_store, resource, status).await.map(|_| ()).map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl ResourceQuotaSideEffectPort for DirectResourceQuotaSideEffectPort {
-    async fn recount_namespace(&self, namespace: &str) -> Result<()> {
-        let Some(pod_query) = self.pod_repository.query() else {
-            return Ok(());
-        };
-        klights_controllers::resource_quota::reconcile_resource_quotas_with_runtime(
-            &DirectResourceQuotaRuntime {
-                db: self.db.as_ref(),
-                status_store: self.status_store.as_ref(),
-                pod_query: pod_query.as_ref(),
-            },
-            namespace,
-        )
-        .await
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn port_for_test(
-    db: crate::datastore::DatastoreHandle,
-    status_store: Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
-    pod_repository: PodSideEffectPortsSlot,
-) -> Arc<dyn ResourceQuotaSideEffectPort> {
-    Arc::new(DirectResourceQuotaSideEffectPort {
-        db,
-        status_store,
-        pod_repository,
-    })
-}
-
-#[cfg(test)]
 mod adapter_tests {
     #[tokio::test]
     async fn test_resource_quota_recount_name() {
-        let (db, db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let effect = klights_controllers::side_effects::resource_quota::effect(super::port(
-            db.focused_read_store(),
+            ports.read_ports.resource_reads(),
             std::sync::Arc::new(
-                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
+                    ports.applied_outbox,
+                    ports.committed_apply,
+                    ports.read_ports.resource_reads(),
+                    ports.ownership_reads,
+                ),
             ),
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
         ));

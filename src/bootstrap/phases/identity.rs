@@ -656,18 +656,27 @@ mod tests {
         let joiner_fixture = crate::paths::test_data_root_fixture(&joiner_namespace);
         let leader_data_root = leader_fixture.path().to_path_buf();
         let joiner_data_root = joiner_fixture.path().to_path_buf();
-        let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
-            crate::datastore::sqlite::Datastore::new_in_memory()
-                .await
-                .unwrap(),
-        );
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+        let sqlite = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let token =
-            crate::bootstrap::bootstrap_token::ensure_controlplane_bootstrap_token(db.as_ref())
-                .await
-                .unwrap();
+        let db = std::sync::Arc::new(sqlite.clone());
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(&sqlite)
+            .await
+            .unwrap();
+        let bootstrap_store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+            sqlite.focused_read_store(),
+            sqlite.focused_read_store(),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                std::sync::Arc::new(sqlite.clone()),
+                sqlite.focused_committed_apply(),
+                sqlite.focused_read_store(),
+            ),
+        );
+        let token = crate::bootstrap::bootstrap_token::ensure_controlplane_bootstrap_token(
+            &bootstrap_store,
+        )
+        .await
+        .unwrap();
 
         let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) =
             klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
@@ -706,6 +715,11 @@ mod tests {
         let composition =
             crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::new(
                 db.clone(),
+                std::sync::Arc::new(sqlite.clone()),
+                sqlite
+                    .clone()
+                    .focused_committed_apply(),
+                sqlite.clone().focused_read_store(),
             );
         let service =
             std::sync::Arc::new(composition.replication_service(leader_supervisor.clone()));

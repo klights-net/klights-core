@@ -10,8 +10,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-#[cfg(test)]
-use crate::datastore::sqlite;
 use klights_supervisor::TaskSupervisor;
 
 /// Fully selected passive cluster-store adapter request.
@@ -76,7 +74,9 @@ impl PassiveReadPorts {
 /// Build test-only passive read ports directly from the SQLite destination
 /// adapter.
 #[cfg(test)]
-pub(crate) fn sqlite_passive_read_ports(db: &sqlite::Datastore) -> PassiveReadPorts {
+pub(crate) fn sqlite_passive_read_ports(
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
+) -> PassiveReadPorts {
     let focused_reads = db.focused_read_store();
     PassiveReadPorts::new(
         focused_reads.clone(),
@@ -90,8 +90,10 @@ pub(crate) fn sqlite_passive_read_ports(db: &sqlite::Datastore) -> PassiveReadPo
 /// It exposes the same fixed focused bundle as production selection, never
 /// the legacy backend handle.
 #[cfg(test)]
-pub(crate) fn sqlite_opened_passive_store(db: &sqlite::Datastore) -> OpenedPassiveStore {
-    OpenedPassiveStore::from_sqlite(db.canonical_embedded_for_test_support())
+pub(crate) fn sqlite_opened_passive_store(
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
+) -> OpenedPassiveStore {
+    OpenedPassiveStore::from_sqlite(db.clone())
 }
 
 /// Root-only result of selecting one passive persistence backend.
@@ -266,7 +268,9 @@ pub(crate) async fn open_with_sink(
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenedPassiveStore, PassiveStoreOpenRequest, open_with_sink};
+    use super::{
+        OpenedPassiveStore, PassiveStoreOpenRequest, open_with_sink, sqlite_opened_passive_store,
+    };
     use klights_cluster_store::{
         DurableWatchTarget, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
         ResourceListRequest, WatchHistoryRead, WatchHistoryRequest,
@@ -278,6 +282,24 @@ mod tests {
 
     fn supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
+    }
+
+    async fn canonical_sqlite_fixture() -> klights_cluster_datastore::sqlite::embedded::Datastore {
+        let supervisor = supervisor();
+        let executor = klights_cluster_datastore::sqlite::open_in_memory(
+            supervisor,
+            "sqlite:p10-3a-canonical-fixture",
+        )
+        .await
+        .expect("open canonical SQLite fixture executor");
+        klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+            executor,
+            crate::bootstrap::watch_commit_wiring::new_sink(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+            Arc::new(klights_supervisor::SystemWallClock),
+        )
+        .await
+        .expect("open canonical SQLite fixture")
     }
 
     fn assert_all_focused_read_ports<T>()
@@ -307,6 +329,34 @@ mod tests {
             !source.contains(forbidden),
             "backend selection must return only its fixed focused composition bundle"
         );
+    }
+
+    #[test]
+    fn root_sqlite_wrapper_has_no_remaining_owner() {
+        let wrapper =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/datastore/sqlite/mod.rs");
+        assert!(
+            !wrapper.exists(),
+            "P10.3a must delete the root SQLite wrapper after every consumer uses canonical ports"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_test_composition_accepts_the_canonical_embedded_store() {
+        let sqlite = canonical_sqlite_fixture().await;
+        let opened = sqlite_opened_passive_store(&sqlite);
+        assert_eq!(
+            opened
+                .read_ports
+                .allocator_reads()
+                .read_allocator_state()
+                .await
+                .expect("canonical SQLite allocator state")
+                .position()
+                .resource_version,
+            0
+        );
+        opened.lifecycle.close();
     }
 
     async fn open_selected(request: PassiveStoreOpenRequest<'_>) -> OpenedPassiveStore {

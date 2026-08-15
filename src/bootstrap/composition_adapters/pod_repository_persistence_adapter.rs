@@ -745,111 +745,62 @@ pub(crate) fn new_root_parts_with_delete_cas_hook(
 /// root's historical in-memory handle. Production construction never takes a
 /// broad backend; this bridge is kept beside the one consumer type it serves.
 #[cfg(test)]
-pub(crate) fn new_root_parts_from_test_handle(
-    db: crate::datastore::DatastoreHandle,
+pub(crate) fn new_root_parts_from_test_ports(
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> RootPodRepositoryPersistenceParts {
     let authority = crate::bootstrap::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
-    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-        db.clone(), authority.clone(),
+    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        resource_reads.clone(), authority.clone(),
     );
     let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
             Arc::new(
-                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                    applied_outbox,
+                    committed_apply,
+                    resource_reads,
+                ),
             ),
             query.clone(),
             authority.authority_arc(),
         ),
     );
-    new_root_parts(
-        query,
-        Arc::new(TestOwnershipReads { db }),
-        commands,
-        wall_clock,
-    )
+    new_root_parts(query, ownership_reads, commands, wall_clock)
 }
 
 #[cfg(test)]
-pub(crate) fn new_store_from_test_handle(db: crate::datastore::DatastoreHandle) -> PodStore {
+pub(crate) fn new_store_from_test_ports(
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+) -> PodStore {
     let authority = crate::bootstrap::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
-    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-        db.clone(), authority.clone(),
+    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        resource_reads.clone(), authority.clone(),
     );
     let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
             Arc::new(
-                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                    applied_outbox,
+                    committed_apply,
+                    resource_reads,
+                ),
             ),
             query.clone(),
             authority.authority_arc(),
         ),
     );
-    new_store(query, Arc::new(TestOwnershipReads { db }), commands)
-}
-
-#[cfg(test)]
-struct TestOwnershipReads {
-    db: crate::datastore::DatastoreHandle,
-}
-
-#[cfg(test)]
-impl klights_cluster_store::ClusterOwnershipRead for TestOwnershipReads {
-    fn find_owned_resources(
-        &self,
-        request: klights_cluster_store::OwnerUidRequest,
-    ) -> klights_cluster_store::OwnershipReadFuture<'_, Vec<klights_cluster_core::Resource>> {
-        Box::pin(async move {
-            self.db
-                .find_owned_resources(request.owner_uid(), request.namespace())
-                .await
-                .map_err(|error| {
-                    klights_cluster_store::ResourceReadError::retryable(error.to_string())
-                })
-        })
-    }
-
-    fn list_resources_by_owner_uid(
-        &self,
-        request: klights_cluster_store::OwnedKindRequest,
-    ) -> klights_cluster_store::OwnershipReadFuture<'_, Vec<klights_cluster_core::Resource>> {
-        Box::pin(async move {
-            self.db
-                .list_resources_by_owner_uid(
-                    request.api_version(),
-                    request.kind(),
-                    request.namespace(),
-                    request.owner_uid(),
-                )
-                .await
-                .map_err(|error| {
-                    klights_cluster_store::ResourceReadError::retryable(error.to_string())
-                })
-        })
-    }
-
-    fn find_owned_by_name_kind_empty_uid(
-        &self,
-        request: klights_cluster_store::OwnerNameKindRequest,
-    ) -> klights_cluster_store::OwnershipReadFuture<'_, Vec<klights_cluster_core::Resource>> {
-        Box::pin(async move {
-            self.db
-                .find_owned_by_name_kind_empty_uid(
-                    request.owner_api_version(),
-                    request.owner_name(),
-                    request.owner_kind(),
-                    request.namespace(),
-                )
-                .await
-                .map_err(|error| {
-                    klights_cluster_store::ResourceReadError::retryable(error.to_string())
-                })
-        })
-    }
+    new_store(query, ownership_reads, commands)
 }
 
 #[cfg(test)]
@@ -895,7 +846,7 @@ mod tests {
     }
 
     fn persistence_parts(
-        db: &crate::datastore::sqlite::Datastore,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         commands: Arc<dyn LeaderResourceCommand>,
     ) -> RootPodRepositoryPersistenceParts {
         let passive = db.focused_read_store();
@@ -941,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_root_actor_finalization_submits_uid_bound_delete_without_local_mutation() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let created = db
@@ -1011,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_root_unscheduled_delete_submits_exact_cas_without_local_mutation() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let created = db
@@ -1083,7 +1034,7 @@ mod tests {
             (CommandDisposition::Conflict, true),
             (CommandDisposition::NotLeader, false),
         ] {
-            let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap();
             let created = db

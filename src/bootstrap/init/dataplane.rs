@@ -2,8 +2,6 @@
 
 use crate::KlightsConfig;
 use crate::bootstrap::NodeMode;
-#[cfg(test)]
-use crate::datastore;
 
 use super::leader_control_stream::runtime_epoch_ms;
 
@@ -148,7 +146,7 @@ fn node_status_external_ip(node: &serde_json::Value) -> Option<&str> {
 /// unreachable address as the cross-node WireGuard endpoint.
 #[cfg(test)]
 pub async fn resolve_local_external_endpoint(
-    db: &dyn datastore::DatastoreBackend,
+    resource_reads: &dyn klights_cluster_store::ClusterResourceRead,
     config: &KlightsConfig,
 ) -> anyhow::Result<Option<String>> {
     if let Some(endpoint) = config
@@ -159,8 +157,13 @@ pub async fn resolve_local_external_endpoint(
     {
         return Ok(Some(endpoint.to_string()));
     }
-    let Some(node) = db
-        .get_resource("v1", "Node", None, &config.node_name)
+    let Some(node) = resource_reads
+        .get_resource(klights_cluster_store::ResourceGetRequest::new(
+            "v1",
+            "Node",
+            None,
+            &config.node_name,
+        ))
         .await?
     else {
         return Ok(None);
@@ -178,14 +181,20 @@ pub async fn resolve_local_external_endpoint(
 /// existed.
 #[cfg(test)]
 pub async fn ensure_node_dataplane_published(
-    db: &dyn datastore::DatastoreBackend,
+    topology_reads: &dyn klights_cluster_store::ClusterTopologyRead,
     command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
     config: &KlightsConfig,
     node_mode: &NodeMode,
     endpoint: &str,
     supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<bool> {
-    if db.get_node_dataplane(&config.node_name).await?.is_some() {
+    if topology_reads
+        .get_node_dataplane(klights_cluster_store::NodeTopologyRequest::try_new(
+            &config.node_name,
+        )?)
+        .await?
+        .is_some()
+    {
         return Ok(false);
     }
     let metadata =
@@ -214,13 +223,13 @@ pub async fn ensure_node_dataplane_published(
 /// publish it later once an endpoint becomes known).
 #[cfg(test)]
 pub async fn publish_local_dataplane_metadata_self_heal(
-    db: &dyn datastore::DatastoreBackend,
+    resource_reads: &dyn klights_cluster_store::ClusterResourceRead,
     command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
     config: &KlightsConfig,
     node_mode: &NodeMode,
     supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<bool> {
-    let Some(endpoint) = resolve_local_external_endpoint(db, config).await? else {
+    let Some(endpoint) = resolve_local_external_endpoint(resource_reads, config).await? else {
         return Ok(false);
     };
     let metadata =
@@ -305,14 +314,13 @@ mod tests {
     use super::*;
 
     fn test_dataplane_command(
-        db: &crate::datastore::sqlite::Datastore,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork{
+        let canonical = db.clone();
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
             {
-                std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-                    std::sync::Arc::new(db.clone()),
-                ))
+                std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(std::sync::Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store()))
             },
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         )
@@ -374,14 +382,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_prefers_config_external_endpoint() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = Some("203.0.113.10".to_string());
 
-        let endpoint = resolve_local_external_endpoint(&db, &config)
+        let endpoint = resolve_local_external_endpoint(db.focused_read_store().as_ref(), &config)
             .await
             .expect("resolve must succeed");
         assert_eq!(endpoint.as_deref(), Some("203.0.113.10"));
@@ -389,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_falls_back_to_node_external_ip() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -418,7 +426,7 @@ mod tests {
         .await
         .unwrap();
 
-        let endpoint = resolve_local_external_endpoint(&db, &config)
+        let endpoint = resolve_local_external_endpoint(db.focused_read_store().as_ref(), &config)
             .await
             .expect("resolve must succeed");
         assert_eq!(endpoint.as_deref(), Some("198.51.100.47"));
@@ -426,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_none_without_endpoint_or_external_ip() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -452,7 +460,7 @@ mod tests {
         .await
         .unwrap();
 
-        let endpoint = resolve_local_external_endpoint(&db, &config)
+        let endpoint = resolve_local_external_endpoint(db.focused_read_store().as_ref(), &config)
             .await
             .expect("resolve must succeed");
         assert_eq!(
@@ -463,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_publishes_node_dataplane_from_registered_external_ip() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -494,7 +502,7 @@ mod tests {
         .unwrap();
 
         let published = publish_local_dataplane_metadata_self_heal(
-            &db,
+            db.focused_read_store().as_ref(),
             &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
@@ -518,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_node_dataplane_published_writes_when_missing() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -529,7 +537,7 @@ mod tests {
         );
 
         let wrote = ensure_node_dataplane_published(
-            &db,
+            db.focused_read_store().as_ref(),
             &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
@@ -550,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_node_dataplane_published_is_noop_when_row_exists() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -576,7 +584,7 @@ mod tests {
         .unwrap();
 
         let wrote = ensure_node_dataplane_published(
-            &db,
+            db.focused_read_store().as_ref(),
             &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
@@ -601,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_is_noop_without_resolvable_endpoint() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -612,7 +620,7 @@ mod tests {
         );
 
         let published = publish_local_dataplane_metadata_self_heal(
-            &db,
+            db.focused_read_store().as_ref(),
             &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,

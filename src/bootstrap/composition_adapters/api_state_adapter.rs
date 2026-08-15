@@ -3,8 +3,6 @@ use std::sync::Arc;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use k8s_native_service::ports::{
     ApiFailureEntry, ApiFailureMetrics, ApiNodeLeaseObservations, ApiNodeLeaseObservedFuture,
     ApiPodRepository,
@@ -35,48 +33,18 @@ fn validate_pod_effect_authority() -> Result<(), klights_pod_api::PodRepositoryE
 }
 
 pub(crate) struct RootNamespaceTerminationStore {
-    #[cfg(test)]
-    inner: Option<DatastoreHandle>,
     resource_reads: Option<Arc<dyn ClusterResourceRead>>,
     namespace_content_reads: Option<Arc<dyn NamespaceContentRead>>,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
 impl RootNamespaceTerminationStore {
-    #[cfg(test)]
-    pub(crate) fn new(inner: DatastoreHandle) -> Arc<Self> {
-        let authority = super::authority_adapter::always_leader_authority();
-        let query = super::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            inner.clone(),
-            authority.clone(),
-        );
-        let commands = Arc::new(
-            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
-                Arc::new(
-                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-                        inner.clone(),
-                    ),
-                ),
-                query,
-                authority,
-            ),
-        );
-        Arc::new(Self {
-            inner: Some(inner),
-            resource_reads: None,
-            namespace_content_reads: None,
-            commands,
-        })
-    }
-
     pub(crate) fn new_with_commands(
         resource_reads: Arc<dyn ClusterResourceRead>,
         namespace_content_reads: Arc<dyn NamespaceContentRead>,
         commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            #[cfg(test)]
-            inner: None,
             resource_reads: Some(resource_reads),
             namespace_content_reads: Some(namespace_content_reads),
             commands,
@@ -159,13 +127,6 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Option<Resource>> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(inner) = &self.inner {
-                return inner
-                    .get_namespace(&namespace)
-                    .await
-                    .map_err(map_namespace_lifecycle_error);
-            }
             self.resource_reads
                 .as_ref()
                 .expect("focused namespace resource reads")
@@ -180,13 +141,6 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(inner) = &self.inner {
-                return inner
-                    .list_namespace_resources_of_kind(&namespace, "Pod")
-                    .await
-                    .map_err(map_namespace_lifecycle_error);
-            }
             self.namespace_content_reads
                 .as_ref()
                 .expect("focused namespace content reads")
@@ -252,13 +206,6 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(inner) = &self.inner {
-                return inner
-                    .list_namespace_resources_excluding_kind(&namespace, "Pod")
-                    .await
-                    .map_err(map_namespace_lifecycle_error);
-            }
             self.namespace_content_reads
                 .as_ref()
                 .expect("focused namespace content reads")
@@ -300,13 +247,6 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, i64> {
         Box::pin(async move {
-            #[cfg(test)]
-            if let Some(inner) = &self.inner {
-                return inner
-                    .count_namespace_resources(&namespace)
-                    .await
-                    .map_err(map_namespace_lifecycle_error);
-            }
             self.namespace_content_reads
                 .as_ref()
                 .expect("focused namespace content reads")
@@ -711,10 +651,19 @@ mod tests {
 
     #[tokio::test]
     async fn root_namespace_termination_reconciler_is_the_controller_effect_port() {
-        let (_db, db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let store = RootNamespaceTerminationStore::new(db_handle);
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+        );
+        let store = RootNamespaceTerminationStore::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.namespace_content_reads,
+            commands,
+        );
         let reconciler = RootNamespaceTerminationReconciler::new(store, metrics);
         let effect = klights_controllers::side_effects::namespace_termination::effect(reconciler);
         assert_eq!(effect.name(), "namespace_termination");
@@ -722,10 +671,19 @@ mod tests {
 
     #[tokio::test]
     async fn root_namespace_termination_reconciler_shares_metrics_arc() {
-        let (_db, db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let store = RootNamespaceTerminationStore::new(db_handle);
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+        );
+        let store = RootNamespaceTerminationStore::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.namespace_content_reads,
+            commands,
+        );
         let _reconciler = RootNamespaceTerminationReconciler::new(store, metrics.clone());
 
         metrics
@@ -741,10 +699,18 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_namespace_termination_already_deleted_is_ok() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let store = RootNamespaceTerminationStore::new(Arc::new(db.clone()));
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+        );
+        let store = RootNamespaceTerminationStore::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.namespace_content_reads,
+            commands,
+        );
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
 
         k8s_native_service::reconcile_namespace_termination_at(
@@ -766,10 +732,18 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_namespace_termination_success_does_not_increment_counter() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let store = RootNamespaceTerminationStore::new(Arc::new(db.clone()));
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+        );
+        let store = RootNamespaceTerminationStore::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.namespace_content_reads,
+            commands,
+        );
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let ns_name = "term-test-ns";
         db.create_namespace(
@@ -807,9 +781,19 @@ mod tests {
 
     #[tokio::test]
     async fn stale_http_authority_scope_rejects_write_after_demote_promote_aba() {
-        let (_datastore, db) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = RootNamespaceTerminationStore::new(db.clone());
+        let datastore = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports =
+            crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&datastore);
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+        );
+        let store = RootNamespaceTerminationStore::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.namespace_content_reads,
+            commands,
+        );
         let (authority, publisher) =
             klights_replication::authority::WatchLeaderAuthority::channel(true, None);
         let AuthorityRoute::Local(permit) = authority.route() else {
@@ -849,7 +833,8 @@ mod tests {
         let error = result.expect_err("stale HTTP permit must reject the write");
         assert!(format!("{error:?}").contains("leader authority rejected effect"));
         assert!(
-            db.get_namespace("stale-http-write")
+            datastore
+                .get_namespace("stale-http-write")
                 .await
                 .unwrap()
                 .is_none()

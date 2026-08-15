@@ -24,7 +24,7 @@ use klights_cluster_store::{
 };
 
 use crate::bootstrap::authority::AuthorityHandle;
-use crate::datastore::{DatastoreHandle, Resource};
+use crate::datastore::Resource;
 
 const PRIVATE_CONTINUATION_CODEC_VERSION: u8 = 2;
 /// Kubernetes clients must be able to restart a chunked LIST after bounded
@@ -312,23 +312,12 @@ fn private_crd_plan_ref(definition: &Resource) -> Result<PrivateCrdPlanRef, Reso
 }
 
 pub(crate) struct DatastoreResourceQueryAdapter {
-    db: Option<DatastoreHandle>,
-    resource_reads: Option<Arc<dyn ClusterResourceRead>>,
+    resource_reads: Arc<dyn ClusterResourceRead>,
     authority: AuthorityHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl DatastoreResourceQueryAdapter {
-    #[cfg(test)]
-    pub(crate) fn new<A: Into<AuthorityHandle>>(db: DatastoreHandle, authority: A) -> Arc<Self> {
-        Arc::new(Self {
-            db: Some(db),
-            resource_reads: None,
-            authority: authority.into(),
-            wall_clock: Arc::new(klights_supervisor::SystemWallClock),
-        })
-    }
-
     /// The root-selected public LIST path. The focused read port receives
     /// decoded typed cursors and the root injects the clock that defines a
     /// pinned pagination session's bounded lifetime.
@@ -338,8 +327,7 @@ impl DatastoreResourceQueryAdapter {
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            db: None,
-            resource_reads: Some(resource_reads),
+            resource_reads,
             authority: authority.into(),
             wall_clock,
         })
@@ -351,8 +339,7 @@ impl DatastoreResourceQueryAdapter {
         authority: A,
     ) -> Arc<Self> {
         Arc::new(Self {
-            db: None,
-            resource_reads: Some(resource_reads),
+            resource_reads,
             authority: authority.into(),
             wall_clock: Arc::new(klights_supervisor::SystemWallClock),
         })
@@ -365,8 +352,7 @@ impl DatastoreResourceQueryAdapter {
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            db: None,
-            resource_reads: Some(resource_reads),
+            resource_reads,
             authority: authority.into(),
             wall_clock,
         })
@@ -461,10 +447,6 @@ impl DatastoreResourceQueryAdapter {
                 "leader-fresh resource query reached a non-authoritative local store",
             )
         })
-    }
-
-    fn query_error(error: impl std::fmt::Display) -> ResourceQueryError {
-        ResourceQueryError::query_failed(error.to_string())
     }
 
     fn focused_read_error(error: ResourceReadError) -> ResourceQueryError {
@@ -1065,27 +1047,13 @@ impl LeaderResourceQuery for DatastoreResourceQueryAdapter {
     ) -> ResourceQueryFuture<'_, Option<Resource>> {
         Box::pin(async move {
             let leadership = self.sample_leader_fresh(request.consistency())?;
-            let resource = if let Some(resource_reads) = &self.resource_reads {
-                resource_reads
-                    .get_resource(klights_cluster_store::ResourceGetRequest::from_key(
-                        request.key().clone(),
-                    ))
-                    .await
-                    .map_err(Self::focused_read_error)?
-            } else {
-                let key = request.key();
-                self.db
-                    .as_ref()
-                    .expect("legacy adapter construction supplies datastore")
-                    .get_resource(
-                        &key.api_version,
-                        &key.kind,
-                        key.namespace.as_deref(),
-                        &key.name,
-                    )
-                    .await
-                    .map_err(Self::query_error)?
-            };
+            let resource = self
+                .resource_reads
+                .get_resource(klights_cluster_store::ResourceGetRequest::from_key(
+                    request.key().clone(),
+                ))
+                .await
+                .map_err(Self::focused_read_error)?;
             if leadership
                 .as_ref()
                 .is_some_and(|permit| self.authority.validate(permit).is_err())
@@ -1105,7 +1073,8 @@ impl LeaderResourceQuery for DatastoreResourceQueryAdapter {
         Box::pin(async move {
             let leadership = self.sample_leader_fresh(request.consistency())?;
             let result =
-                if let Some(resource_reads) = &self.resource_reads {
+                {
+                    let resource_reads = &self.resource_reads;
                     let (plan, pinned_issued_at_unix_ms) =
                         if request.custom_resource_identity().is_none() {
                             // Ordinary typed LIST continuations carry no CRD plan.
@@ -1243,31 +1212,6 @@ impl LeaderResourceQuery for DatastoreResourceQueryAdapter {
                             .map_err(Self::focused_read_error)?;
                         self.focused_result(&request, read, pinned_issued_at_unix_ms)?
                     }
-                } else {
-                    let list = self
-                        .db
-                        .as_ref()
-                        .expect("legacy adapter construction supplies datastore")
-                        .list_resources(
-                            request.api_version(),
-                            request.kind(),
-                            request.namespace(),
-                            klights_cluster_store::ResourceListOptions::new(
-                                request.label_selector(),
-                                request.field_selector(),
-                                request.limit(),
-                                request.continue_token(),
-                            ),
-                        )
-                        .await
-                        .map_err(Self::query_error)?;
-                    ResourceListResult::try_new(
-                        list.items,
-                        list.resource_version,
-                        list.watch_replay_position,
-                        list.continue_token,
-                        list.remaining_item_count,
-                    )?
                 };
             if leadership
                 .as_ref()

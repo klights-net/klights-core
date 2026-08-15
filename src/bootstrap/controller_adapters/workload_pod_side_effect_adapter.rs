@@ -8,8 +8,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::workload_pod::WorkloadPodStore;
 
 struct BorrowedWorkloadPodStore<'a> {
@@ -120,44 +118,4 @@ impl WorkloadPodStore for OwnedWorkloadPodStore {
 
 pub(crate) fn port(resource_reads: Arc<dyn ClusterResourceRead>) -> Arc<dyn WorkloadPodStore> {
     Arc::new(OwnedWorkloadPodStore { resource_reads })
-}
-
-#[cfg(test)]
-struct DirectWorkloadPodStore {
-    db: DatastoreHandle,
-}
-#[cfg(test)]
-#[async_trait]
-impl WorkloadPodStore for DirectWorkloadPodStore {
-    async fn get_replica_set(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        self.db
-            .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-            .await
-    }
-    async fn list_replica_sets(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources(
-                "apps/v1",
-                "ReplicaSet",
-                Some(namespace),
-                klights_cluster_store::ResourceListOptions::all(),
-            )
-            .await
-            .map(|page| page.items)
-    }
-    async fn list_replication_controllers(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources(
-                "v1",
-                "ReplicationController",
-                Some(namespace),
-                klights_cluster_store::ResourceListOptions::all(),
-            )
-            .await
-            .map(|page| page.items)
-    }
-}
-#[cfg(test)]
-pub(crate) fn port_for_test(db: DatastoreHandle) -> Arc<dyn WorkloadPodStore> {
-    Arc::new(DirectWorkloadPodStore { db })
 }

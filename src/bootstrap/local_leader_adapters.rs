@@ -42,13 +42,6 @@ pub(crate) fn new_local_outbox_side_effect_state(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn new_local_outbox_side_effect_state_for_test(
-    db: crate::datastore::DatastoreHandle,
-) -> Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState>{
-    Arc::new(crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState::new_for_test(db))
-}
-
 /// Bootstrap-owned in-memory Node lease publisher.
 pub(crate) struct LocalNodeLeaseRenewal {
     tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
@@ -327,8 +320,6 @@ impl LeadershipGenerationFence {
 /// Bootstrap-owned projected ServiceAccount token issuer.
 pub(crate) struct LocalProjectedToken {
     resource_reads: Option<Arc<dyn klights_cluster_store::ClusterResourceRead>>,
-    #[cfg(test)]
-    db: Option<crate::datastore::DatastoreHandle>,
     authoring_node: String,
     containerd_namespace: String,
     signing_key_path: std::path::PathBuf,
@@ -351,32 +342,6 @@ impl LocalProjectedToken {
         let crypto = file_process.crypto_executor();
         Self {
             resource_reads: Some(resource_reads),
-            #[cfg(test)]
-            db: None,
-            authoring_node,
-            containerd_namespace,
-            signing_key_path,
-            file_process,
-            crypto,
-            authority: authority.into(),
-            signing_fence: None,
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_for_test<A: Into<AuthorityHandle>>(
-        db: crate::datastore::DatastoreHandle,
-        authoring_node: String,
-        containerd_namespace: String,
-        signing_key_path: std::path::PathBuf,
-        authority: A,
-        file_process: klights_supervisor::FileProcessExecutor,
-    ) -> Self {
-        let crypto = file_process.crypto_executor();
-        Self {
-            resource_reads: None,
-            db: Some(db),
             authoring_node,
             containerd_namespace,
             signing_key_path,
@@ -419,12 +384,6 @@ impl LocalProjectedToken {
             });
             leadership.ensure_unchanged()?;
             let signing_key_pem = signing_key_pem?;
-            #[cfg(test)]
-            let resources = match &self.db {
-                Some(db) => crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new_for_test(db.as_ref()),
-                None => crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new(self.resource_reads.as_ref().expect("focused projected-token reads").as_ref()),
-            };
-            #[cfg(not(test))]
             let resources = crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new(self.resource_reads.as_ref().expect("focused projected-token reads").as_ref());
             let claims =
                 klights_auth::projected_service_account_token::authorize_projected_service_account_token(

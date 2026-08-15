@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::datastore::DatastoreHandle as IntegrationDatastoreHandle;
+type IntegrationDatastoreHandle = super::SqliteTestStore;
 
 pub struct IntegrationPassiveReadPorts {
     ports: crate::bootstrap::cluster_store::selector::PassiveReadPorts,
@@ -151,15 +151,35 @@ impl IntegrationLeaderRpcRuntime {
 /// base-owned composition suite.
 pub struct IntegrationLeaderRpcComposition {
     db: IntegrationDatastoreHandle,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 }
 
 impl IntegrationLeaderRpcComposition {
-    pub fn new(db: IntegrationDatastoreHandle) -> Self {
-        Self { db }
+    pub fn new(
+        db: IntegrationDatastoreHandle,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ) -> Self {
+        Self {
+            db,
+            applied_outbox,
+            committed_apply,
+            resource_reads,
+        }
+    }
+
+    pub fn from_sqlite(db: IntegrationDatastoreHandle) -> Self {
+        let applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger> = db.clone();
+        let committed_apply = db.focused_committed_apply();
+        let resource_reads = db.focused_read_store();
+        Self::new(db, applied_outbox, committed_apply, resource_reads)
     }
 
     pub fn passive_reads_for(
-        db: &crate::datastore::sqlite::Datastore,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> IntegrationPassiveReadPorts {
         IntegrationPassiveReadPorts {
             ports: crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(db),
@@ -167,19 +187,19 @@ impl IntegrationLeaderRpcComposition {
     }
 
     pub async fn ensure_cluster_metadata_for(
-        db: &dyn crate::datastore::DatastoreBackend,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> anyhow::Result<()> {
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db).await
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(db).await
     }
 
     pub async fn ensure_worker_bootstrap_token_for(
-        db: &dyn crate::datastore::DatastoreBackend,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> anyhow::Result<String> {
         crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db).await
     }
 
     pub async fn create_scoped_bootstrap_token_for(
-        db: &dyn crate::datastore::DatastoreBackend,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         token: &str,
         controlplane: bool,
     ) -> anyhow::Result<()> {
@@ -188,14 +208,17 @@ impl IntegrationLeaderRpcComposition {
         } else {
             klights_auth::bootstrap_token::BootstrapTokenScope::Worker
         };
-        crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
-            db, scope, token,
+        crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
+            db,
+            scope,
+            token,
+            klights_auth::bootstrap_token::BOOTSTRAP_TOKEN_TTL,
         )
         .await
     }
 
     pub fn controller_dispatcher(
-        db: &crate::datastore::sqlite::Datastore,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> Arc<klights_controllers::ControllerDispatcher> {
         crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
             db,
@@ -277,7 +300,7 @@ impl IntegrationLeaderRpcComposition {
     ) -> klights_watch::PositionedWatchService {
         crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
             &passive_reads.ports,
-            db,
+            db.as_ref(),
         )
     }
 
@@ -291,45 +314,47 @@ impl IntegrationLeaderRpcComposition {
         ))
     }
 
-    pub async fn seed_namespace(db: &dyn crate::datastore::DatastoreBackend, name: &str) {
+    pub async fn seed_namespace(
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
+        name: &str,
+    ) {
         let _ = db
             .create_namespace(name, serde_json::json!({"metadata": {"name": name}}))
             .await;
     }
 
     pub fn broadcast_watch_event(
-        db: &dyn crate::datastore::DatastoreBackend,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         event: klights_watch::WatchEvent,
     ) {
-        let pending = crate::datastore::staged_post_commit_from_event(event);
-        db.commit_observation_sink().observe(&[pending]);
+        let pending = crate::bootstrap::watch_commit_wiring::staged_post_commit_from_event(event);
+        if let Some(sink) = db.commit_observation_sink() {
+            sink.observe(&[pending]);
+        }
     }
 
-    pub fn local_node_ports(
-        db: IntegrationDatastoreHandle,
-        node_name: String,
-    ) -> IntegrationLeaderRpcNodePorts {
-        let (resource_query, lifecycle_status) = Self::local_client_with_query(db, node_name);
+    pub fn local_node_ports(&self, node_name: String) -> IntegrationLeaderRpcNodePorts {
+        let (resource_query, lifecycle_status) = self.local_client_with_query(node_name);
         IntegrationLeaderRpcNodePorts {
             resource_query,
             lifecycle_status,
         }
     }
 
-    pub fn local_network_ports(
-        db: IntegrationDatastoreHandle,
-        node_name: String,
-    ) -> IntegrationLeaderRpcLocalNetworkPorts {
-        let (resource_query, _lifecycle_status) =
-            Self::local_client_with_query(db.clone(), node_name);
+    pub fn local_network_ports(&self, node_name: String) -> IntegrationLeaderRpcLocalNetworkPorts {
+        let (resource_query, _lifecycle_status) = self.local_client_with_query(node_name);
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                self.applied_outbox.clone(),
+                self.committed_apply.clone(),
+                self.resource_reads.clone(),
+            ),
         );
         let network = Arc::new(
             crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new_for_test(
-                db,
+                self.db.focused_read_store(),
                 proposal,
                 authority,
             ),
@@ -363,7 +388,7 @@ impl IntegrationLeaderRpcComposition {
     }
 
     fn local_client_with_query(
-        db: IntegrationDatastoreHandle,
+        &self,
         _node_name: String,
     ) -> (
         Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -371,14 +396,18 @@ impl IntegrationLeaderRpcComposition {
     ) {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db.clone(),
+        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            self.resource_reads.clone(),
             authority.clone(),
         );
         let lifecycle_status =
             crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
                 resource_query.clone(),
-                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                self.applied_outbox.clone(),
+                self.committed_apply.clone(),
+                self.resource_reads.clone(),
+                ),
                 authority,
             );
         (resource_query, Arc::new(lifecycle_status))
@@ -400,8 +429,18 @@ impl IntegrationLeaderRpcComposition {
             None,
         )
         .await;
-        crate::bootstrap::node_registration_adapter::register_node_snapshot(
-            self.db.as_ref(),
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+            self.applied_outbox.clone(),
+            self.committed_apply.clone(),
+            self.resource_reads.clone(),
+        );
+        let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+            self.resource_reads.clone(),
+            self.db.focused_read_store(),
+            commands,
+        );
+        crate::bootstrap::node_registration_adapter::register_leader_node_snapshot(
+            &store,
             None,
             dataplane_health,
             &snapshot,
@@ -413,10 +452,20 @@ impl IntegrationLeaderRpcComposition {
         &self,
         request: klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest<'_>,
     ) -> anyhow::Result<()> {
-        let pod_store =
-            crate::bootstrap::pod_repository_composition::new_pod_store(self.db.clone());
+        let pod_store = crate::bootstrap::pod_repository_composition::new_pod_store(
+            Arc::new(self.db.as_ref().clone()),
+            self.db.focused_committed_apply(),
+            self.db.focused_read_store(),
+            self.db.focused_read_store(),
+        );
+        let endpoint_store = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
+            Arc::new(self.db.as_ref().clone()),
+            self.db.focused_committed_apply(),
+            self.db.focused_read_store(),
+            self.db.focused_read_store(),
+        );
         klights_controllers::endpoints::reconcile_service_endpoints_batch(
-            self.db.as_ref(),
+            &endpoint_store,
             &pod_store,
             request,
         )
@@ -461,7 +510,7 @@ impl IntegrationLeaderRpcComposition {
             metadata,
             Arc::new(
                 crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new_for_test(
-                    self.db.clone(),
+                    self.db.as_ref(),
                 ),
             ),
             supervisor,
@@ -478,7 +527,7 @@ impl IntegrationLeaderRpcComposition {
             Arc::new(IntegrationLeaderRpcMetadataRead { current_rv }),
             Arc::new(
                 crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new_for_test(
-                    self.db.clone(),
+                    self.db.as_ref(),
                 ),
             ),
             supervisor,
@@ -592,11 +641,15 @@ impl IntegrationLeaderRpcComposition {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(self.db.clone()),
+            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                self.applied_outbox.clone(),
+                self.committed_apply.clone(),
+                self.resource_reads.clone(),
+            ),
         );
         let network = Arc::new(
             crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new_for_test(
-                self.db.clone(),
+                self.db.focused_read_store(),
                 proposal.clone(),
                 authority.clone(),
             ),
@@ -614,36 +667,45 @@ impl IntegrationLeaderRpcComposition {
                 authority.clone(),
                 Arc::new(klights_supervisor::SystemWallClock),
             ),
-            None => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-                self.db.clone(),
+            None => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+                self.resource_reads.clone(),
                 authority.clone(),
             ),
         };
         let authority_handle =
             crate::bootstrap::authority::AuthorityHandle::from(authority.clone());
         let side_effects =
-            crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state_for_test(
+            crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+                self.resource_reads.clone(),
                 self.db.clone(),
+                self.db.focused_read_store(),
             );
         if let Some(dispatcher) = controller_dispatcher {
             side_effects.set_controller_dispatcher(dispatcher);
         }
         side_effects.set_non_pod_finalization(Arc::new(
-            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-                self.db.clone(),
+            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test(
+                self.applied_outbox.clone(),
+                self.committed_apply.clone(),
+                self.resource_reads.clone(),
+                self.db.focused_read_store(),
             ),
         ));
         let resource_command = crate::bootstrap::composition_adapters::
             committed_outbox_delivery_adapter::test_resource_command(
-                self.db.clone(),
                 &authority_handle,
+                self.applied_outbox.clone(),
+                self.committed_apply.clone(),
+                self.resource_reads.clone(),
             );
         let authenticated_outbox = crate::bootstrap::composition_adapters::
             committed_outbox_delivery_adapter::test_outbox_delivery(
-                self.db.clone(),
                 &authority_handle,
                 side_effects,
                 "grpc-test".to_string(),
+                self.applied_outbox.clone(),
+                self.committed_apply.clone(),
+                self.resource_reads.clone(),
             );
         let local_node_lease = Arc::new(
             crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewalAdapter::new(
@@ -652,8 +714,8 @@ impl IntegrationLeaderRpcComposition {
             ),
         );
         let local_projected_token = Arc::new(
-            crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new_for_test(
-                self.db.clone(),
+            crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+                self.resource_reads.clone(),
                 "grpc-test".to_string(),
                 crate::paths::runtime_namespace(),
                 crate::paths::service_account_signing_key_path(&crate::paths::runtime_namespace()),

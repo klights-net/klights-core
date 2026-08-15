@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use async_trait::async_trait;
 use klights_cluster_core::{

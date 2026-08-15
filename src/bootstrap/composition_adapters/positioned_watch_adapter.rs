@@ -3,8 +3,6 @@ use std::sync::Arc;
 use klights_leader_api::LeaderWatchError;
 
 use crate::bootstrap::cluster_store::selector::PassiveReadPorts;
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 
 pub(crate) fn datastore_positioned_watch_service(
     passive_reads: &PassiveReadPorts,
@@ -24,11 +22,11 @@ pub(crate) fn datastore_positioned_watch_service(
 #[cfg(test)]
 pub(crate) fn for_test(
     passive_reads: &PassiveReadPorts,
-    db: DatastoreHandle,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
 ) -> klights_watch::PositionedWatchService {
     datastore_positioned_watch_service(
         passive_reads,
-        crate::bootstrap::watch_commit_wiring::test_signal_source(&db),
+        crate::bootstrap::watch_commit_wiring::test_signal_source(db),
     )
 }
 

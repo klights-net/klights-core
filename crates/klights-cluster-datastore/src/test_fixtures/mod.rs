@@ -1,4 +1,5 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
+#![allow(dead_code, unused_imports)]
 
 //! Capability-scoped fixtures for passive persistence tests.
 

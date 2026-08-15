@@ -1076,7 +1076,7 @@ mod tests {
             &'a self,
             _api_version: &'a str,
             _kind: &'a str,
-            _namespace: Option<&'a str>,
+            _scope: klights_leader_api::ResourceListScope,
             _label_selector: Option<&'a str>,
             _field_selector: Option<&'a str>,
             _limit: Option<i64>,

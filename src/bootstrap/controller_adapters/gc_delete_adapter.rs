@@ -3,11 +3,7 @@ use klights_reconcile_api::{
     FinalizerLifecyclePort, FinalizerResourceTarget, FinalizerTombstoneDeleteRequest,
     FinalizerUpdateRequest,
 };
-#[cfg(test)]
-use std::sync::Arc;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_cluster_store::{ClusterOwnershipRead, ClusterResourceRead};
 
 pub(crate) struct GcOwnerLifecycleAdapter {
@@ -134,19 +130,19 @@ pub(crate) struct GcNonPodFinalizationAdapter {
 
 impl GcNonPodFinalizationAdapter {
     #[cfg(test)]
-    pub(crate) fn new(db: DatastoreHandle) -> Self {
+    pub(crate) fn new_for_test(
+        applied_outbox: std::sync::Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>,
+        ownership_reads: std::sync::Arc<dyn ClusterOwnershipRead>,
+    ) -> Self {
         let commands =
             super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
-                db.clone(),
+                applied_outbox,
+                committed_apply,
+                resource_reads.clone(),
             );
-        Self::new_for_test_with_commands(db, commands)
-    }
-    #[cfg(test)]
-    pub(crate) fn new_for_test_with_commands(
-        db: DatastoreHandle,
-        commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
-    ) -> Self {
-        Self { lifecycle: crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new_for_test(db, commands) }
+        Self::new_with_commands(resource_reads, ownership_reads, commands)
     }
     pub(crate) fn new_with_commands(
         resource_reads: std::sync::Arc<dyn ClusterResourceRead>,
@@ -284,8 +280,9 @@ mod tests {
 
     #[tokio::test]
     async fn non_pod_port_rejects_pod_without_touching_datastore() {
-        let (db, _db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = db
             .create_resource(
                 "v1",
@@ -305,7 +302,13 @@ mod tests {
             )
             .await
             .expect("create Pod");
-        let adapter = GcNonPodFinalizationAdapter::new(Arc::new(db.clone()));
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let adapter = GcNonPodFinalizationAdapter::new_for_test(
+            ports.applied_outbox,
+            ports.committed_apply,
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
+        );
 
         let error = adapter
             .finalize_non_pod(GcNonPodFinalizationRequest {
@@ -379,8 +382,9 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_is_command_routed_end_to_end() {
-        let (db, _db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let owner = db
             .create_resource(
                 "v1",
@@ -404,8 +408,10 @@ mod tests {
             .expect("create owner");
         let observed_rv = owner.resource_version;
         let commands = std::sync::Arc::new(RecordingCommands::default());
-        let adapter = GcNonPodFinalizationAdapter::new_for_test_with_commands(
-            Arc::new(db.clone()),
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let adapter = GcNonPodFinalizationAdapter::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
             commands.clone(),
         );
 
@@ -475,8 +481,9 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_rejects_follower_without_local_mutation() {
-        let (db, _db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let owner = db
             .create_resource(
                 "v1",
@@ -503,8 +510,10 @@ mod tests {
             commands: std::sync::Mutex::new(Vec::new()),
             reject_as_follower: true,
         });
-        let adapter = GcNonPodFinalizationAdapter::new_for_test_with_commands(
-            Arc::new(db.clone()),
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let adapter = GcNonPodFinalizationAdapter::new_with_commands(
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
             commands.clone(),
         );
 

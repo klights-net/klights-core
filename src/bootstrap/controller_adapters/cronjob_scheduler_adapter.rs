@@ -133,8 +133,9 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_uses_exact_initial_snapshot_handoff() {
-        let (db, db_handle) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let passive_reads =
             crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db);
         db.create_resource(
@@ -158,16 +159,20 @@ mod tests {
                     "10.43.128.0/17",
                 )),
             );
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let runtime = LeaderCronJobSchedulerRuntime {
             positioned_watch:
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
                     &passive_reads,
-                    db_handle.clone(),
+                    &db,
                 ),
             resource_reads: passive_reads.resource_reads(),
             store: Arc::new(
-                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
-                    Arc::new(db.clone()),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
+                    ports.applied_outbox,
+                    ports.committed_apply,
+                    ports.read_ports.resource_reads(),
+                    ports.ownership_reads,
                 ),
             ),
             dispatcher,

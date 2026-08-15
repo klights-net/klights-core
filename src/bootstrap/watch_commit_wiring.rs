@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::datastore::CommitObservationSink;
+use klights_cluster_store::CommitObservationSink;
 #[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
 #[cfg(test)]
@@ -36,6 +36,45 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
     }
 }
 
+/// Test-only conversion for the root watch harness.  The durable post-commit
+/// record remains owned by the cluster-store contract; this helper merely
+/// projects its optional test event without reintroducing a datastore facade.
+#[cfg(test)]
+pub(crate) fn staged_test_event(pending: &StagedPostCommit) -> Option<klights_watch::WatchEvent> {
+    let staged = pending.test_event()?;
+    let mut event = klights_watch::WatchEvent::from_type(
+        staged.event_type(),
+        staged.resource().data.as_ref().clone(),
+    );
+    event.encoded_payload =
+        staged
+            .encoded_json()
+            .cloned()
+            .map(|bytes| klights_watch::EncodedWatchPayload {
+                content_type: klights_watch::WatchContentType::Json,
+                bytes,
+            });
+    Some(event)
+}
+
+#[cfg(test)]
+pub(crate) fn staged_post_commit_from_event(event: klights_watch::WatchEvent) -> StagedPostCommit {
+    let resource = klights_cluster_core::Resource::try_from_data(event.object.clone())
+        .expect("test watch event must carry canonical resource identity");
+    let encoded_json = event
+        .encoded_payload
+        .as_ref()
+        .filter(|payload| payload.content_type == klights_watch::WatchContentType::Json)
+        .map(|payload| payload.bytes.clone());
+    StagedPostCommit::new(
+        &resource.api_version,
+        &resource.kind,
+        resource.namespace.as_deref(),
+        resource.resource_version,
+    )
+    .with_test_event(event.event_type.to_string(), resource, encoded_json)
+}
+
 #[cfg(test)]
 pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
@@ -47,9 +86,11 @@ pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
 
 #[cfg(test)]
 pub(crate) fn test_signal_source(
-    db: &crate::datastore::DatastoreHandle,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
 ) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
-    let sink = db.commit_observation_sink();
+    let sink = db
+        .commit_observation_sink()
+        .expect("test datastore watch sink");
     sink.as_any()
         .downcast_ref::<WatchCommitObservationSink>()
         .expect("test datastore watch sink")
@@ -110,10 +151,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
             .collect::<Vec<_>>();
         self.wakeups.wake(&advances);
         #[cfg(test)]
-        for event in observations
-            .iter()
-            .filter_map(crate::datastore::staged_test_event)
-        {
+        for event in observations.iter().filter_map(staged_test_event) {
             self.bus.publish(event);
         }
     }
@@ -192,6 +230,7 @@ mod tests {
 
     use super::*;
     use crate::datastore::DatastoreBackend;
+    use klights_cluster_store::ClusterResourceMutation;
 
     #[derive(Default)]
     struct RecordingSink {
@@ -278,6 +317,24 @@ mod tests {
         );
     }
 
+    async fn assert_sqlite_success_only(store: &dyn ClusterResourceMutation, sink: &RecordingSink) {
+        store
+            .create_resource("v1", "ConfigMap", Some("default"), "observed", config_map())
+            .await
+            .expect("first committed create");
+        assert_eq!(sink.observations.lock().unwrap().len(), 1);
+
+        store
+            .create_resource("v1", "ConfigMap", Some("default"), "observed", config_map())
+            .await
+            .expect_err("duplicate transaction must fail");
+        assert_eq!(
+            sink.observations.lock().unwrap().len(),
+            1,
+            "failed transaction must not emit an observation"
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_emits_commit_observations_only_after_successful_commit() {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
@@ -288,16 +345,15 @@ mod tests {
         .await
         .unwrap();
         let sink = Arc::new(RecordingSink::default());
-        let store =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
-                executor,
-                sink.clone(),
-                crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
-                std::sync::Arc::new(klights_supervisor::SystemWallClock),
-            )
-            .await
-            .unwrap();
-        assert_success_only(&store, sink.as_ref()).await;
+        let store = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+            executor,
+            sink.clone(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        )
+        .await
+        .unwrap();
+        assert_sqlite_success_only(&store, sink.as_ref()).await;
     }
 
     #[tokio::test]

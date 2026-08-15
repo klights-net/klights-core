@@ -9,107 +9,33 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use klights_cluster_core::{
-    OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark, StorageCommand,
+    BuildOutboxOutcome, OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark, StorageCommand,
 };
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    AppliedOutboxLedger, ClusterResourceRead, CommittedRaftApplyRequest,
+    PrivilegedCommittedRaftApply, ResourceGetRequest,
+};
 use klights_replication::proposal::{RaftProposal, RaftProposalEffect};
-
-use crate::datastore::DatastoreBackend;
 
 const TEST_RESOURCE_COMMAND_OPERATION: &str = "test-resource-command";
 
 pub(crate) struct BackendProposalFixture {
-    backend: Arc<dyn DatastoreBackend>,
-}
-
-pub(crate) struct BackendResourceQueryFixture {
-    backend: Arc<dyn DatastoreBackend>,
-    is_leader_rx: tokio::sync::watch::Receiver<bool>,
-}
-
-impl BackendResourceQueryFixture {
-    pub(crate) fn new(
-        backend: Arc<dyn DatastoreBackend>,
-        is_leader_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> Self {
-        Self {
-            backend,
-            is_leader_rx,
-        }
-    }
-}
-
-impl klights_leader_api::LeaderResourceQuery for BackendResourceQueryFixture {
-    fn get_resource(
-        &self,
-        request: klights_leader_api::ResourceGetRequest,
-    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>> {
-        Box::pin(async move {
-            if request.consistency() == klights_leader_api::ResourceQueryConsistency::LeaderFresh
-                && !*self.is_leader_rx.borrow()
-            {
-                return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "test resource query target is not leader",
-                ));
-            }
-            let key = request.into_key();
-            self.backend
-                .get_resource(
-                    &key.api_version,
-                    &key.kind,
-                    key.namespace.as_deref(),
-                    &key.name,
-                )
-                .await
-                .map_err(|error| {
-                    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
-                })
-        })
-    }
-
-    fn list_resources(
-        &self,
-        request: klights_leader_api::ResourceListRequest,
-    ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult> {
-        Box::pin(async move {
-            if request.consistency() == klights_leader_api::ResourceQueryConsistency::LeaderFresh
-                && !*self.is_leader_rx.borrow()
-            {
-                return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "test resource query target is not leader",
-                ));
-            }
-            let list = self
-                .backend
-                .list_resources(
-                    request.api_version(),
-                    request.kind(),
-                    request.namespace(),
-                    ResourceListOptions::new(
-                        request.label_selector(),
-                        request.field_selector(),
-                        request.limit(),
-                        request.continue_token(),
-                    ),
-                )
-                .await
-                .map_err(|error| {
-                    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
-                })?;
-            klights_leader_api::ResourceListResult::try_new(
-                list.items,
-                list.resource_version,
-                list.watch_replay_position,
-                list.continue_token,
-                list.remaining_item_count,
-            )
-        })
-    }
+    outbox_ledger: Arc<dyn AppliedOutboxLedger>,
+    committed_apply: Arc<dyn PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 impl BackendProposalFixture {
-    pub(crate) fn new(backend: Arc<dyn DatastoreBackend>) -> Self {
-        Self { backend }
+    pub(crate) fn new(
+        outbox_ledger: Arc<dyn AppliedOutboxLedger>,
+        committed_apply: Arc<dyn PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn ClusterResourceRead>,
+    ) -> Self {
+        Self {
+            outbox_ledger,
+            committed_apply,
+            resource_reads,
+        }
     }
 
     async fn apply_command(
@@ -118,19 +44,17 @@ impl BackendProposalFixture {
     ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
         let return_key = command_return_key(&command);
         let commit = self
-            .backend
+            .outbox_ledger
             .build_log_apply_commit_for_command(
                 command,
                 TEST_RESOURCE_COMMAND_OPERATION,
                 "test-proposer",
             )
             .await
-            .map_err(
-                crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test,
-            )?;
+            .map_err(|error| crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test(anyhow::Error::new(error)))?;
         let receipt = self
-            .backend
-            .apply_raft_log_apply_commit_receipt(commit)
+            .committed_apply
+            .apply_committed_raft(CommittedRaftApplyRequest::new(commit))
             .await
             .map_err(|error| anyhow::anyhow!("test committed apply: {error:#}"))?;
         let mut result =
@@ -141,8 +65,8 @@ impl BackendProposalFixture {
             && result.applied_mutation.is_none()
             && let Some((api_version, kind, namespace, name)) = return_key
             && let Some(resource) = self
-                .backend
-                .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                .resource_reads
+                .get_resource(ResourceGetRequest::new(api_version, kind, namespace, name))
                 .await?
         {
             result.applied_mutation =
@@ -161,8 +85,8 @@ impl BackendProposalFixture {
     ) -> Result<RaftProposalEffect, OutboxApplyError> {
         let return_key = command_return_key(&command);
         let effect = self
-            .backend
-            .apply_outbox_transactionally_with_watermark_effect(
+            .outbox_ledger
+            .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
                 operation.as_str(),
                 command,
@@ -170,22 +94,66 @@ impl BackendProposalFixture {
                 watermark,
             )
             .await?;
-        let (result, resource_effect, pod_endpoint_effect, mut committed_resource) =
-            effect.into_parts();
-        if committed_resource.is_none()
-            && resource_effect == klights_cluster_core::ResourceMutationEffect::Changed
-            && let Some((api_version, kind, namespace, name)) = return_key
-        {
-            committed_resource = self
-                .backend
-                .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-                .await
-                .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+        match effect {
+            BuildOutboxOutcome::NeedsPropose {
+                commit,
+                applied_rv,
+                terminal_error,
+            } => {
+                let receipt = self
+                    .committed_apply
+                    .apply_committed_raft(CommittedRaftApplyRequest::new(commit))
+                    .await
+                    .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+                if let Some(error) = terminal_error {
+                    return Err(error);
+                }
+                if let Some(message) = receipt.terminal_rejection() {
+                    return Err(OutboxApplyError::ConflictTerminal(message.to_string()));
+                }
+                let mut committed_resource = receipt.applied_resource().cloned();
+                let resource_effect = if matches!(
+                    receipt.outcome(),
+                    klights_cluster_core::CommittedApplyOutcome::Visible { .. }
+                ) {
+                    klights_cluster_core::ResourceMutationEffect::Changed
+                } else {
+                    klights_cluster_core::ResourceMutationEffect::Unchanged
+                };
+                if committed_resource.is_none()
+                    && resource_effect == klights_cluster_core::ResourceMutationEffect::Changed
+                    && let Some((api_version, kind, namespace, name)) = return_key
+                {
+                    committed_resource = self
+                        .resource_reads
+                        .get_resource(ResourceGetRequest::new(api_version, kind, namespace, name))
+                        .await
+                        .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+                }
+                Ok(RaftProposalEffect::new(
+                    OutboxApplyOutcome::Applied {
+                        applied_rv: receipt.applied_resource_version().unwrap_or(applied_rv),
+                    },
+                    resource_effect,
+                    receipt.pod_endpoint_effect(),
+                )
+                .with_committed_resource(committed_resource))
+            }
+            BuildOutboxOutcome::AlreadyApplied {
+                applied_rv,
+                committed_resource,
+            } => Ok(RaftProposalEffect::new(
+                OutboxApplyOutcome::AlreadyApplied { applied_rv },
+                klights_cluster_core::ResourceMutationEffect::Unchanged,
+                klights_cluster_core::PodEndpointEffect::Unchanged,
+            )
+            .with_committed_resource(committed_resource)),
+            BuildOutboxOutcome::LeaseRenewShortcircuit => Ok(RaftProposalEffect::new(
+                OutboxApplyOutcome::Applied { applied_rv: 0 },
+                klights_cluster_core::ResourceMutationEffect::Unchanged,
+                klights_cluster_core::PodEndpointEffect::NotApplicable,
+            )),
         }
-        Ok(
-            RaftProposalEffect::new(result, resource_effect, pod_endpoint_effect)
-                .with_committed_resource(committed_resource),
-        )
     }
 }
 
@@ -306,7 +274,7 @@ mod review_regressions {
 
     #[tokio::test]
     async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         db.create_resource(
@@ -330,7 +298,12 @@ mod review_regressions {
             stream_seq: 1,
         };
 
-        let fixture = super::BackendProposalFixture::new(Arc::new(db.clone()));
+        let canonical = db.clone();
+        let fixture = super::BackendProposalFixture::new(
+            Arc::new(canonical.clone()),
+            canonical.focused_committed_apply(),
+            canonical.focused_read_store(),
+        );
         let result = fixture
             .propose_outbox_command_effect(
                 "missing-pod-status",

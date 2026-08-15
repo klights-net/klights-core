@@ -7,8 +7,6 @@
 //! the root `PodUpdate`/`PodStatusWriter`/deletion-finalizer wrappers, and
 //! the namespace-termination queue sink over the workqueue.
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use std::sync::Arc;
 
 use klights_kubelet::pod_repository::background::PodRepositoryBackground;
@@ -18,30 +16,6 @@ use klights_kubelet::pod_repository::workqueue::{
     PodWorkqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueuePersistence,
 };
 
-impl klights_cluster_store::PodUidPreconditionRead for dyn crate::datastore::DatastoreBackend + '_ {
-    fn read_pod_uid_precondition(
-        &self,
-        request: klights_cluster_store::PodUidPreconditionRequest,
-    ) -> klights_cluster_store::PodUidPreconditionFuture<'_> {
-        Box::pin(async move {
-            let live = self
-                .get_resource("v1", "Pod", Some(request.namespace()), request.name())
-                .await
-                .map_err(|error| {
-                    klights_cluster_store::PodUidPreconditionError::retryable(error.to_string())
-                })?;
-            Ok(match live {
-                None => klights_cluster_store::PodUidPreconditionState::Missing,
-                Some(pod) if pod.uid == request.expected_uid() => {
-                    klights_cluster_store::PodUidPreconditionState::Matches
-                }
-                Some(pod) => klights_cluster_store::PodUidPreconditionState::Mismatch {
-                    actual_uid: pod.uid,
-                },
-            })
-        })
-    }
-}
 use k8s_native_service::{
     PodApiService, PodApiServiceDependencies, PodNativeOrchestration,
     PodNativeOrchestrationDependencies, PodSubresourceService,
@@ -704,8 +678,15 @@ impl klights_pod_api::PodRepositoryWritePersistence for WorkerPodPersistence {
 }
 
 #[cfg(test)]
-pub(crate) fn new_pod_store(db: DatastoreHandle) -> PodStore {
-    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store_from_test_handle(db)
+pub(crate) fn new_pod_store(
+    applied_outbox: std::sync::Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ownership_reads: std::sync::Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+) -> PodStore {
+    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store_from_test_ports(
+        applied_outbox, committed_apply, resource_reads, ownership_reads,
+    )
 }
 
 fn legacy_workqueue_kind(kind: PodWorkqueueKind) -> klights_node_store::PodWorkqueueKind {

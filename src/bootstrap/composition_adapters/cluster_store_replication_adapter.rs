@@ -111,12 +111,6 @@ pub(crate) fn map_storage_mutation_error_for_test(
     map_storage_mutation_error(error)
 }
 
-pub(crate) fn storage_command_result_from_receipt(
-    receipt: &klights_cluster_store::CommittedRaftApplyReceipt,
-) -> klights_cluster_store::StorageCommandResult {
-    klights_replication::committed_apply::storage_command_result_from_committed_outcome(receipt)
-}
-
 #[async_trait::async_trait]
 impl klights_replication::materializer::RaftCommitMaterializer for DatastoreRaftCommitMaterializer {
     async fn read_raft_metadata(
@@ -174,9 +168,9 @@ impl klights_leader_api::PostCommitWakeup for TestNoopPostCommitWakeup {
 
 #[cfg(test)]
 pub(crate) fn raft_state_machine_store_ports_for_test(
-    db: std::sync::Arc<crate::datastore::sqlite::Datastore>,
+    db: std::sync::Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
 ) -> klights_replication::state_machine::RaftStateMachineStorePorts {
-    let passive = std::sync::Arc::new(db.canonical_embedded_for_test_support());
+    let passive = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(
         passive.clone(),
         passive.clone(),
@@ -202,9 +196,9 @@ pub(crate) fn raft_state_machine_store_ports_for_test(
 
 #[cfg(test)]
 pub(crate) fn raft_store_ports_for_test(
-    db: std::sync::Arc<crate::datastore::sqlite::Datastore>,
+    db: std::sync::Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
 ) -> klights_replication::node::RaftStorePorts {
-    let passive = std::sync::Arc::new(db.canonical_embedded_for_test_support());
+    let passive = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(
         passive.clone(),
         passive.clone(),

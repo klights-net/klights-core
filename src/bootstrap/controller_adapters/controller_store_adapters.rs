@@ -8,8 +8,6 @@ use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_c
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use klights_controllers::apiservice::ApiServiceStore;
 use klights_controllers::common::ControllerStatusStore;
-#[cfg(test)]
-use klights_controllers::cronjob::CronJobStore;
 use klights_controllers::csr_signer::CsrStatusStore;
 use klights_controllers::deployment::DeploymentFinalizeStore;
 use klights_controllers::kube_service::KubernetesBootstrapStore;
@@ -280,53 +278,6 @@ impl ControllerStatusStore for dyn DatastoreBackend + '_ {
     }
 }
 
-#[cfg(test)]
-#[async_trait]
-impl ControllerStatusStore for crate::datastore::sqlite::Datastore {
-    async fn get_status_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource(api_version, kind, namespace, name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn update_status(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: serde_json::Value,
-        preconditions: ResourcePreconditions,
-    ) -> ControllerStoreResult<Resource> {
-        self.update_status_only_with_preconditions(
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            preconditions,
-        )
-        .await
-        .map_err(map_controller_store_error)
-    }
-
-    fn log_noop_status_write(
-        &self,
-        operation: &'static str,
-        resource: &Resource,
-        reason: &'static str,
-    ) {
-        let backend: &dyn DatastoreBackend = self;
-        ControllerStatusStore::log_noop_status_write(backend, operation, resource, reason);
-    }
-}
-
 #[async_trait]
 impl RbacPolicyStore for dyn DatastoreBackend + '_ {
     async fn get_rbac_object(
@@ -465,151 +416,6 @@ impl NamespaceBootstrapStore for dyn DatastoreBackend + '_ {
     }
 }
 
-#[cfg(test)]
-#[async_trait]
-impl NamespaceBootstrapStore for crate::datastore::sqlite::Datastore {
-    async fn get_namespace(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
-        DatastoreBackend::get_namespace(self, name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn create_namespace(
-        &self,
-        name: &str,
-        value: serde_json::Value,
-    ) -> ControllerStoreResult<Resource> {
-        DatastoreBackend::create_namespace(self, name, value)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn get_default_service_account(
-        &self,
-        namespace: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("v1", "ServiceAccount", Some(namespace), "default")
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn create_default_service_account(
-        &self,
-        namespace: &str,
-        value: serde_json::Value,
-    ) -> ControllerStoreResult<Resource> {
-        self.create_resource("v1", "ServiceAccount", Some(namespace), "default", value)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn get_configmap(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("v1", "ConfigMap", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn create_configmap(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> ControllerStoreResult<Resource> {
-        self.create_resource("v1", "ConfigMap", Some(namespace), name, value)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn update_configmap(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> ControllerStoreResult<Resource> {
-        self.update_resource(
-            "v1",
-            "ConfigMap",
-            Some(namespace),
-            name,
-            value,
-            expected_resource_version,
-        )
-        .await
-        .map_err(map_controller_store_error)
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl CronJobStore for crate::datastore::sqlite::Datastore {
-    async fn get_cronjob(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("batch/v1", "CronJob", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn get_job(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("batch/v1", "Job", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn create_job(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> ControllerStoreResult<Resource> {
-        self.create_resource("batch/v1", "Job", Some(namespace), name, value)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn list_jobs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources(
-            "batch/v1",
-            "Job",
-            Some(namespace),
-            ResourceListOptions::all(),
-        )
-        .await
-        .map(|listing| listing.items)
-        .map_err(map_controller_store_error)
-    }
-
-    async fn delete_job(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: String,
-        resource_version: i64,
-    ) -> ControllerStoreResult<()> {
-        self.delete_resource_with_preconditions(
-            "batch/v1",
-            "Job",
-            Some(namespace),
-            name,
-            ResourcePreconditions::uid_and_resource_version(uid, resource_version),
-        )
-        .await
-        .map(|_| ())
-        .map_err(map_controller_store_error)
-    }
-}
-
 #[async_trait]
 impl PvcStore for dyn DatastoreBackend + '_ {
     async fn get_pvc(
@@ -664,79 +470,8 @@ impl PvcStore for dyn DatastoreBackend + '_ {
     }
 }
 
-#[cfg(test)]
-#[async_trait]
-impl PvcStore for crate::datastore::sqlite::Datastore {
-    async fn get_pvc(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("v1", "PersistentVolumeClaim", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn list_persistent_volumes(&self) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources("v1", "PersistentVolume", None, ResourceListOptions::all())
-            .await
-            .map(|listing| listing.items)
-            .map_err(map_controller_store_error)
-    }
-
-    async fn get_persistent_volume(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("v1", "PersistentVolume", None, name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn create_persistent_volume(
-        &self,
-        name: &str,
-        value: serde_json::Value,
-    ) -> ControllerStoreResult<Resource> {
-        self.create_resource("v1", "PersistentVolume", None, name, value)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn update_persistent_volume(
-        &self,
-        name: &str,
-        value: serde_json::Value,
-        preconditions: ResourcePreconditions,
-    ) -> ControllerStoreResult<Resource> {
-        self.update_resource_with_preconditions(
-            "v1",
-            "PersistentVolume",
-            None,
-            name,
-            value,
-            preconditions,
-        )
-        .await
-        .map_err(map_controller_store_error)
-    }
-}
-
 #[async_trait]
 impl PdbStore for dyn DatastoreBackend + '_ {
-    async fn list_pdbs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources(
-            "policy/v1",
-            "PodDisruptionBudget",
-            Some(namespace),
-            ResourceListOptions::all(),
-        )
-        .await
-        .map(|listing| listing.items)
-        .map_err(map_controller_store_error)
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl PdbStore for crate::datastore::sqlite::Datastore {
     async fn list_pdbs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
         self.list_resources(
             "policy/v1",

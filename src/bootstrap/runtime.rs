@@ -848,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_local_dataplane_metadata_writes_explicit_disabled_route_metadata() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -858,15 +858,15 @@ mod tests {
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
-        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        let canonical = db.clone();
         let command = crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db_handle)),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store())),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
 
         let published = super::publish_local_dataplane_metadata_self_heal(
-            &db,
+            db.focused_read_store().as_ref(),
             &command,
             &config,
             &crate::bootstrap::NodeMode::Root,

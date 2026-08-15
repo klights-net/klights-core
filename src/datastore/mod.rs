@@ -7,7 +7,6 @@
 
 pub mod backend;
 pub mod redb;
-pub mod sqlite;
 
 #[cfg(test)]
 pub use backend::CommitObservationSink;
@@ -28,5 +27,3 @@ pub use klights_cluster_core::{
 #[cfg(test)]
 pub use klights_cluster_datastore::sqlite::embedded::ReplicatedCreateOptions;
 pub use klights_cluster_store::StagedPostCommit;
-#[cfg(test)]
-pub use sqlite::{staged_post_commit_from_event, staged_test_event};

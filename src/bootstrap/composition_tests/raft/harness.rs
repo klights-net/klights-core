@@ -1,6 +1,5 @@
 //! Focused root composition for Raft integration tests.
 
-use crate::datastore::backend::DatastoreBackendLifecyclePort;
 use std::sync::Arc;
 
 /// Opaque feature-gated capability for the root's exact Raft composition.
@@ -8,13 +7,13 @@ use std::sync::Arc;
 /// The concrete datastore and adapter implementations remain private. Tests
 /// receive only focused Raft ports and explicit fixture operations.
 pub struct IntegrationRaftComposition {
-    db: Arc<crate::datastore::sqlite::Datastore>,
+    db: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
 }
 
 impl IntegrationRaftComposition {
     pub const SNAPSHOT_CAPTURE_PAGE_SIZE: usize = klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE;
 
-    pub fn new(db: Arc<crate::datastore::sqlite::Datastore>) -> Self {
+    pub fn new(db: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>) -> Self {
         Self { db }
     }
 
@@ -48,7 +47,7 @@ impl IntegrationRaftComposition {
     pub fn commit_materializer(
         &self,
     ) -> Arc<dyn klights_replication::materializer::RaftCommitMaterializer> {
-        let passive = Arc::new(self.db.canonical_embedded_for_test_support());
+        let passive = self.db.clone();
         Arc::new(
             crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
                 passive.clone(),
@@ -78,7 +77,7 @@ impl IntegrationRaftComposition {
         let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(
             self.db.focused_recovery_store(),
             self.db.focused_read_store(),
-            Arc::new(DatastoreBackendLifecyclePort::new(self.db.clone())),
+            self.db.clone(),
             snapshot_applied_state,
             supervisor,
         );
@@ -103,10 +102,12 @@ impl IntegrationRaftComposition {
         );
         let query =
             crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
-        let db: crate::datastore::DatastoreHandle = self.db.clone();
+        let canonical = self.db.as_ref();
         let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
-            db,
             &authority,
+            Arc::new(canonical.clone()),
+            canonical.focused_committed_apply(),
+            canonical.focused_read_store(),
         );
         let store = Arc::new(
             crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
@@ -272,7 +273,7 @@ impl IntegrationRaftComposition {
     pub async fn read_cluster_membership(
         &self,
     ) -> anyhow::Result<klights_cluster_core::ClusterMembership> {
-        crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref()).await
+        crate::bootstrap::cluster_meta::read_cluster_membership_sqlite(self.db.as_ref()).await
     }
 
     pub fn inject_resource_version(

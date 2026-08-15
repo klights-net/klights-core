@@ -7,7 +7,6 @@
 pub(crate) mod support {
     use std::sync::Arc;
 
-    use crate::datastore::DatastoreHandle;
     use k8s_native_service::test_support::admission::DeterministicApiIdentity;
     use klights_auth::test_support::{
         AllowAllAuthorizer, IntegrationCsrSignerObservation, recording_csr_signer,
@@ -124,7 +123,7 @@ pub(crate) mod support {
     #[derive(Clone)]
     pub(crate) struct NativeApiTestHarness {
         router: axum::Router,
-        datastore: DatastoreHandle,
+        datastore: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         resource_store: klights_cluster_datastore::test_support::ResourceTestStore,
         endpoint_resource_fixture: klights_cluster_datastore::test_support::EndpointResourceFixture,
         commit_watch_fixture: Arc<klights_watch::test_support::CommitWatchFixture>,
@@ -419,13 +418,14 @@ pub(crate) mod support {
             )
             .await?;
             let db =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
                 executor,
                 commit_watch_fixture.clone(),
                 crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
                 Arc::new(klights_supervisor::SystemWallClock),
             )
             .await?;
+            let canonical = db.clone();
             let canonical_ports =
                 crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
             let passive_reads = if let Some(control) = watch_history_failure {
@@ -444,9 +444,9 @@ pub(crate) mod support {
             };
             let resource_store =
             klights_cluster_datastore::test_support::ResourceTestStore::from_embedded_for_test_support(
-                db.canonical_embedded_for_test_support(),
+                db.clone(),
             );
-            let datastore: DatastoreHandle = Arc::new(db.clone());
+            let datastore = Arc::new(db.clone());
             let config = crate::KlightsConfig::test_default();
             let identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> =
                 Arc::new(DeterministicApiIdentity::default());
@@ -475,7 +475,9 @@ pub(crate) mod support {
                 );
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-                    datastore.clone(),
+                    Arc::new(canonical.clone()),
+                    canonical.focused_committed_apply(),
+                    canonical.focused_read_store(),
                 ),
             );
             let resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand> = Arc::new(
@@ -515,7 +517,12 @@ pub(crate) mod support {
                 metrics.clone(),
                 None,
                 Some(supervisor.clone()),
-                Some(datastore.clone()),
+                canonical_ports.applied_outbox.clone(),
+                canonical_ports.committed_apply.clone(),
+                canonical_ports.read_ports.resource_reads(),
+                canonical_ports.ownership_reads.clone(),
+                canonical_ports.namespace_content_reads.clone(),
+                canonical_ports.topology_reads.clone(),
                 controller_identity.clone(),
             ));
             let gc_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
@@ -1044,16 +1051,23 @@ pub(crate) mod support {
         }
 
         pub(crate) async fn ensure_operational_cluster_metadata(&self) -> anyhow::Result<()> {
-            crate::bootstrap::cluster_meta::ensure_cluster_metadata(self.datastore.as_ref())
+            crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(self.datastore.as_ref())
                 .await?;
             Ok(())
         }
 
         pub(crate) async fn seed_default_rbac(&self) -> anyhow::Result<()> {
-            klights_controllers::rbac_reconcile::reconcile_default_rbac_objects(
-                self.datastore.as_ref(),
-            )
-            .await
+            let db = self.datastore.as_ref();
+            let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+                db.focused_read_store(),
+                db.focused_read_store(),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                    Arc::new(db.clone()),
+                    db.focused_committed_apply(),
+                    db.focused_read_store(),
+                ),
+            );
+            klights_controllers::rbac_reconcile::reconcile_default_rbac_objects(&store).await
         }
 
         pub(crate) async fn register_operational_follower(

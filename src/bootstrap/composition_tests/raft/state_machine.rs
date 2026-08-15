@@ -2,7 +2,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use klights::datastore::DatastoreBackend;
+    use klights_cluster_store::{ClusterMetadataMutation, ClusterMetadataRead};
     use klights_node_datastore::SqliteRaftDurability;
     use klights_replication::activation::CommandCodecV3Activation;
     use klights_replication::state_machine::SqliteRaftStateMachine;
@@ -28,7 +28,7 @@ mod tests {
     }
 
     async fn state_machine(
-        backend: Arc<klights::datastore::sqlite::Datastore>,
+        backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
         supervisor: Arc<TaskSupervisor>,
     ) -> TestRaftStateMachine {
@@ -38,7 +38,7 @@ mod tests {
     }
 
     async fn state_machine_with_activation(
-        backend: Arc<klights::datastore::sqlite::Datastore>,
+        backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
         supervisor: Arc<TaskSupervisor>,
     ) -> (TestRaftStateMachine, Arc<CommandCodecV3Activation>) {
@@ -98,8 +98,8 @@ mod tests {
         .await
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(node_executor));
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -107,13 +107,13 @@ mod tests {
     }
 
     async fn build_sm_with_backend(
-        backend: Arc<klights::datastore::sqlite::Datastore>,
+        backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     ) -> TestRaftStateMachine {
         build_sm_with_backend_and_activation(backend).await.0
     }
 
     async fn build_sm_with_backend_and_activation(
-        backend: Arc<klights::datastore::sqlite::Datastore>,
+        backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     ) -> (TestRaftStateMachine, Arc<CommandCodecV3Activation>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
@@ -127,7 +127,9 @@ mod tests {
         state_machine_with_activation(backend, applied_durability(&node_local), supervisor).await
     }
 
-    async fn seed_snapshot_identity(backend: &dyn DatastoreBackend) {
+    async fn seed_snapshot_identity(
+        backend: &klights_cluster_datastore::sqlite::embedded::Datastore,
+    ) {
         backend
             .set_klights_meta(
                 klights_cluster_store::CLUSTER_ID_META_KEY,
@@ -144,8 +146,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_round_trip_replays_namespaces_and_resources() {
         // Populate a "leader" backend with one namespace + one Pod.
-        let backend_src: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -211,8 +213,8 @@ mod tests {
         );
 
         // Install on a fresh "follower" backend that starts empty.
-        let backend_dst: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -269,17 +271,18 @@ mod tests {
             .unwrap();
         assert!(pod.is_some(), "pod must be replayed into dst backend");
         let restored_metadata = backend_dst
-            .read_cluster_metadata_observation()
+            .focused_recovery_store()
+            .read_cluster_metadata()
             .await
             .expect("read restored cluster identity");
         assert_eq!(
-            restored_metadata.metadata.cluster_id,
+            restored_metadata.metadata().cluster_id,
             "leader-snapshot-cluster"
         );
-        assert_eq!(restored_metadata.metadata.leader_epoch, 7);
+        assert_eq!(restored_metadata.metadata().leader_epoch, 7);
         assert_eq!(
-            restored_metadata.membership,
-            klights_cluster_store::ReplicatedMembershipState::Present(leader_membership),
+            restored_metadata.membership(),
+            &klights_cluster_store::SnapshotMembership::Present(leader_membership),
             "streaming Raft envelope must preserve authoritative membership presence and value"
         );
 
@@ -297,8 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn install_snapshot_restores_empty_watch_history_allocator_exactly() {
-        let backend_src: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -322,8 +325,8 @@ mod tests {
         let mut builder = sm_src.get_snapshot_builder().await;
         let snapshot = builder.build_snapshot().await.unwrap();
 
-        let backend_dst: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -372,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_fence_excludes_post_anchor_resource_and_watch_event() {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
-        let backend = klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         seed_snapshot_identity(&backend).await;
@@ -409,7 +412,8 @@ mod tests {
             .await
             .unwrap();
 
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(backend);
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> =
+            Arc::new(backend);
         let mut state_machine = build_sm_with_backend(backend).await;
         let mut builder = state_machine.get_snapshot_builder().await;
         let pause =
@@ -476,8 +480,8 @@ mod tests {
 
         let snapshot = snapshot_task.await.unwrap().unwrap();
         apply_task.await.unwrap().unwrap();
-        let destination: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let destination: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -514,9 +518,11 @@ mod tests {
         .expect("secure disk snapshot fixture");
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let backend = Arc::new(
-            klights::datastore::sqlite::Datastore::new_persistent_paths(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_persistent_paths(
                 &directory.path().join("cluster.db"),
                 supervisor.clone(),
+                crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+                Arc::new(klights_supervisor::SystemWallClock),
             )
             .await
             .expect("open persistent snapshot fixture"),
@@ -597,8 +603,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_fence_blocks_concurrent_authoritative_install() {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
-        let source_backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let source_backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -611,7 +617,7 @@ mod tests {
             .await
             .unwrap();
 
-        let destination = klights::datastore::sqlite::Datastore::new_in_memory()
+        let destination = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
         seed_snapshot_identity(&destination).await;
@@ -639,7 +645,8 @@ mod tests {
             .replace_replicated_resource_state(entries, 512, Some(512), Some(Vec::new()), None)
             .await
             .unwrap();
-        let destination: Arc<klights::datastore::sqlite::Datastore> = Arc::new(destination);
+        let destination: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> =
+            Arc::new(destination);
         let mut destination_sm = build_sm_with_backend(destination).await;
         let mut builder = destination_sm.get_snapshot_builder().await;
         let pause =
@@ -666,8 +673,8 @@ mod tests {
 
     #[tokio::test]
     async fn install_snapshot_replaces_divergent_watch_replay_floors() {
-        let backend_src: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -716,8 +723,8 @@ mod tests {
         let mut builder = sm_src.get_snapshot_builder().await;
         let snapshot = builder.build_snapshot().await.unwrap();
 
-        let backend_dst: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -771,8 +778,8 @@ mod tests {
     #[tokio::test]
     async fn install_snapshot_replaces_local_state_and_removes_stale_rows() {
         // Leader: namespace snap-ns + ConfigMap `live`.
-        let backend_src: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -813,8 +820,8 @@ mod tests {
 
         // Follower: same namespace + `live`, PLUS a stale `stale` ConfigMap
         // that the leader has already deleted. This is the divergent member.
-        let backend_dst: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -882,7 +889,7 @@ mod tests {
     /// fields (`creationTimestamp`) that can legitimately differ when the same
     /// object is created independently on two backends during test setup.
     async fn resource_identity_fingerprint(
-        backend: &dyn DatastoreBackend,
+        backend: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> Vec<(String, String, Option<String>, String, String, i64)> {
         let full = resource_fingerprint(backend).await;
         full.into_iter()
@@ -902,8 +909,8 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_resources_and_rv_counter() {
-        let backend_src: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -988,8 +995,8 @@ mod tests {
         let snapshot = builder.build_snapshot().await.expect("build snapshot");
         let snapshot_bytes = snapshot.snapshot.into_inner();
 
-        let backend_dst: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1027,8 +1034,8 @@ mod tests {
     /// runs cooperatively at each of the builder's await points.
     #[tokio::test]
     async fn build_snapshot_current_rv_not_behind_commits_applied_during_build() {
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1075,13 +1082,7 @@ mod tests {
         let bg = backend.clone();
         let race = tokio::spawn(async move {
             for i in 0..60u32 {
-                let _snapshot_mutation =
-                    klights::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(
-                        bg.as_ref(),
-                    )
-                    .await
-                    .unwrap()
-                    .expect("SQLite supplies a snapshot mutation fence");
+                let _snapshot_mutation = bg.acquire_snapshot_mutation_fence().await;
                 let _ = bg
                     .create_resource(
                         "v1",
@@ -1108,8 +1109,8 @@ mod tests {
 
         // The snapshot must install cleanly on a fresh follower: a follower
         // applying replace_replicated_resource_state must not reject it.
-        let backend_dst: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1152,7 +1153,7 @@ mod tests {
     }
 
     async fn resource_fingerprint(
-        backend: &dyn DatastoreBackend,
+        backend: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> Vec<(
         String,
         String,
@@ -1227,8 +1228,8 @@ mod tests {
         // `backend.apply_log_apply_commit`. After apply, the cluster.db
         // row produced by the PutResource mutation must be visible to a
         // `get_resource` read on the same backend.
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1300,8 +1301,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_empty_live_commit_preserves_public_resource_version() {
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1337,8 +1338,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_normal_entry_stamps_provisional_rv_after_current_store_rv() {
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );
@@ -1407,8 +1408,8 @@ mod tests {
 
     #[tokio::test]
     async fn follower_selector_list_positive_watch_receives_v1_ready_transition() {
-        let backend: Arc<klights::datastore::sqlite::Datastore> = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+        let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
+            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
                 .await
                 .unwrap(),
         );

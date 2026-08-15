@@ -34,10 +34,13 @@ mod tests {
     }
 
     fn test_persistence(
-        db: crate::datastore::DatastoreHandle,
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::RootPodRepositoryPersistenceParts{
-        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts_from_test_handle(db, clock)
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
+        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts_from_test_ports(
+            clock, ports.applied_outbox, ports.committed_apply, ports.read_ports.resource_reads(), ports.ownership_reads,
+        )
     }
 
     fn pod_delete_target_payload(target_node: Option<&str>) -> Value {
@@ -463,7 +466,7 @@ mod tests {
 
     async fn test_workqueue() -> (
         Arc<PodWorkqueue>,
-        crate::datastore::DatastoreHandle,
+        klights_cluster_datastore::sqlite::embedded::Datastore,
         std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
         test_workqueue_at(Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock)).await
@@ -473,11 +476,13 @@ mod tests {
         clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> (
         Arc<PodWorkqueue>,
-        crate::datastore::DatastoreHandle,
+        klights_cluster_datastore::sqlite::embedded::Datastore,
         std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
-        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let persistence = test_persistence(db.clone(), clock.clone());
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let persistence = test_persistence(&db, clock.clone());
         let store = persistence.store;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -503,12 +508,18 @@ mod tests {
 
     async fn test_non_leader_workqueue() -> (
         Arc<PodWorkqueue>,
-        crate::datastore::DatastoreHandle,
+        klights_cluster_datastore::sqlite::embedded::Datastore,
         std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
-        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
-            db.clone(),
+            ports.applied_outbox,
+            ports.committed_apply,
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
         ));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -536,9 +547,15 @@ mod tests {
     async fn probe_workqueue_for_persistence(
         persistence: impl PodWorkqueuePersistence + 'static,
     ) -> Arc<PodWorkqueue> {
-        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
-            db,
+            ports.applied_outbox,
+            ports.committed_apply,
+            ports.read_ports.resource_reads(),
+            ports.ownership_reads,
         ));
         PodWorkqueue::new(
             store,
@@ -601,9 +618,11 @@ mod tests {
         Arc<klights_supervisor::TaskSupervisor>,
         Arc<Notify>,
     ) {
-        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let persistence = test_persistence(
-            db.clone(),
+            &db,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let config = klights_supervisor::TaskCategoryConfig {
@@ -889,9 +908,11 @@ mod tests {
 
     #[tokio::test]
     async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
-        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let persistence = test_persistence(
-            db.clone(),
+            &db,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let store = persistence.store;
@@ -1072,10 +1093,11 @@ mod tests {
 
     #[tokio::test]
     async fn stale_lease_cannot_delete_unscheduled_pod_after_demote_promote_aba() {
-        let (_datastore, db) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let persistence = test_persistence(
-            db.clone(),
+            &db,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let deletion = persistence.unscheduled_deletion;
@@ -1293,7 +1315,7 @@ mod tests {
             .expect("durable workqueue reminder should wake the actor without a live watch event");
 
         let finalization = test_persistence(
-            db.clone(),
+            &db,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let outcome = finalization
@@ -2037,7 +2059,7 @@ mod tests {
             .expect("running worker must consume durable intent and wake its actor");
 
         let finalization = test_persistence(
-            db.clone(),
+            &db,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let outcome = finalization
@@ -2147,7 +2169,15 @@ mod tests {
             }
         }
         workqueue.set_namespace_termination_sink(Arc::new(DirectNamespaceTermination {
-            store: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db.clone()),
+            store: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
+                db.focused_read_store(),
+                db.focused_read_store(),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                    Arc::new(db.clone()),
+                    db.focused_committed_apply(),
+                    db.focused_read_store(),
+                ),
+            ),
             metrics: SideEffectMetrics::new(),
         }));
         db.create_namespace(
@@ -2318,9 +2348,14 @@ mod tests {
     /// be delayed by the sleep duration.
     #[tokio::test]
     async fn reconciler_exits_on_root_cancellation() {
-        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
-            db.clone(),
+            Arc::new(db.clone()),
+            db.focused_committed_apply(),
+            db.focused_read_store(),
+            db.focused_read_store(),
         ));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

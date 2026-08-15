@@ -1630,42 +1630,6 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     }
 }
 
-#[cfg(test)]
-pub(crate) struct DatastoreBackendLifecyclePort {
-    db: std::sync::Arc<dyn DatastoreBackend>,
-}
-
-#[cfg(test)]
-impl DatastoreBackendLifecyclePort {
-    pub(crate) fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
-        Self { db }
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl klights_cluster_store::BackendLifecycleStore for DatastoreBackendLifecyclePort {
-    async fn acquire_snapshot_exclusive_fence(
-        &self,
-    ) -> klights_cluster_store::ClusterStoreResult<Option<SnapshotExclusiveFence>> {
-        DatastoreBackend::acquire_snapshot_exclusive_fence(self.db.as_ref())
-            .await
-            .map_err(root_cluster_store_error)
-    }
-
-    async fn acquire_snapshot_mutation_fence(
-        &self,
-    ) -> klights_cluster_store::ClusterStoreResult<Option<SnapshotMutationFence>> {
-        DatastoreBackend::acquire_snapshot_mutation_fence(self.db.as_ref())
-            .await
-            .map_err(root_cluster_store_error)
-    }
-
-    fn close(&self) {
-        DatastoreBackend::close(self.db.as_ref());
-    }
-}
-
 pub(crate) fn root_cluster_store_error(
     error: anyhow::Error,
 ) -> klights_cluster_store::ClusterStoreError {

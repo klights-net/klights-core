@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};

@@ -299,8 +299,11 @@ async fn run_status_only_rv_advance_main_case(name: &str) -> (i64, i64, serde_js
             namespace: Some("default".into()),
             name: name.into(),
             data: proposed,
-            expected_rv: created.resource_version,
-            preconditions: ResourcePreconditions::from_resource(&created),
+            expected_rv: status_advanced.resource_version,
+            preconditions: ResourcePreconditions::uid_and_resource_version(
+                created.uid.clone(),
+                status_advanced.resource_version,
+            ),
             preserve_status: true,
         },
     )

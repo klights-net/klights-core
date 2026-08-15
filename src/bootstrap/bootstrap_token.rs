@@ -121,6 +121,56 @@ impl BootstrapTokenStore for dyn DatastoreBackend + '_ {
     }
 }
 
+/// The canonical SQLite store is consumed through this existing narrow auth
+/// contract during the transitional backend-removal packets.  It deliberately
+/// does not implement the legacy broad backend trait.
+#[async_trait::async_trait]
+impl BootstrapTokenStore for klights_cluster_datastore::sqlite::embedded::Datastore {
+    async fn get_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+    ) -> Result<Option<Resource>> {
+        self.get_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            scope.secret_name(),
+        )
+        .await
+    }
+
+    async fn create_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+        data: serde_json::Value,
+    ) -> Result<Resource> {
+        self.create_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            scope.secret_name(),
+            data,
+        )
+        .await
+    }
+
+    async fn update_bootstrap_token_secret(
+        &self,
+        resource: &Resource,
+        data: serde_json::Value,
+    ) -> Result<Resource> {
+        self.update_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            &resource.name,
+            data,
+            resource.resource_version,
+        )
+        .await
+    }
+}
+
 pub(crate) fn generate_random_bootstrap_token() -> String {
     use rand_core::RngCore;
 
@@ -133,8 +183,6 @@ pub(crate) fn generate_random_bootstrap_token() -> String {
 
 pub(crate) struct DatastoreBootstrapTokenValidation {
     resource_reads: Option<std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>>,
-    #[cfg(test)]
-    db: Option<crate::datastore::DatastoreHandle>,
 }
 
 impl DatastoreBootstrapTokenValidation {
@@ -143,17 +191,14 @@ impl DatastoreBootstrapTokenValidation {
     ) -> Self {
         Self {
             resource_reads: Some(resource_reads),
-            #[cfg(test)]
-            db: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(db: crate::datastore::DatastoreHandle) -> Self {
-        Self {
-            resource_reads: None,
-            db: Some(db),
-        }
+    pub(crate) fn new_for_test(
+        db: &klights_cluster_datastore::sqlite::embedded::Datastore,
+    ) -> Self {
+        Self::new(db.focused_read_store())
     }
 }
 
@@ -164,17 +209,6 @@ impl klights_leader_api::BootstrapTokenValidation for DatastoreBootstrapTokenVal
     ) -> klights_leader_api::BootstrapTokenValidationFuture<'_> {
         Box::pin(async move {
             let (token, scope) = request.into_parts();
-            #[cfg(test)]
-            if let Some(db) = &self.db {
-                return validate_bootstrap_token_for_scope(db.as_ref(), &token, scope)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| {
-                        klights_leader_api::BootstrapTokenValidationError::rejected(
-                            error.to_string(),
-                        )
-                    });
-            }
             validate_bootstrap_token_for_scope_with_reads(
                 self.resource_reads
                     .as_ref()
@@ -332,51 +366,13 @@ async fn write_scoped_bootstrap_token_secret(
 }
 
 #[cfg(test)]
-pub(crate) async fn create_scoped_bootstrap_token_secret_for_test(
-    db: &dyn DatastoreBackend,
-    scope: BootstrapTokenScope,
-    token: &str,
-) -> Result<()> {
-    write_scoped_bootstrap_token_secret(db, scope, token, BOOTSTRAP_TOKEN_TTL).await
-}
-
-#[cfg(test)]
 pub(crate) async fn create_scoped_bootstrap_token_secret_with_ttl_for_test(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     scope: BootstrapTokenScope,
     token: &str,
     ttl: std::time::Duration,
 ) -> Result<()> {
     write_scoped_bootstrap_token_secret(db, scope, token, ttl).await
-}
-
-#[cfg(test)]
-pub(crate) async fn validate_bootstrap_token_for_scope(
-    db: &dyn DatastoreBackend,
-    token: &str,
-    scope: BootstrapTokenScope,
-) -> Result<BootstrapTokenIdentity> {
-    let _ = bootstrap_token::parse_bootstrap_token(token)?;
-    let secret = read_secret(db, scope).await?;
-    if let Some(secret) = &secret
-        && bootstrap_token::bootstrap_token_matches(secret.data.as_ref(), token).unwrap_or(false)
-    {
-        return validate_resource(secret, token, Some(scope));
-    }
-
-    let other_scope = scope.other();
-    if let Some(other_secret) = read_secret(db, other_scope).await?
-        && bootstrap_token::bootstrap_token_matches(other_secret.data.as_ref(), token)
-            .unwrap_or(false)
-    {
-        validate_resource(&other_secret, token, Some(other_scope))?;
-        return Err(anyhow!("token is not a {}", scope.error_name()));
-    }
-
-    match secret {
-        Some(secret) => validate_resource(&secret, token, None),
-        None => Err(anyhow!("{} not found", scope.error_name())),
-    }
 }
 
 pub(crate) async fn rotate_bootstrap_token_secret_for_get(
@@ -457,12 +453,30 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use klights_auth::bootstrap_token::CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME;
     use serde_json::json;
+    use std::sync::Arc;
+
+    async fn canonical_sqlite_fixture() -> klights_cluster_datastore::sqlite::embedded::Datastore {
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let executor = klights_cluster_datastore::sqlite::open_in_memory(
+            supervisor,
+            "sqlite:p10-3a-bootstrap-token-tests",
+        )
+        .await
+        .unwrap();
+        klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor(
+            executor,
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+            Arc::new(klights_supervisor::SystemWallClock),
+        )
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn datastore_ensure_reuses_live_tokens_and_keeps_scopes_distinct() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap();
+        let db = canonical_sqlite_fixture().await;
         let first_worker = ensure_worker_bootstrap_token(&db).await.unwrap();
         let first_controlplane = ensure_controlplane_bootstrap_token(&db).await.unwrap();
         assert_eq!(
@@ -474,11 +488,15 @@ mod tests {
             first_controlplane
         );
         assert_ne!(first_worker, first_controlplane);
-        validate_bootstrap_token_for_scope(&db, &first_worker, BootstrapTokenScope::Worker)
-            .await
-            .unwrap();
-        validate_bootstrap_token_for_scope(
-            &db,
+        validate_bootstrap_token_for_scope_with_reads(
+            db.focused_read_store().as_ref(),
+            &first_worker,
+            BootstrapTokenScope::Worker,
+        )
+        .await
+        .unwrap();
+        validate_bootstrap_token_for_scope_with_reads(
+            db.focused_read_store().as_ref(),
             &first_controlplane,
             BootstrapTokenScope::Controlplane,
         )
@@ -488,10 +506,9 @@ mod tests {
 
     #[tokio::test]
     async fn datastore_ensure_migrates_legacy_split_fields() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap();
-        db.create_resource(
+        let db = canonical_sqlite_fixture().await;
+        klights_cluster_store::ClusterResourceMutation::create_resource(
+            &db,
             "v1",
             "Secret",
             Some(BOOTSTRAP_TOKEN_NAMESPACE),
@@ -533,9 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn datastore_get_rotates_near_expiry_and_preserves_fresh_token() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap();
+        let db = canonical_sqlite_fixture().await;
         create_scoped_bootstrap_token_secret_with_ttl_for_test(
             &db,
             BootstrapTokenScope::Worker,

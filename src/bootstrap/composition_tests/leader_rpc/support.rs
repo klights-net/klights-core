@@ -7,10 +7,33 @@ pub(crate) use harness::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use klights::datastore::DatastoreHandle;
 use klights_replication::ReplicationService;
 
+pub(crate) type SqliteTestStore = Arc<klights_cluster_datastore::sqlite::embedded::Datastore>;
+
 pub(crate) type GrpcReplicationServer = klights_leader_rpc::server::GrpcReplicationServer;
+
+/// Root-composed SQLite fixture for leader-RPC tests. The canonical embedded
+/// store receives the root watch sink, so positioned watches observe committed
+/// changes without reintroducing the deleted root SQLite wrapper.
+pub(crate) async fn canonical_sqlite_fixture()
+-> anyhow::Result<klights_cluster_datastore::sqlite::embedded::Datastore> {
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let executor = klights_cluster_datastore::sqlite::open_in_memory(
+        supervisor,
+        "sqlite:leader-rpc-canonical-fixture",
+    )
+    .await?;
+    klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+        executor,
+        crate::bootstrap::watch_commit_wiring::new_sink(),
+        crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+        Arc::new(klights_supervisor::SystemWallClock),
+    )
+    .await
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OutboxPayload {
@@ -45,19 +68,19 @@ pub(crate) enum BootstrapTokenScope {
 }
 
 pub(crate) async fn ensure_cluster_metadata(
-    db: &dyn klights::datastore::DatastoreBackend,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
 ) -> anyhow::Result<()> {
     IntegrationLeaderRpcComposition::ensure_cluster_metadata_for(db).await
 }
 
 pub(crate) async fn ensure_worker_bootstrap_token(
-    db: &dyn klights::datastore::DatastoreBackend,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
 ) -> anyhow::Result<String> {
     IntegrationLeaderRpcComposition::ensure_worker_bootstrap_token_for(db).await
 }
 
 pub(crate) async fn create_scoped_bootstrap_token_secret_for_test(
-    db: &dyn klights::datastore::DatastoreBackend,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     scope: BootstrapTokenScope,
     token: &str,
 ) -> anyhow::Result<()> {
@@ -70,13 +93,13 @@ pub(crate) async fn create_scoped_bootstrap_token_secret_for_test(
 }
 
 pub(crate) fn sqlite_passive_read_ports(
-    db: &klights::datastore::sqlite::Datastore,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
 ) -> IntegrationPassiveReadPorts {
     IntegrationLeaderRpcComposition::passive_reads_for(db)
 }
 
 pub(crate) fn controller_dispatcher_for_test(
-    db: &klights::datastore::sqlite::Datastore,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
 ) -> Arc<klights_controllers::ControllerDispatcher> {
     IntegrationLeaderRpcComposition::controller_dispatcher(db)
 }
@@ -91,7 +114,7 @@ pub(crate) fn grpc_runtime(service: Arc<ReplicationService>) -> IntegrationLeade
 
 pub(crate) fn positioned_watch(
     passive_reads: &IntegrationPassiveReadPorts,
-    db: DatastoreHandle,
+    db: SqliteTestStore,
 ) -> klights_watch::PositionedWatchService {
     IntegrationLeaderRpcComposition::positioned_watch(passive_reads, db)
 }
@@ -102,29 +125,40 @@ pub(crate) fn pod_log_follow_watch(
     IntegrationLeaderRpcComposition::pod_log_follow_watch(positioned_watch)
 }
 
-pub(crate) async fn seed_namespace(db: &dyn klights::datastore::DatastoreBackend, name: &str) {
+pub(crate) async fn seed_namespace(
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
+    name: &str,
+) {
     IntegrationLeaderRpcComposition::seed_namespace(db, name).await;
 }
 
 pub(crate) fn broadcast_watch_event(
-    db: &dyn klights::datastore::DatastoreBackend,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     event: klights_watch::WatchEvent,
 ) {
     IntegrationLeaderRpcComposition::broadcast_watch_event(db, event);
 }
 
 pub(crate) fn local_node_ports(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     node_name: String,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> IntegrationLeaderRpcNodePorts {
-    IntegrationLeaderRpcComposition::local_node_ports(db, node_name)
+    IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+        .local_node_ports(node_name)
 }
 
 pub(crate) fn local_network_ports(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     node_name: String,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> IntegrationLeaderRpcLocalNetworkPorts {
-    IntegrationLeaderRpcComposition::local_network_ports(db, node_name)
+    IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+        .local_network_ports(node_name)
 }
 
 pub(crate) fn focused_dataplane(
@@ -134,23 +168,27 @@ pub(crate) fn focused_dataplane(
 }
 
 pub(crate) fn replication_service(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> ReplicationService {
-    IntegrationLeaderRpcComposition::new(db).replication_service(supervisor)
+    IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+        .replication_service(supervisor)
 }
 
 pub(crate) fn replication_service_with_progress(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     follower_progress: Arc<klights_replication::FollowerProgressHub>,
     current_rv: i64,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> ReplicationService {
-    IntegrationLeaderRpcComposition::new(db).replication_service_with_progress(
-        supervisor,
-        follower_progress,
-        current_rv,
-    )
+    IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+        .replication_service_with_progress(supervisor, follower_progress, current_rv)
 }
 
 pub(crate) async fn serve_tls_test_app(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -158,63 +196,87 @@ pub(crate) async fn serve_tls_test_app(app: axum::Router) -> (String, tokio::tas
 }
 
 pub(crate) trait GrpcReplicationServerTestExt: Sized {
-    fn new(service: Arc<ReplicationService>, db: DatastoreHandle) -> Self;
+    fn new(
+        service: Arc<ReplicationService>,
+        db: SqliteTestStore,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ) -> Self;
     fn new_with_passive_reads(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
+        db: SqliteTestStore,
         passive_reads: IntegrationPassiveReadPorts,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self;
     fn new_with_controller_dispatcher(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
+        db: SqliteTestStore,
         controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self;
     fn new_with_node_lease_tracker(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
+        db: SqliteTestStore,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self;
     fn with_namespace(self, data_root: &str) -> Self;
     fn with_leader_gate(self, is_leader_rx: tokio::sync::watch::Receiver<bool>) -> Self;
 }
 
 impl GrpcReplicationServerTestExt for GrpcReplicationServer {
-    fn new(service: Arc<ReplicationService>, db: DatastoreHandle) -> Self {
-        IntegrationLeaderRpcComposition::new(db).server(service, None, None, None)
+    fn new(
+        service: Arc<ReplicationService>,
+        db: SqliteTestStore,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ) -> Self {
+        IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+            .server(service, None, None, None)
     }
 
     fn new_with_passive_reads(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
+        db: SqliteTestStore,
         passive_reads: IntegrationPassiveReadPorts,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self {
-        IntegrationLeaderRpcComposition::new(db).server(service, Some(passive_reads), None, None)
+        IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+            .server(service, Some(passive_reads), None, None)
     }
 
     fn new_with_controller_dispatcher(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
+        db: SqliteTestStore,
         controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self {
-        IntegrationLeaderRpcComposition::new(db).server(
-            service,
-            None,
-            Some(controller_dispatcher),
-            None,
-        )
+        IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+            .server(service, None, Some(controller_dispatcher), None)
     }
 
     fn new_with_node_lease_tracker(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
+        db: SqliteTestStore,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
+        applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self {
-        IntegrationLeaderRpcComposition::new(db).server(
-            service,
-            None,
-            None,
-            Some(node_lease_tracker),
-        )
+        IntegrationLeaderRpcComposition::new(db, applied_outbox, committed_apply, resource_reads)
+            .server(service, None, None, Some(node_lease_tracker))
     }
 
     fn with_namespace(self, data_root: &str) -> Self {
@@ -235,7 +297,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
 pub(crate) fn mount_service_full(
     app: axum::Router,
     service: Arc<ReplicationService>,
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter>>,
@@ -248,7 +310,7 @@ pub(crate) fn mount_service_full(
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
-    IntegrationLeaderRpcComposition::new(db).mount_service_full(
+    IntegrationLeaderRpcComposition::from_sqlite(db).mount_service_full(
         app,
         service,
         None,
@@ -269,11 +331,11 @@ pub(crate) fn mount_service_full(
 pub(crate) fn mount_service_with_passive_reads(
     app: axum::Router,
     service: Arc<ReplicationService>,
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     passive_reads: IntegrationPassiveReadPorts,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
-    IntegrationLeaderRpcComposition::new(db).mount_service_full(
+    IntegrationLeaderRpcComposition::from_sqlite(db).mount_service_full(
         app,
         service,
         Some(passive_reads),
@@ -294,12 +356,12 @@ pub(crate) fn mount_service_with_passive_reads(
 pub(crate) fn mount_service_with_passive_reads_and_leader_gate(
     app: axum::Router,
     service: Arc<ReplicationService>,
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     passive_reads: IntegrationPassiveReadPorts,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
-    IntegrationLeaderRpcComposition::new(db).mount_service_full(
+    IntegrationLeaderRpcComposition::from_sqlite(db).mount_service_full(
         app,
         service,
         Some(passive_reads),
@@ -320,7 +382,7 @@ pub(crate) fn mount_service_with_passive_reads_and_leader_gate(
 pub(crate) fn mount_service(
     app: axum::Router,
     service: Arc<ReplicationService>,
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
     mount_service_full(
@@ -344,7 +406,7 @@ pub(crate) fn mount_service(
 pub(crate) fn mount_service_with_controller_dispatcher(
     app: axum::Router,
     service: Arc<ReplicationService>,
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use std::sync::Mutex;
 
-use klights::datastore::backend::{DatastoreBackend, DatastoreHandle};
+use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore as DatastoreHandle;
 
 use klights_cluster_core::ResourcePreconditions;
 
@@ -69,7 +69,7 @@ fn valid_join() -> JoinRequest {
 }
 
 async fn create_scoped_token_for_test(
-    db: &dyn DatastoreBackend,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     token: &str,
     scope: crate::bootstrap::composition_tests::leader_rpc::support::BootstrapTokenScope,
 ) {
@@ -82,6 +82,9 @@ async fn create_scoped_token_for_test(
 
 async fn grpc_test_server_with_signing_ca(
     db: DatastoreHandle,
+    applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     namespace: &str,
 ) -> super::support::GrpcReplicationServer {
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
@@ -104,9 +107,19 @@ async fn grpc_test_server_with_signing_ca(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            applied_outbox.clone(),
+            committed_apply.clone(),
+            resource_reads.clone(),
         ),
     );
-    super::support::GrpcReplicationServer::new(service, db).with_namespace(namespace)
+    super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        applied_outbox,
+        committed_apply,
+        resource_reads,
+    )
+    .with_namespace(namespace)
 }
 
 async fn grpc_test_server(
@@ -183,6 +196,9 @@ async fn grpc_test_server_full_with_node_cert_and_current_rv(
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger> = db.clone();
+    let committed_apply = db.focused_committed_apply();
+    let resource_reads = db.focused_read_store();
     let follower_progress = Arc::new(klights_replication::FollowerProgressHub::new(0));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service_with_progress(
@@ -190,11 +206,17 @@ async fn grpc_test_server_full_with_node_cert_and_current_rv(
             supervisor,
             follower_progress.clone(),
             current_rv,
+            applied_outbox.clone(),
+            committed_apply.clone(),
+            resource_reads.clone(),
         ),
     );
     let node_ports = crate::bootstrap::composition_tests::leader_rpc::support::local_node_ports(
         db.clone(),
         "test-leader".to_string(),
+        applied_outbox,
+        committed_apply,
+        resource_reads,
     );
     let app = super::support::mount_service_full(
         axum::Router::new(),
@@ -260,7 +282,7 @@ async fn grpc_test_server_full_with_node_cert_and_current_rv(
 /// require steady-state auth (e.g. `watch_resources`) accept the request;
 /// `None` leaves auth to fail (the decode-size check fires first regardless).
 async fn grpc_test_server_with_policy(
-    db: klights::datastore::sqlite::Datastore,
+    db: klights_cluster_datastore::sqlite::embedded::Datastore,
     policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
     injected_node_cert: Option<&str>,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -270,17 +292,27 @@ async fn grpc_test_server_with_policy(
         .unwrap();
     let passive_reads =
         crate::bootstrap::composition_tests::leader_rpc::support::sqlite_passive_read_ports(&db);
+    let canonical = db.clone();
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc =
-        super::support::GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
-            .with_watch_heartbeat_interval(policy.watch_heartbeat_interval);
+    let grpc = super::support::GrpcReplicationServer::new_with_passive_reads(
+        service,
+        db.clone(),
+        passive_reads,
+        db.clone(),
+        db.focused_committed_apply(),
+        db.focused_read_store(),
+    )
+    .with_watch_heartbeat_interval(policy.watch_heartbeat_interval);
     let app = super::support::mount_configured_test_service(axum::Router::new(), grpc, policy);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -329,7 +361,7 @@ async fn grpc_test_server_with_policy(
 
 #[tokio::test]
 async fn server_rejects_request_over_policy_message_limit() {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     let policy = klights_leader_rpc::transport_policy::GrpcTransportPolicy {
@@ -393,7 +425,7 @@ async fn server_rejects_request_over_policy_message_limit() {
 
 #[tokio::test]
 async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_namespace(
@@ -453,7 +485,7 @@ async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
 
 #[tokio::test]
 async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatching_traffic() {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_namespace("hb", serde_json::json!({"metadata": {"name": "hb"}}))
@@ -542,7 +574,7 @@ async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatchi
 
 #[tokio::test]
 async fn watch_stream_replays_lower_matching_pod_on_nonmatching_high_rv_signal() {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(&db)
@@ -672,14 +704,14 @@ async fn grpc_leader_server(
     super::support::GrpcReplicationServer,
     tokio::sync::watch::Sender<bool>,
 ) {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     grpc_leader_server_with_db(db, is_leader).await
 }
 
 async fn grpc_leader_server_with_db(
-    db: klights::datastore::sqlite::Datastore,
+    db: klights_cluster_datastore::sqlite::embedded::Datastore,
     is_leader: bool,
 ) -> (
     super::support::GrpcReplicationServer,
@@ -690,18 +722,28 @@ async fn grpc_leader_server_with_db(
         .unwrap();
     let passive_reads =
         crate::bootstrap::composition_tests::leader_rpc::support::sqlite_passive_read_ports(&db);
+    let canonical = db.clone();
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let (leader_tx, is_leader_rx) = tokio::sync::watch::channel(is_leader);
-    let grpc =
-        super::support::GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
-            .with_leader_gate(is_leader_rx);
+    let grpc = super::support::GrpcReplicationServer::new_with_passive_reads(
+        service,
+        db.clone(),
+        passive_reads,
+        db.clone(),
+        db.focused_committed_apply(),
+        db.focused_read_store(),
+    )
+    .with_leader_gate(is_leader_rx);
     (grpc, leader_tx)
 }
 
@@ -743,8 +785,8 @@ fn configmap(name: &str) -> serde_json::Value {
     })
 }
 
-async fn configmap_replay_db() -> (klights::datastore::sqlite::Datastore, i64) {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+async fn configmap_replay_db() -> (klights_cluster_datastore::sqlite::embedded::Datastore, i64) {
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(&db)
@@ -784,7 +826,7 @@ async fn configmap_replay_db() -> (klights::datastore::sqlite::Datastore, i64) {
 }
 
 async fn register_grpc_watch_scope_crd(
-    db: &dyn DatastoreBackend,
+    db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     group: &str,
     kind: &str,
     plural: &str,
@@ -830,7 +872,7 @@ fn custom_resource_watch_request(
 async fn grpc_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
     use futures::StreamExt;
 
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     register_grpc_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
@@ -873,7 +915,7 @@ async fn grpc_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
 async fn grpc_watch_resolves_cluster_scoped_crd_delivery() {
     use futures::StreamExt;
 
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
     register_grpc_watch_scope_crd(
@@ -1484,19 +1526,29 @@ fn request_with_admin_cert<T>(message: T) -> tonic::Request<T> {
 // ── CRIT-1: raft RPC authentication ──
 
 async fn raft_test_server() -> super::support::GrpcReplicationServer {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    super::support::GrpcReplicationServer::new(service, db)
+    super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    )
 }
 
 fn test_raft_receiver_admission() -> Vec<u8> {
@@ -1637,11 +1689,12 @@ async fn submit_resource_command_accepts_controlplane_create() {
 
 #[tokio::test]
 async fn raft_append_entries_rejects_bootstrap_token() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -1656,9 +1709,18 @@ async fn raft_append_entries_rejects_bootstrap_token() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
 
     let status = grpc
         .raft_append_entries(request_with_join_token(
@@ -1828,9 +1890,10 @@ async fn raft_install_snapshot_rejects_admin_certificate() {
 
 #[tokio::test]
 async fn renew_node_lease_rejects_mismatched_node() {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
+    let canonical = db.clone();
     let db: DatastoreHandle = Arc::new(db);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
@@ -1842,12 +1905,18 @@ async fn renew_node_lease_rejects_mismatched_node() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let grpc = super::support::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db.clone(),
         tracker.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     );
 
     // worker-1's cert tries to renew worker-2's lease.
@@ -1869,11 +1938,12 @@ async fn renew_node_lease_rejects_mismatched_node() {
 
 #[tokio::test]
 async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutation() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::Utc::now(),
     ));
@@ -1882,12 +1952,18 @@ async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutat
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let grpc = super::support::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db,
         tracker.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     );
 
     for duration in [0, -1] {
@@ -1909,11 +1985,12 @@ async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutat
 
 #[tokio::test]
 async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_order() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let created = db
         .create_resource(
             "v1",
@@ -1933,9 +2010,18 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db.clone());
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let command = StorageCommand::PatchResource {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
@@ -2071,11 +2157,12 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
 
 #[tokio::test]
 async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let created = db
         .create_resource(
             "v1",
@@ -2096,9 +2183,18 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db.clone());
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
@@ -2148,11 +2244,12 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
 
 #[tokio::test]
 async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let created = db
         .create_resource(
             "v1",
@@ -2188,9 +2285,18 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db.clone());
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let payload =
         crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
             StorageCommand::UpdateStatus {
@@ -2261,19 +2367,29 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
 
 #[tokio::test]
 async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db.clone());
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let command = StorageCommand::UpdateNodeDataplane {
         node_name: "worker-1".to_string(),
         mode: "root".to_string(),
@@ -2314,21 +2430,31 @@ async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
 
 #[tokio::test]
 async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
-    let follower = super::support::GrpcReplicationServer::new(service.clone(), db.clone())
-        .with_leader_gate(follower_rx);
+    let follower = super::support::GrpcReplicationServer::new(
+        service.clone(),
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    )
+    .with_leader_gate(follower_rx);
 
     let status = follower
         .list_pod_cleanup_intents_for_node(request_with_node_client_cert(
@@ -2342,7 +2468,13 @@ async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert_eq!(status.message(), "not current leader authority");
 
-    let leader = super::support::GrpcReplicationServer::new(service, db);
+    let leader = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let status = leader
         .list_pod_cleanup_intents_for_node(request_with_node_client_cert(
             klights_internal_protobuf::ListPodCleanupIntentsForNodeRequest {
@@ -2357,21 +2489,31 @@ async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
 
 #[tokio::test]
 async fn cleanup_intent_ack_requires_current_leader_before_mutation() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
-    let follower =
-        super::support::GrpcReplicationServer::new(service, db).with_leader_gate(follower_rx);
+    let follower = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    )
+    .with_leader_gate(follower_rx);
 
     let status = follower
         .delete_pod_cleanup_intent(request_with_node_client_cert(
@@ -2512,9 +2654,10 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
     let wall_time = chrono::DateTime::parse_from_rfc3339("2040-02-03T04:05:06Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
+    let canonical = db.clone();
     let db: DatastoreHandle = Arc::new(db);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         wall_time,
@@ -2524,12 +2667,18 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let grpc = super::support::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db.clone(),
         tracker.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     )
     .with_wall_clock(Arc::new(move || wall_time));
 
@@ -2556,18 +2705,28 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
 
 #[tokio::test]
 async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
+    let canonical = db.clone();
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db.clone());
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let command = StorageCommand::UpdateNodeDataplane {
         node_name: "worker-2".to_string(),
         mode: "root".to_string(),
@@ -2613,10 +2772,11 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
 #[tokio::test]
 async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2627,9 +2787,18 @@ async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
 
     let response = grpc
         .get_metadata(request_with_node_client_cert(
@@ -2646,19 +2815,29 @@ async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
 
 #[tokio::test]
 async fn observe_peer_endpoint_records_authenticated_node_remote_ip() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service.clone(), db);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service.clone(),
+        db,
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
     let mut request = request_with_node_client_cert(
         klights_internal_protobuf::ObservePeerEndpointRequest {
             node_name: "leader-a".to_string(),
@@ -2696,9 +2875,10 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
         }
     }
 
-    let db = klights::datastore::sqlite::Datastore::new_in_memory()
+    let db = crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
         .await
         .unwrap();
+    let canonical = db.clone();
     let addresses =
         klights_kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
     let profile = klights_kubelet::node_config::NodeRegistrationProfile::new(
@@ -2710,6 +2890,9 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
     let composition =
         crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::new(
             Arc::new(db.clone()),
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         );
     composition
         .register_node_at_addresses("leader-a", &profile, None, &addresses)
@@ -2719,6 +2902,9 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
     let local_ports = crate::bootstrap::composition_tests::leader_rpc::support::local_network_ports(
         Arc::new(db.clone()),
         "leader-a".to_string(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     );
     let query = local_ports.resource_query();
     let node_local =
@@ -2780,10 +2966,11 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
 #[tokio::test]
 async fn node_effect_join_external_ip_is_atomic_with_metadata_cas_without_redundant_status() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     let created = db
         .create_resource(
             "v1",
@@ -2817,6 +3004,9 @@ async fn node_effect_join_external_ip_is_atomic_with_metadata_cas_without_redund
     let local = crate::bootstrap::composition_tests::leader_rpc::support::local_network_ports(
         db.clone(),
         "leader-a".to_string(),
+        canonical.clone(),
+        canonical.focused_committed_apply(),
+        canonical.focused_read_store(),
     );
     let query = local.resource_query();
     let status = Arc::new(RecordingNodeLifecycleStatus::default());
@@ -2876,10 +3066,11 @@ async fn node_effect_join_external_ip_is_atomic_with_metadata_cas_without_redund
 #[tokio::test]
 async fn get_metadata_rpc_rejects_missing_node_client_certificate() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2888,9 +3079,18 @@ async fn get_metadata_rpc_rejects_missing_node_client_certificate() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
 
     let status = grpc
         .get_metadata(tonic::Request::new(MetadataRequest {}))
@@ -2902,10 +3102,11 @@ async fn get_metadata_rpc_rejects_missing_node_client_certificate() {
 #[tokio::test]
 async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2920,9 +3121,18 @@ async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
 
     let status = grpc
         .get_metadata(request_with_join_token(MetadataRequest {}, &token))
@@ -2934,10 +3144,11 @@ async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
 #[tokio::test]
 async fn get_metadata_rpc_accepts_node_client_cert_without_bootstrap_token() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2946,9 +3157,18 @@ async fn get_metadata_rpc_accepts_node_client_cert_without_bootstrap_token() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
-    let grpc = super::support::GrpcReplicationServer::new(service, db);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    );
 
     let response = grpc
         .get_metadata(request_with_node_client_cert(
@@ -2965,10 +3185,11 @@ async fn get_metadata_rpc_accepts_node_client_cert_without_bootstrap_token() {
 #[tokio::test]
 async fn renew_node_lease_rpc_rejects_bootstrap_token_on_leader() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2988,12 +3209,18 @@ async fn renew_node_lease_rpc_rejects_bootstrap_token_on_leader() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let grpc = super::support::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db,
         tracker.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     );
 
     let status = grpc
@@ -3017,10 +3244,11 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
         .unwrap()
         .with_timezone(&chrono::Utc);
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3033,12 +3261,18 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let grpc = super::support::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db.clone(),
         tracker.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     )
     .with_wall_clock(Arc::new(move || wall_time));
 
@@ -3079,10 +3313,11 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
 #[tokio::test]
 async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3096,6 +3331,9 @@ async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(false);
@@ -3103,6 +3341,9 @@ async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
         service,
         db,
         tracker.clone(),
+        canonical.clone(),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
     )
     .with_leader_gate(is_leader_rx);
 
@@ -3130,10 +3371,11 @@ async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
 async fn sign_controlplane_csr_sends_private_key_material_to_cp_and_replica() {
     for node_name in ["mn-controlplane2", "mn-replica"] {
         let db = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
+            crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
+        let canonical = db.clone();
         create_scoped_token_for_test(
             db.as_ref(),
             "123456.fedcba9876543210",
@@ -3142,7 +3384,14 @@ async fn sign_controlplane_csr_sends_private_key_material_to_cp_and_replica() {
         .await;
         let data_root = tempfile::tempdir().unwrap();
         let namespace = data_root.path().to_string_lossy().to_string();
-        let grpc = grpc_test_server_with_signing_ca(db, &namespace).await;
+        let grpc = grpc_test_server_with_signing_ca(
+            db,
+            canonical.clone(),
+            canonical.focused_committed_apply(),
+            canonical.focused_read_store(),
+            &namespace,
+        )
+        .await;
         let (_, csr_pem) = klights_auth::cert::generate_server_csr(
             "10.43.0.0/16",
             "10.50.4.0/24",
@@ -3201,10 +3450,11 @@ async fn sign_controlplane_csr_rejects_worker_node_cert_without_controlplane_tok
     // handler, so membership cannot be confirmed and the request fails
     // closed.
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     // Only a *worker*-scoped token exists; the supplied token can never be a
     // valid controlplane join token.
     create_scoped_token_for_test(
@@ -3215,7 +3465,14 @@ async fn sign_controlplane_csr_rejects_worker_node_cert_without_controlplane_tok
     .await;
     let data_root = tempfile::tempdir().unwrap();
     let namespace = data_root.path().to_string_lossy().to_string();
-    let grpc = grpc_test_server_with_signing_ca(db, &namespace).await;
+    let grpc = grpc_test_server_with_signing_ca(
+        db,
+        canonical.clone(),
+        canonical.focused_committed_apply(),
+        canonical.focused_read_store(),
+        &namespace,
+    )
+    .await;
     let (_, csr_pem) = klights_auth::cert::generate_server_csr(
         "10.43.0.0/16",
         "10.50.4.0/24",
@@ -3250,11 +3507,12 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
     // a raft member. It must NOT be admitted as a voter/learner — otherwise
     // it would receive the full replicated cluster.db (all Secrets) and
     // quorum influence.
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3263,12 +3521,21 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(true);
-    let grpc = super::support::GrpcReplicationServer::new(service, db)
-        .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
-        .with_leader_gate(is_leader_rx);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    )
+    .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
+    .with_leader_gate(is_leader_rx);
 
     let request = request_with_node_client_cert(
         klights_internal_protobuf::JoinAsControlplaneRequest {
@@ -3304,11 +3571,12 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
 async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() {
     // First join: caller is not yet a member (NonMember handler) but presents
     // a valid controlplane bootstrap token → admitted.
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let canonical = sqlite.clone();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3323,12 +3591,21 @@ async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() 
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(true);
-    let grpc = super::support::GrpcReplicationServer::new(service, db)
-        .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
-        .with_leader_gate(is_leader_rx);
+    let grpc = super::support::GrpcReplicationServer::new(
+        service,
+        db.clone(),
+        Arc::new(canonical.clone()),
+        canonical.clone().focused_committed_apply(),
+        canonical.clone().focused_read_store(),
+    )
+    .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
+    .with_leader_gate(is_leader_rx);
 
     let join_request = klights_internal_protobuf::JoinAsControlplaneRequest {
         node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
@@ -3398,10 +3675,11 @@ fn raft_node_id_for_node_name_in_test(node_name: &str) -> u64 {
 #[tokio::test]
 async fn mount_service_accepts_replication_router_prefix() {
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3410,6 +3688,9 @@ async fn mount_service_accepts_replication_router_prefix() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let _router = super::support::mount_service(
@@ -3427,10 +3708,11 @@ async fn mounted_router_does_not_send_plain_rest_unknown_paths_to_grpc() {
     use tower::ServiceExt;
 
     let db = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap(),
     );
+    let canonical = db.clone();
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3439,6 +3721,9 @@ async fn mounted_router_does_not_send_plain_rest_unknown_paths_to_grpc() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            canonical.clone(),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let app = super::support::mount_service(
@@ -3469,11 +3754,11 @@ async fn mounted_router_does_not_send_plain_rest_unknown_paths_to_grpc() {
 
 #[tokio::test]
 async fn mounted_router_serves_grpc_get_metadata() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3496,11 +3781,11 @@ async fn mounted_router_serves_grpc_get_metadata() {
 
 #[tokio::test]
 async fn mounted_router_serves_grpc_reflection_for_replication_service() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let (endpoint, _service, handle) = grpc_test_server(db).await;
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .unwrap()
@@ -3540,11 +3825,11 @@ async fn mounted_router_serves_grpc_reflection_for_replication_service() {
 
 #[tokio::test]
 async fn connect_rejects_invalid_token_without_persisting_dataplane_metadata() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let (endpoint, _service, handle) = grpc_test_server(db.clone()).await;
     let mut join = valid_join();
     join.token = "wrong-token".to_string();
@@ -3569,11 +3854,11 @@ async fn connect_rejects_invalid_token_without_persisting_dataplane_metadata() {
 
 #[tokio::test]
 async fn connect_persists_dataplane_endpoint_from_observed_peer_ip() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let (endpoint, _service, handle) =
         grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     let mut join = valid_join();
@@ -3606,11 +3891,11 @@ async fn connect_persists_dataplane_endpoint_from_observed_peer_ip() {
 
 #[tokio::test]
 async fn connect_refreshes_existing_node_external_ip_from_observed_peer_ip() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     let (endpoint, _service, handle) =
         grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     db.create_resource(
@@ -3658,11 +3943,11 @@ async fn connect_refreshes_existing_node_external_ip_from_observed_peer_ip() {
 
 #[tokio::test]
 async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3707,11 +3992,11 @@ async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
 
 #[tokio::test]
 async fn connect_follower_progress_heartbeats_never_regress_below_initial_rv() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3776,11 +4061,11 @@ async fn connect_follower_progress_heartbeats_never_regress_below_initial_rv() {
 
 #[tokio::test]
 async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane_metadata() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3836,11 +4121,11 @@ async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane
 
 #[tokio::test]
 async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft_addr() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
-            .unwrap(),
-    );
+            .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3917,9 +4202,11 @@ async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft
 
 #[tokio::test]
 async fn apply_outbox_pod_status_enqueues_matching_service() {
-    let sqlite = klights::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let sqlite =
+        crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
+            .await
+            .unwrap();
+    let canonical = sqlite.clone();
     let db: DatastoreHandle = Arc::new(sqlite.clone());
     let _token = {
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
@@ -3979,12 +4266,18 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
             db.clone(),
             supervisor,
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         ),
     );
     let grpc = super::support::GrpcReplicationServer::new_with_controller_dispatcher(
         service,
         db.clone(),
         dispatcher.clone(),
+        Arc::new(canonical.clone()),
+        canonical.focused_committed_apply(),
+        canonical.focused_read_store(),
     );
 
     let command = StorageCommand::UpdateStatus {
@@ -4057,6 +4350,9 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
     let composition =
         crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::new(
             db.clone(),
+            Arc::new(canonical.clone()),
+            canonical.clone().focused_committed_apply(),
+            canonical.clone().focused_read_store(),
         );
     composition
         .reconcile_service_endpoints(

@@ -8,8 +8,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::daemonset_node::DaemonSetNodeSideEffectStore;
 
 struct RootDaemonSetNodeSideEffectStore {
@@ -50,40 +48,15 @@ pub(crate) fn port(
 }
 
 #[cfg(test)]
-struct DirectDaemonSetNodeSideEffectStore {
-    db: DatastoreHandle,
-}
-#[cfg(test)]
-#[async_trait]
-impl DaemonSetNodeSideEffectStore for DirectDaemonSetNodeSideEffectStore {
-    async fn list_daemonsets(&self) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources(
-                "apps/v1",
-                "DaemonSet",
-                None,
-                klights_cluster_store::ResourceListOptions::all(),
-            )
-            .await
-            .map(|page| page.items)
-    }
-}
-#[cfg(test)]
-pub(crate) fn port_for_test(db: DatastoreHandle) -> Arc<dyn DaemonSetNodeSideEffectStore> {
-    Arc::new(DirectDaemonSetNodeSideEffectStore { db })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[tokio::test]
     async fn node_label_change_enqueues_daemonsets_without_reconciling_inline() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
             .await
             .unwrap();
-        let _db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let dispatcher = Arc::new(
             crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
             ),
