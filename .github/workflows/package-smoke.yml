@@ -87,11 +87,12 @@ jobs:
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             "$image"
 
+          mkdir -p /tmp/klights
           for attempt in {1..60}; do
-            if docker exec "${{ matrix.container_name }}" systemctl is-system-running >/tmp/systemd-state 2>&1; then
+            if docker exec "${{ matrix.container_name }}" systemctl is-system-running >/tmp/klights/systemd-state 2>&1; then
               break
             fi
-            state="$(cat /tmp/systemd-state || true)"
+            state="$(cat /tmp/klights/systemd-state || true)"
             if [[ "$state" == "degraded" ]]; then
               break
             fi
@@ -150,12 +151,13 @@ jobs:
             set -euo pipefail
             curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.34.1/bin/linux/${{ matrix.kubectl_arch }}/kubectl"
             chmod +x /usr/local/bin/kubectl
+            mkdir -p /tmp/klights
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
             kubectl get nodes
             kubectl wait --for=condition=Ready node --all --timeout=5s
             kubectl get nodes -o wide
-            kubectl version -o yaml | tee /tmp/klights-version.yaml
-            grep -F "gitVersion: v1.34.6" /tmp/klights-version.yaml
+            kubectl version -o yaml | tee /tmp/klights/version.yaml
+            grep -F "gitVersion: v1.34.6" /tmp/klights/version.yaml
           '
 
       - name: Deploy nginx and curl service from another pod
@@ -256,11 +258,12 @@ jobs:
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             "${{ matrix.image }}" /usr/sbin/init
 
+          mkdir -p /tmp/klights
           for attempt in {1..60}; do
-            if docker exec "${{ matrix.container_name }}" systemctl is-system-running >/tmp/systemd-state 2>&1; then
+            if docker exec "${{ matrix.container_name }}" systemctl is-system-running >/tmp/klights/systemd-state 2>&1; then
               break
             fi
-            state="$(cat /tmp/systemd-state || true)"
+            state="$(cat /tmp/klights/systemd-state || true)"
             if [[ "$state" == "degraded" ]]; then
               break
             fi
@@ -319,12 +322,13 @@ jobs:
             set -euo pipefail
             curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.34.1/bin/linux/${{ matrix.kubectl_arch }}/kubectl"
             chmod +x /usr/local/bin/kubectl
+            mkdir -p /tmp/klights
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
             kubectl get nodes
             kubectl wait --for=condition=Ready node --all --timeout=5s
             kubectl get nodes -o wide
-            kubectl version -o yaml | tee /tmp/klights-version.yaml
-            grep -F "gitVersion: v1.34.6" /tmp/klights-version.yaml
+            kubectl version -o yaml | tee /tmp/klights/version.yaml
+            grep -F "gitVersion: v1.34.6" /tmp/klights/version.yaml
           '
 
       - name: Deploy nginx and curl service from another pod

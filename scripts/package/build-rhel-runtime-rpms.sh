@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/tmp_root.sh"
+klights_prepare_tmp_root
+
 usage() {
   cat >&2 <<EOF_USAGE
 Usage: $(basename "$0") --containerd-dir DIR --runc-bin PATH --containerd-version VERSION --runc-version VERSION --containerd-license PATH --containerd-notice PATH --runc-license PATH --runc-notice PATH --distro el9|el10 --arch ARCH --out DIR
@@ -130,7 +134,7 @@ if [[ ! -f "$RUNC_NOTICE" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
-TMPROOT="$(mktemp -d -t klights-runtime-rpm-XXXXXXXX)"
+TMPROOT="$(klights_mktemp_dir klights-runtime-rpm.XXXXXXXX)"
 cleanup() {
   rm -rf "$TMPROOT"
 }

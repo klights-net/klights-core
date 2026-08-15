@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/tmp_root.sh"
+klights_prepare_tmp_root
+
 usage() {
   cat >&2 <<EOF_USAGE
 Usage: $(basename "$0") --packages DIR
@@ -69,7 +73,7 @@ if [[ "${#rpm_files[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-TMPROOT="$(mktemp -d -t klights-rpm-sign-XXXXXXXX)"
+TMPROOT="$(klights_mktemp_dir klights-rpm-sign.XXXXXXXX)"
 cleanup() {
   rm -rf "$TMPROOT"
 }

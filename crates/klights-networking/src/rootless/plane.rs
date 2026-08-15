@@ -805,7 +805,7 @@ mod integration_tests {
             crate::wireguard::DataplaneEncryption::Disabled,
             crate::wireguard::WireGuardBootConfig::try_new(
                 crate::wireguard::DEFAULT_WIREGUARD_DEVICE,
-                "/tmp/klights-rootless-plane-test.key",
+                "/tmp/klights/rootless-plane-test.key",
                 crate::wireguard::DEFAULT_WIREGUARD_PORT,
             )
             .expect("valid WireGuard test configuration"),

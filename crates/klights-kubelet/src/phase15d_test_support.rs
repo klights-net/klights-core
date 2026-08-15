@@ -14,7 +14,7 @@ pub(crate) fn runtime_paths_for_test(namespace: &str) -> crate::runtime_paths::K
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     identity.hash(&mut hasher);
     namespace.hash(&mut hasher);
-    let run_root = std::path::PathBuf::from("/tmp")
+    let run_root = std::path::PathBuf::from("/tmp/klights")
         .join("klights-kubelet-tests")
         .join(std::process::id().to_string());
     crate::runtime_paths::KubeletRuntimePaths::new(

@@ -292,7 +292,7 @@ pub fn build_sandbox_config_with_dns_policy(
         pod_spec,
         &SandboxRuntimeInputs::default(),
         &crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-            "/tmp/klights-sandbox-test",
+            "/tmp/klights/sandbox-test",
         ))
         .expect("absolute test path"),
     )
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(
             config.log_directory,
             crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-sandbox-test"
+                "/tmp/klights/sandbox-test"
             ),)
             .unwrap()
             .pod_log_dir("production", "nginx", "uid-999")

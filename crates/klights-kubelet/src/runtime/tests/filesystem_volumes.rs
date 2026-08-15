@@ -429,7 +429,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         })
@@ -493,7 +493,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         })
@@ -603,7 +603,7 @@ async fn termination_message_mount_path_with_parity() {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         })
@@ -674,7 +674,7 @@ async fn hosts_file_mount_path_with_parity() {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         })
@@ -715,7 +715,7 @@ async fn hosts_file_mount_path_with_parity() {
         .first()
         .expect("container config must be created");
     let expected_host_path = crate::runtime_paths::KubeletRuntimePaths::new(
-        std::path::PathBuf::from("/tmp/klights-runtime-test"),
+        std::path::PathBuf::from("/tmp/klights/runtime-test"),
     )
     .unwrap()
     .containerd_hosts_dir("kubelet-test", "host-alias-pod")
@@ -749,7 +749,7 @@ async fn termination_message_file_handling_with_parity() {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         })

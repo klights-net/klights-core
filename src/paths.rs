@@ -88,7 +88,7 @@ fn test_random_token() -> &'static str {
 fn test_run_root_path() -> PathBuf {
     std::env::var_os("KLIGHTS_TEST_DATA_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/klights-test-run-{}", test_random_token())))
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/klights/test-run-{}", test_random_token())))
 }
 
 #[cfg(test)]
@@ -139,9 +139,11 @@ pub fn test_data_root_path(namespace: &str) -> PathBuf {
 #[cfg(test)]
 pub fn test_data_root_fixture(namespace: &str) -> tempfile::TempDir {
     if std::env::var_os("KLIGHTS_TEST_DATA_ROOT").is_none() {
+        let scratch_root = PathBuf::from("/tmp/klights");
+        std::fs::create_dir_all(&scratch_root).expect("create direct-test repository scratch root");
         return tempfile::Builder::new()
             .prefix(&format!("klights-test-{}-", test_path_component(namespace)))
-            .tempdir()
+            .tempdir_in(scratch_root)
             .expect("create isolated direct-test data fixture");
     }
     let test_case_root = test_case_root_path();
@@ -343,8 +345,8 @@ mod tests {
     fn test_data_root_lives_under_tmp() {
         let r = test_data_root_path("klights");
         assert!(
-            r.starts_with("/tmp/"),
-            "test root must be under /tmp, got: {}",
+            r.starts_with("/tmp/klights/"),
+            "test root must be under /tmp/klights, got: {}",
             r.display()
         );
     }

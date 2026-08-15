@@ -521,7 +521,7 @@ async fn fixture_runtime_with_node(
         sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: crate::node_capacity::NodeCapacity::default(),
         paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-            "/tmp/klights-runtime-test",
+            "/tmp/klights/runtime-test",
         ))
         .unwrap(),
     };
@@ -593,7 +593,7 @@ async fn fixture_runtime_with_cluster(
         sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: crate::node_capacity::NodeCapacity::default(),
         paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-            "/tmp/klights-runtime-test",
+            "/tmp/klights/runtime-test",
         ))
         .unwrap(),
     };
@@ -838,7 +838,7 @@ impl PodRuntimeHarness {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         }

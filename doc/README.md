@@ -116,18 +116,19 @@ token Secrets:
 
 ```bash
 export KUBECONFIG=/var/lib/klights/cp1/etc/kubeconfig.yaml
+mkdir -p /tmp/klights
 
 kubectl -n kube-system get secret controlplane-bootstrap-token -o json \
   | jq -r '
       .data["token"] | @base64d
-    ' > /tmp/klights-controlplane.token
+    ' > /tmp/klights/controlplane.token
 
 kubectl -n kube-system get secret worker-bootstrap-token -o json \
   | jq -r '
       .data["token"] | @base64d
-    ' > /tmp/klights-worker.token
+    ' > /tmp/klights/worker.token
 
-chmod 600 /tmp/klights-controlplane.token /tmp/klights-worker.token
+chmod 600 /tmp/klights/controlplane.token /tmp/klights/worker.token
 ```
 
 The control-plane token is used by `controlplane` and `replica` joins. The
@@ -147,7 +148,7 @@ sudo env \
   KLIGHTS_SERVICE_CIDR=10.44.0.0/16 \
   ./target/release/klights controlplane \
     --leader https://10.0.0.10:7679 \
-    --token-file /tmp/klights-controlplane.token
+    --token-file /tmp/klights/controlplane.token
 ```
 
 Repeat with a distinct namespace, data root, node name, node IP, external
@@ -169,7 +170,7 @@ sudo env \
   KLIGHTS_SERVICE_CIDR=10.44.0.0/16 \
   ./target/release/klights replica \
     --leader https://10.0.0.10:7679 \
-    --token-file /tmp/klights-controlplane.token
+    --token-file /tmp/klights/controlplane.token
 ```
 
 Equivalent explicit learner form:
@@ -177,7 +178,7 @@ Equivalent explicit learner form:
 ```bash
 sudo ./target/release/klights controlplane \
   --leader https://10.0.0.10:7679 \
-  --token-file /tmp/klights-controlplane.token \
+  --token-file /tmp/klights/controlplane.token \
   --as-learner
 ```
 
@@ -195,7 +196,7 @@ sudo env \
   KLIGHTS_SERVICE_CIDR=10.44.0.0/16 \
   ./target/release/klights worker \
     --leader https://10.0.0.10:7679 \
-    --token-file /tmp/klights-worker.token
+    --token-file /tmp/klights/worker.token
 ```
 
 Workers may receive multiple leader endpoints, either repeated or
@@ -204,7 +205,7 @@ comma-separated:
 ```bash
 sudo ./target/release/klights worker \
   --leader https://10.0.0.10:7679,https://10.0.0.11:7679 \
-  --token-file /tmp/klights-worker.token
+  --token-file /tmp/klights/worker.token
 ```
 
 ### Rejoin Existing Nodes

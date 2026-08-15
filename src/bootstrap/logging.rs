@@ -63,10 +63,10 @@ mod tests {
     #[test]
     fn log_file_true_uses_data_root_klights_log_case_insensitive() {
         let path =
-            resolve_log_file_path_under("TrUe", std::path::Path::new("/tmp/klights-log-test"));
+            resolve_log_file_path_under("TrUe", std::path::Path::new("/tmp/klights/log-test"));
         assert_eq!(
             path,
-            PathBuf::from("/tmp/klights-log-test/logs/klights.log")
+            PathBuf::from("/tmp/klights/log-test/logs/klights.log")
         );
     }
 

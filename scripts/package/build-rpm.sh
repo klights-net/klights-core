@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/tmp_root.sh"
+klights_prepare_tmp_root
+
 usage() {
   cat >&2 <<EOF_USAGE
 Usage: $(basename "$0") --binary PATH --version VERSION --distro el9|el10 --arch ARCH --out DIR
@@ -101,7 +105,7 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
-TMPROOT="$(mktemp -d -t klights-rpm-XXXXXXXX)"
+TMPROOT="$(klights_mktemp_dir klights-rpm.XXXXXXXX)"
 cleanup() {
   rm -rf "$TMPROOT"
 }

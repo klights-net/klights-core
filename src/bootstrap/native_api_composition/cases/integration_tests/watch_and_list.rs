@@ -7250,7 +7250,7 @@ async fn test_guestbook_selector_watchlist_delivers_ready_after_initial_events_e
 
 /// Regression for the `[sig-cli] Kubectl client Guestbook application ... should
 /// create and stop a working application` readiness timeout under multinode
-/// netns latency + packet loss (canary run `/tmp/2r.log` run 25, build
+/// netns latency + packet loss (canary run `/tmp/klights/2r.log` run 25, build
 /// `e9bf241`). Reproduces the scoped-watch delivery stall: a positive-RV label
 /// selector watch over frontend pods must deliver a Running+Ready MODIFIED for
 /// EVERY in-scope pod even while heavy out-of-scope write churn advances the

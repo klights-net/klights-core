@@ -259,7 +259,7 @@ fn ensure_root_only_blocking(db_path: &Path, allow_existing_perms: bool) -> Resu
         let meta = std::fs::metadata(parent)
             .map_err(|e| anyhow!("stat parent dir {} failed: {}", parent.display(), e))?;
         let mode = meta.mode() & 0o777;
-        // Loose-perm fixtures (shared /tmp) opt in via allow_existing_perms;
+        // Loose-perm fixtures (shared /tmp/klights) opt in via allow_existing_perms;
         // the parent gets tightened to 0700 below.
         if mode != 0o700 && !allow_existing_perms {
             return Err(anyhow!(

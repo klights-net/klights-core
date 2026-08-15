@@ -258,7 +258,7 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
         sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: crate::node_capacity::NodeCapacity::default(),
         paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-            "/tmp/klights-runtime-test",
+            "/tmp/klights/runtime-test",
         ))
         .unwrap(),
     };
@@ -385,7 +385,7 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
             ),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(
-                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+                std::path::PathBuf::from("/tmp/klights/runtime-test"),
             )
             .unwrap(),
         },
@@ -921,7 +921,7 @@ async fn reconcile_ephemeral_full_sequence_with_parity() {
         sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: crate::node_capacity::NodeCapacity::default(),
         paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-            "/tmp/klights-runtime-test",
+            "/tmp/klights/runtime-test",
         ))
         .unwrap(),
     })
@@ -2165,7 +2165,7 @@ async fn kubernetes_service_envs_with_parity() {
             sandbox_inputs: crate::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
-                "/tmp/klights-runtime-test",
+                "/tmp/klights/runtime-test",
             ))
             .unwrap(),
         })
@@ -2667,7 +2667,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             ),
             node_capacity: crate::node_capacity::NodeCapacity::default(),
             paths: crate::runtime_paths::KubeletRuntimePaths::new(
-                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+                std::path::PathBuf::from("/tmp/klights/runtime-test"),
             )
             .unwrap(),
         },

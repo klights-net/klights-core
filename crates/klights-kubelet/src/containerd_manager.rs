@@ -1265,7 +1265,7 @@ mod tests {
         ))
     }
 
-    /// Per-process unique test root under /tmp, shared by all tests in
+    /// Per-process unique test root under /tmp/klights, shared by all tests in
     /// this module.
     fn test_root(ns: &str) -> String {
         crate::runtime_paths::KubeletRuntimePaths::for_test(ns)
@@ -1322,7 +1322,7 @@ mod tests {
             .expect("spawn containerd stop fixture");
         ContainerdManager {
             process: ContainerdProcess::Spawned(child),
-            socket_path: "/tmp/klights-containerd-stop-fixture.sock".to_string(),
+            socket_path: "/tmp/klights/containerd-stop-fixture.sock".to_string(),
             _config_path: String::new(),
             _data_dir: String::new(),
             _state_dir: String::new(),

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/tmp_root.sh"
+klights_prepare_tmp_root
+
 usage() {
   cat >&2 <<EOF_USAGE
 Usage: $(basename "$0") --binary PATH --version VERSION --suite SUITE --distro DISTRO --arch ARCH --out DIR
@@ -111,7 +115,7 @@ SERVICE_SRC="$REPO_ROOT/packaging/systemd/klights.service"
 DEFAULT_SRC="$REPO_ROOT/packaging/default/klights"
 
 mkdir -p "$OUT_DIR"
-TMPDIR="$(mktemp -d -t klights-deb-XXXXXXXX)"
+TMPDIR="$(klights_mktemp_dir klights-deb.XXXXXXXX)"
 cleanup() {
   rm -rf "$TMPDIR"
 }
