@@ -3,7 +3,6 @@
 use anyhow::Context;
 
 use crate::bootstrap::NodeMode;
-use crate::bootstrap::networking;
 use crate::{KlightsConfig, paths, shutdown};
 
 use super::cleanup::stop_namespace_containerd_after_cleanup;
@@ -11,7 +10,7 @@ use super::cleanup::stop_namespace_containerd_after_cleanup;
 pub struct StartupRecoveryContext<'a> {
     pub config: &'a KlightsConfig,
     pub node_mode: &'a NodeMode,
-    pub network_cleanup: &'a networking::NetworkCleanup,
+    pub network_cleanup: &'a klights_networking::NetworkCleanup,
     pub containerd_state_dir: &'a str,
     pub runtime_paths: &'a klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: &'a klights_supervisor::TaskSupervisor,

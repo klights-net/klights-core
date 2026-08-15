@@ -101,7 +101,7 @@ pub struct BootstrapRunArgs<'a> {
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     pub local_node_lease_renewal: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     pub node_lifecycle_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
-    pub network: Arc<crate::bootstrap::networking::Network>,
+    pub network: Arc<klights_networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub local_side_effects: Arc<crate::bootstrap::composition_adapters::
         committed_outbox_delivery_adapter::RootOutboxSideEffectState>,

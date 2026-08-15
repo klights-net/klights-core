@@ -8,11 +8,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
 use crate::bootstrap::NodeMode;
-use crate::bootstrap::networking::{self, NetworkCleanup};
+use klights_networking::NetworkCleanup;
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct NetworkPhase {
-    pub network: Arc<networking::Network>,
+    pub network: Arc<klights_networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub _local_pod_subnet: String,
     pub cni_rpc_token: CancellationToken,
@@ -82,10 +82,10 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         klights_kubelet::cni_readiness::CniReadiness::channel();
     let (assignment_publisher, assignment_waiter) = assignment_bus_views();
     let mode = match node_mode {
-        NodeMode::Root => networking::NetworkMode::Root,
-        NodeMode::Rootless { .. } => networking::NetworkMode::Rootless,
+        NodeMode::Root => klights_networking::NetworkMode::Root,
+        NodeMode::Rootless { .. } => klights_networking::NetworkMode::Rootless,
     };
-    let network_config = networking::NetworkBootConfig::try_new(
+    let network_config = klights_networking::NetworkBootConfig::try_new(
         mode,
         &config.bridge_name,
         &config.node_name,
@@ -98,9 +98,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     )
     .map_err(anyhow::Error::msg)
     .context("invalid focused network boot configuration")?;
-    let network_boot = match networking::NetworkBoot::boot(
+    let network_boot = match klights_networking::NetworkBoot::boot(
         &network_config,
-        networking::boot::NetworkBootStores::new(
+        klights_networking::NetworkBootStores::new(
             subnet_allocation,
             network_topology.clone(),
             pod_network_cache.clone(),
@@ -151,7 +151,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         endpoint_adapter.clone();
     let resolver: Arc<dyn klights_network_api::PodEndpointResolver> = endpoint_adapter;
 
-    if let networking::NetworkBoot::Rootless(plane) = &network_boot {
+    if let klights_networking::NetworkBoot::Rootless(plane) = &network_boot {
         plane
             .prepare_service_routing_bridge()
             .await
@@ -193,12 +193,14 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         Arc<dyn klights_network_api::Datapath>,
         Arc<dyn klights_network_api::PeerRouter>,
     ) = match (&network_boot, node_mode) {
-        (networking::NetworkBoot::Root(p), _) => (p.clone(), network_boot.peer_router()),
-        (networking::NetworkBoot::Rootless(p), _) => (p.clone(), network_boot.peer_router()),
+        (klights_networking::NetworkBoot::Root(p), _) => (p.clone(), network_boot.peer_router()),
+        (klights_networking::NetworkBoot::Rootless(p), _) => {
+            (p.clone(), network_boot.peer_router())
+        }
     };
 
     let cni_datapath = datapath.clone();
-    let network = Arc::new(networking::Network::new(
+    let network = Arc::new(klights_networking::Network::new(
         datapath,
         peering,
         services.clone(),
@@ -259,7 +261,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                 namespace: &config.containerd_namespace,
                 bridge_name: &config.bridge_name,
                 pod_subnet: &local_pod_subnet,
-                pod_link_mtu: networking::pod_link_mtu_for_encryption(config.dataplane_encryption),
+                pod_link_mtu: klights_networking::pod_link_mtu_for_encryption(
+                    config.dataplane_encryption,
+                ),
                 rootless: is_rootless,
                 executable_path: &executable_path,
                 image_pull_response_timeout: runtime_inputs.image_pull_response_timeout,

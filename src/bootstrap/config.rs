@@ -130,8 +130,8 @@ impl KlightsConfig {
     pub fn from_env_with_namespace_override(
         namespace_override: Option<&str>,
     ) -> anyhow::Result<Self> {
-        use crate::bootstrap::networking::BridgeName;
         use anyhow::anyhow;
+        use klights_networking::BridgeName;
         use klights_types::{ClusterCidr, NodeName};
 
         let containerd_namespace = namespace_override.map(str::to_string).unwrap_or_else(|| {

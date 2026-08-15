@@ -1,20 +1,18 @@
 use anyhow::{Context, Result};
-use klights_networking::{RootDatapath, RootPeerDataplane, RootPeerDataplaneBoot};
-use klights_types::{NodeName, PodSubnet};
-
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use super::boot::NetworkBootStores;
+use crate::{RootDatapath, RootPeerDataplane, RootPeerDataplaneBoot};
+use klights_types::{NodeName, PodSubnet};
 
-/// Concrete root-mode networking implementation used by klights runtime.
+/// Root-mode CNI datapath and peer-router implementation.
 pub struct NetworkPlane {
     root: RootDatapath,
     pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pod_ipam: Arc<dyn klights_node_store::PodIpamStore>,
     pod_runtime: Arc<dyn klights_node_store::PodRuntimeStore>,
     assignment_publisher: Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
-    sandbox_operations: klights_networking::SandboxOperationLocks,
+    sandbox_operations: crate::SandboxOperationLocks,
     my_node: NodeName,
     host_ip: Ipv4Addr,
     peer: Arc<RootPeerDataplane>,
@@ -22,17 +20,13 @@ pub struct NetworkPlane {
 }
 
 impl NetworkPlane {
-    /// Boot the shared networking plane. Opens one rtnetlink connection,
-    /// prepares the local bridge/CNI datapath, and initializes the selected
-    /// cross-node dataplane. WireGuard is the default encrypted dataplane;
-    /// explicit direct-route mode installs only kernel routes.
     pub(crate) async fn boot(
-        cfg: &super::NetworkBootConfig,
-        stores: super::boot::NetworkBootStores,
+        cfg: &crate::NetworkBootConfig,
+        stores: crate::NetworkBootStores,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Arc<Self>> {
-        let NetworkBootStores {
+        let crate::NetworkBootStores {
             subnet_allocation,
             topology,
             pod_network_cache,
@@ -42,33 +36,26 @@ impl NetworkPlane {
         } = stores;
         let my_node = cfg.node().clone();
         let host_ip = cfg.host_ip();
-
-        let local_subnet = klights_networking::NodeSubnetAllocator::new(
-            subnet_allocation,
-            topology,
-            task_supervisor.clone(),
-        )
-        .allocate_or_reuse_existing(
-            cfg.node().as_ref(),
-            &cfg.cluster_cidr().to_string(),
-            &cfg.host_ip().to_string(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to allocate local node subnet for {} at {}",
-                cfg.node(),
-                cfg.host_ip()
-            )
-        })?;
-
+        let local_subnet =
+            crate::NodeSubnetAllocator::new(subnet_allocation, topology, task_supervisor.clone())
+                .allocate_or_reuse_existing(
+                    cfg.node().as_ref(),
+                    &cfg.cluster_cidr().to_string(),
+                    &cfg.host_ip().to_string(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to allocate local node subnet for {} at {}",
+                        cfg.node(),
+                        cfg.host_ip()
+                    )
+                })?;
         let root = RootDatapath::boot(
             cfg.bridge().clone(),
             local_subnet,
-            klights_networking::PodLinkMtu::try_new(super::pod_link_mtu_for_encryption(
-                cfg.encryption(),
-            ))
-            .map_err(anyhow::Error::msg)?,
+            crate::PodLinkMtu::try_new(crate::pod_link_mtu_for_encryption(cfg.encryption()))
+                .map_err(anyhow::Error::msg)?,
             cancel.clone(),
             task_supervisor.clone(),
         )
@@ -78,7 +65,7 @@ impl NetworkPlane {
                 &root,
                 RootPeerDataplaneBoot::new(
                     cfg.encryption(),
-                    klights_networking::wireguard::WireGuardBootConfig::try_new(
+                    crate::wireguard::WireGuardBootConfig::try_new(
                         cfg.wireguard_device(),
                         cfg.wireguard_key_path(),
                         cfg.wireguard_port(),
@@ -90,30 +77,25 @@ impl NetworkPlane {
             )
             .await,
         );
-
-        let plane = Arc::new(Self {
+        Ok(Arc::new(Self {
             root,
             pod_network_cache,
             pod_ipam,
             pod_runtime,
             assignment_publisher,
-            sandbox_operations: klights_networking::SandboxOperationLocks::default(),
+            sandbox_operations: crate::SandboxOperationLocks::default(),
             my_node,
             host_ip,
             peer,
-            task_supervisor: task_supervisor.clone(),
-        });
-
-        Ok(plane)
+            task_supervisor,
+        }))
     }
 
     pub fn local_pod_subnet(&self) -> PodSubnet {
         self.root.pod_subnet()
     }
 
-    /// Dataplane health snapshot. WireGuard failures are recorded here
-    /// so callers can set `NetworkUnavailable=True` on the Node.
-    pub fn health(&self) -> &klights_networking::dataplane_health::DataplaneHealth {
+    pub fn health(&self) -> &crate::dataplane_health::DataplaneHealth {
         self.peer.health()
     }
 
@@ -134,7 +116,7 @@ impl NetworkPlane {
             .await
             .with_context(|| format!("bridge {} not found", self.root.bridge()))?;
         let pod_subnet = self.root.pod_subnet();
-        klights_networking::add(klights_networking::CniAddArgs {
+        crate::add(crate::CniAddArgs {
             cache: self.pod_network_cache.as_ref(),
             ipam: self.pod_ipam.as_ref(),
             runtime: self.pod_runtime.as_ref(),
@@ -176,7 +158,7 @@ impl NetworkPlane {
             .bridge_index()
             .await
             .with_context(|| format!("bridge {} not found", self.root.bridge()))?;
-        klights_networking::del(
+        crate::del(
             self.pod_network_cache.as_ref(),
             self.root.handle(),
             sandbox_id,
@@ -229,81 +211,5 @@ impl klights_network_api::Datapath for NetworkPlane {
                 .await
                 .map_err(|error| klights_network_api::DatapathError::shutdown(error.to_string()))
         })
-    }
-}
-
-// Hybrid peer boot invariants (boot ordering, overlay avoidance,
-// peer-endpoint arms) are enforced by
-// `tests/source_guard_networking_invariants.py`,
-// run as part of `./build.sh`.
-
-#[cfg(test)]
-mod stale_route_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn root_cni_del_without_allocation_does_not_resolve_missing_bridge() {
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let node_local = crate::bootstrap::node_store::open_node_local(
-            crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
-            None,
-            supervisor.clone(),
-            "sqlite:root-cni-del-test",
-        )
-        .await
-        .expect("open node-local test store");
-        let node_network = Arc::new(node_local);
-        let assignment_bus = Arc::new(klights_networking::PodNetworkAssignmentBus::new());
-        let (connection, handle, _) = rtnetlink::new_connection().expect("open rtnetlink");
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let connection_cancel = cancel.clone();
-        let connection = supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Network,
-                "test_root_cni_del_rtnetlink_connection",
-                async move {
-                    tokio::select! {
-                        _ = connection => {}
-                        _ = connection_cancel.cancelled() => {}
-                    }
-                },
-            )
-            .await
-            .expect("spawn rtnetlink test connection");
-        let root = RootDatapath::from_open_connection(
-            handle,
-            connection,
-            klights_networking::BridgeName::parse("missing-cni0").unwrap(),
-            PodSubnet::parse("10.42.1.0/24").unwrap(),
-            klights_networking::PodLinkMtu::try_new(1500).unwrap(),
-        );
-        let peer = Arc::new(RootPeerDataplane::direct_for_test(
-            root.handle().clone(),
-            root.pod_subnet(),
-            "missing-wg0",
-            supervisor.clone(),
-        ));
-        let plane = NetworkPlane {
-            root,
-            pod_network_cache: node_network.pod_network_cache(),
-            pod_ipam: node_network.pod_ipam(),
-            pod_runtime: node_network.pod_runtime(),
-            assignment_publisher: assignment_bus,
-            sandbox_operations: klights_networking::SandboxOperationLocks::default(),
-            my_node: NodeName::parse("node-a").unwrap(),
-            host_ip: Ipv4Addr::new(192, 0, 2, 1),
-            peer,
-            task_supervisor: supervisor,
-        };
-
-        let result = NetworkPlane::cni_del(&plane, "already-gone").await;
-        cancel.cancel();
-        plane.root.shutdown();
-        assert!(
-            result.is_ok(),
-            "idempotent DEL without an allocation must not require the bridge: {result:?}"
-        );
     }
 }

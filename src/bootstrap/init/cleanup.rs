@@ -2,13 +2,12 @@
 
 use anyhow::Context;
 
-use crate::bootstrap::networking;
 use crate::bootstrap::{CliFlags, NodeMode};
 use crate::{KlightsConfig, paths, pidfile, shutdown};
 use klights_networking::cni_plugin;
 
 /// Full teardown with the same immutable mode detection used by startup. This
-/// keeps root/rootless cleanup dispatch centralized in `networking::NetworkCleanup`.
+/// keeps root/rootless cleanup dispatch centralized in `klights_networking::NetworkCleanup`.
 pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
     // Initialize tracing early
     let namespace = cli.namespace.as_deref().unwrap_or("klights");
@@ -299,7 +298,7 @@ async fn open_cleanup_node_local(
 }
 
 async fn cleanup_directories_and_network(
-    network_cleanup: &networking::NetworkCleanup,
+    network_cleanup: &klights_networking::NetworkCleanup,
     node_local: Option<&crate::bootstrap::node_store::NodeLocalStores>,
     containerd_state_dir: &str,
     namespace: &str,

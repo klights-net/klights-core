@@ -23,7 +23,6 @@ pub(crate) mod local_leader_adapters;
 pub mod logging;
 pub(crate) mod maintenance;
 pub(crate) mod network_adapters;
-pub(crate) mod networking;
 pub mod node_mode;
 pub(crate) mod node_registration_adapter;
 pub mod node_role;

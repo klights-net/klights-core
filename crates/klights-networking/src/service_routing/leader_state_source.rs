@@ -153,7 +153,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct Query {
-        requests: Mutex<Vec<ResourceQueryConsistency>>,
+        requests: Mutex<Vec<(String, String, ResourceQueryConsistency)>>,
     }
     impl LeaderResourceQuery for Query {
         fn list_resources(
@@ -162,7 +162,11 @@ mod tests {
         ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult>
         {
             Box::pin(async move {
-                self.requests.lock().unwrap().push(request.consistency());
+                self.requests.lock().unwrap().push((
+                    request.api_version().to_string(),
+                    request.kind().to_string(),
+                    request.consistency(),
+                ));
                 klights_leader_api::ResourceListResult::try_new(Vec::new(), 1, None, None, None)
             })
         }
@@ -185,7 +189,38 @@ mod tests {
         source.network_policy_snapshot().await.unwrap();
         assert_eq!(
             query.requests.lock().unwrap().as_slice(),
-            &[ResourceQueryConsistency::LeaderFresh; 6]
+            &[
+                (
+                    "v1".to_string(),
+                    "Service".to_string(),
+                    ResourceQueryConsistency::LeaderFresh
+                ),
+                (
+                    "v1".to_string(),
+                    "Endpoints".to_string(),
+                    ResourceQueryConsistency::LeaderFresh
+                ),
+                (
+                    "discovery.k8s.io/v1".to_string(),
+                    "EndpointSlice".to_string(),
+                    ResourceQueryConsistency::LeaderFresh
+                ),
+                (
+                    "networking.k8s.io/v1".to_string(),
+                    "NetworkPolicy".to_string(),
+                    ResourceQueryConsistency::LeaderFresh
+                ),
+                (
+                    "v1".to_string(),
+                    "Pod".to_string(),
+                    ResourceQueryConsistency::LeaderFresh
+                ),
+                (
+                    "v1".to_string(),
+                    "Namespace".to_string(),
+                    ResourceQueryConsistency::LeaderFresh
+                ),
+            ]
         );
     }
 }
