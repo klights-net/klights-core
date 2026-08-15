@@ -1,10 +1,10 @@
 mod allocator;
-pub mod cli;
+pub(crate) mod cli;
 mod cluster_engine;
-pub mod paths;
-pub mod pidfile;
-pub mod shutdown;
-pub mod version;
+pub(crate) mod paths;
+pub(crate) mod pidfile;
+pub(crate) mod shutdown;
+pub(crate) mod version;
 
 #[cfg(test)]
 mod cluster_engine_composition_tests;
@@ -17,7 +17,7 @@ extern crate self as klights;
 #[cfg(test)]
 mod shutdown_test;
 
-pub use bootstrap::config::KlightsConfig;
+pub(crate) use bootstrap::config::KlightsConfig;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

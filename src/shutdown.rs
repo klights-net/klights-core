@@ -39,6 +39,7 @@ fn require_success<'a>(
 }
 
 /// Stop and remove all pod sandboxes on shutdown.
+#[allow(dead_code)] // Retained private shutdown path; startup behavior is unchanged.
 pub async fn cleanup_pod_sandboxes(
     file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut klights_kubelet::cri::CriClient,
@@ -96,6 +97,7 @@ pub async fn cleanup_pod_sandboxes(
     Ok(())
 }
 
+#[allow(dead_code)] // Reached only by the retained private shutdown path above.
 async fn cleanup_one_pod_sandbox(
     file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut klights_kubelet::cri::CriClient,

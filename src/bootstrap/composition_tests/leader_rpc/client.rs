@@ -187,7 +187,7 @@ mod cases {
             let server_shutdown = shutdown.clone();
             let server_supervisor = supervisor.clone();
             let server_namespace = namespace.clone();
-            let server_data_root = klights::paths::data_root_path(&server_namespace);
+            let server_data_root = crate::paths::data_root_path(&server_namespace);
             let handle = tokio::spawn(async move {
                 klights_apiserver::serve_https(
                     app,
@@ -246,7 +246,7 @@ mod cases {
             self.shutdown.cancel();
             let _ = tokio::time::timeout(Duration::from_secs(2), self.handle).await;
             let _ = self.supervisor.shutdown(Duration::from_secs(1)).await;
-            let _ = std::fs::remove_dir_all(klights::paths::data_root_path(&self.namespace));
+            let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&self.namespace));
         }
     }
 
@@ -278,7 +278,7 @@ mod cases {
     }
 
     fn write_leader_tls_files(namespace: &str) -> (PathBuf, PathBuf, String, String) {
-        let etc_dir = klights::paths::etc_dir_path(namespace);
+        let etc_dir = crate::paths::etc_dir_path(namespace);
         std::fs::create_dir_all(&etc_dir).unwrap();
 
         let (ca_cert, ca_key, ca_cert_pem, _ca_key_pem) =
@@ -293,10 +293,10 @@ mod cases {
             .unwrap();
         let (node_cert_pem, node_key_pem) =
             generate_node_client_cert(&ca_cert, &ca_key, "worker-1");
-        let ca_cert_path = klights::paths::ca_cert_path(namespace);
+        let ca_cert_path = crate::paths::ca_cert_path(namespace);
         std::fs::write(&ca_cert_path, ca_cert_pem).unwrap();
-        std::fs::write(klights::paths::server_cert_path(namespace), server_cert_pem).unwrap();
-        std::fs::write(klights::paths::server_key_path(namespace), server_key_pem).unwrap();
+        std::fs::write(crate::paths::server_cert_path(namespace), server_cert_pem).unwrap();
+        std::fs::write(crate::paths::server_key_path(namespace), server_key_pem).unwrap();
 
         let (_, _, wrong_ca_cert_pem, _) =
             klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
@@ -2023,8 +2023,8 @@ mod cases {
             .as_nanos();
         let leader_ns = format!("grpc-client-leader-{suffix}");
         let worker_ns = format!("grpc-client-worker-{suffix}");
-        let leader_etc = klights::paths::etc_dir_path(&leader_ns);
-        let worker_etc = klights::paths::etc_dir_path(&worker_ns);
+        let leader_etc = crate::paths::etc_dir_path(&leader_ns);
+        let worker_etc = crate::paths::etc_dir_path(&worker_ns);
         std::fs::create_dir_all(&leader_etc).unwrap();
         std::fs::create_dir_all(&worker_etc).unwrap();
         std::fs::write(
@@ -2095,8 +2095,8 @@ mod cases {
 
         handle.abort();
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
-        let _ = std::fs::remove_dir_all(klights::paths::data_root_path(&leader_ns));
-        let _ = std::fs::remove_dir_all(klights::paths::data_root_path(&worker_ns));
+        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&leader_ns));
+        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&worker_ns));
         unsafe { std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE") };
     }
 
@@ -2104,7 +2104,7 @@ mod cases {
     async fn local_node_log_runtime_previous_is_empty_for_finite_and_follow() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let runtime = LocalNodeLogRuntime::new_for_test(
-            klights::paths::pod_logs_root_path("previous-log-test"),
+            crate::paths::pod_logs_root_path("previous-log-test"),
             supervisor.clone(),
             Arc::new(klights_supervisor::SystemWallClock),
         );
@@ -2143,13 +2143,9 @@ mod cases {
             .unwrap()
             .as_nanos();
         let runtime_ns = format!("grpc-client-log-follow-{suffix}");
-        let log_dir = klights::paths::pod_log_dir_path(
-            &runtime_ns,
-            "sonobuoy",
-            "sonobuoy-e2e-job",
-            "pod-uid",
-        )
-        .join("e2e");
+        let log_dir =
+            crate::paths::pod_log_dir_path(&runtime_ns, "sonobuoy", "sonobuoy-e2e-job", "pod-uid")
+                .join("e2e");
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2194,7 +2190,7 @@ mod cases {
             .await
             .unwrap();
         let handler = LocalNodeLogRuntime::new_with_pod_event_store(
-            klights::paths::pod_logs_root_path(&runtime_ns),
+            crate::paths::pod_logs_root_path(&runtime_ns),
             supervisor.clone(),
             Arc::new(klights_supervisor::SystemWallClock),
             crate::bootstrap::composition_tests::leader_rpc::support::pod_log_follow_watch(
@@ -2246,7 +2242,7 @@ mod cases {
         );
 
         let _ = supervisor.shutdown(Duration::from_secs(1)).await;
-        let _ = tokio::fs::remove_dir_all(klights::paths::data_root_path(&runtime_ns)).await;
+        let _ = tokio::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns)).await;
     }
 
     struct StaticExecHandler;

@@ -65,6 +65,7 @@ fn node_db_path_under(dir: PathBuf, backend: &str) -> PathBuf {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Used by the binary entry; integration dependencies omit it.
 pub fn runtime_namespace() -> String {
     std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())
 }
@@ -162,6 +163,7 @@ pub fn containerd_root_dir_path(namespace: &str) -> PathBuf {
     data_root_path(namespace).join("containerd")
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Used by the binary entry; integration dependencies omit it.
 pub fn containerd_data_dir_path(namespace: &str) -> PathBuf {
     containerd_root_dir_path(namespace).join("data")
 }
@@ -174,6 +176,7 @@ pub fn containerd_socket_path(namespace: &str) -> PathBuf {
     data_root_path(namespace).join("containerd.sock")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn containerd_hosts_dir_path(namespace: &str, pod_namespace: &str, pod_name: &str) -> PathBuf {
     containerd_root_dir_path(namespace)
         .join("hosts")
@@ -181,6 +184,7 @@ pub fn containerd_hosts_dir_path(namespace: &str, pod_namespace: &str, pod_name:
         .join(pod_name)
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn containerd_termination_log_path(
     namespace: &str,
     pod_namespace: &str,
@@ -198,6 +202,7 @@ pub fn volumes_root_path(namespace: &str) -> PathBuf {
     data_root_path(namespace).join("pods")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn local_path_provisioner_root_path(namespace: &str) -> PathBuf {
     data_root_path(namespace).join("local-path-provisioner")
 }
@@ -206,6 +211,7 @@ pub fn pod_logs_root_path(namespace: &str) -> PathBuf {
     data_root_path(namespace).join("logs").join("pods")
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Used by the binary entry; integration dependencies omit it.
 pub fn pod_log_dir_path(
     namespace: &str,
     pod_namespace: &str,
@@ -215,6 +221,7 @@ pub fn pod_log_dir_path(
     pod_logs_root_path(namespace).join(format!("{}_{}_{}", pod_namespace, pod_name, pod_uid))
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn kubeconfig_path(namespace: &str) -> PathBuf {
     etc_dir_path(namespace).join("kubeconfig.yaml")
 }
@@ -235,34 +242,42 @@ pub fn service_account_signing_key_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "service-account-signing.key")
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Used by the binary entry; integration dependencies omit it.
 pub fn server_cert_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "server.crt")
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Used by the binary entry; integration dependencies omit it.
 pub fn server_key_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "server.key")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn api_proxy_cert_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "api-proxy.crt")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn api_proxy_key_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "api-proxy.key")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn apiservice_proxy_cert_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "apiservice-proxy.crt")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn apiservice_proxy_key_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "apiservice-proxy.key")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn admin_cert_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "admin.crt")
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn admin_key_path(namespace: &str) -> PathBuf {
     etc_file_path(namespace, "admin.key")
 }
@@ -274,6 +289,7 @@ pub fn cni_conf_dir_path(namespace: &str) -> PathBuf {
         .join(namespace)
 }
 
+#[allow(dead_code)] // Retained process-local path constructor; no external root API remains.
 pub fn cni_bin_dir_path(namespace: &str) -> PathBuf {
     data_root_path(namespace).join("cni").join("bin")
 }

@@ -15,6 +15,8 @@ pub struct KlightsConfig {
     pub tls_port: u16,
     /// FQDN for the API server, included as DNS SAN in the TLS server cert.
     pub api_fqdn: Option<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    // Binary-entry logging config is not read by library dependents.
     pub log_file: Option<String>,
     pub containerd_namespace: String,
     pub containerd_socket: Option<String>,
@@ -123,6 +125,7 @@ fn parse_pod_subnet(raw: &str) -> anyhow::Result<String> {
 }
 
 impl KlightsConfig {
+    #[cfg_attr(not(test), allow(dead_code))] // Binary entry owns environment construction.
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_env_with_namespace_override(None)
     }
@@ -296,6 +299,7 @@ impl KlightsConfig {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // Binary entry owns logging-path selection.
     pub fn log_file_path(&self) -> String {
         self.log_file
             .as_deref()

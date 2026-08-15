@@ -84,6 +84,7 @@ pub enum NodeRole {
 
 /// Raft initialization mode for a Leader node.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Root CLI entry constructs every bootstrap mode.
 pub enum LeaderBootstrap {
     /// Single-voter cluster (N=1). The default; matches today's solo behavior.
     Seed,
@@ -101,6 +102,7 @@ pub struct LeaderPeer {
     pub endpoint: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Root CLI entry owns the role predicates.
 impl NodeRole {
     /// Returns the role selected by the given CLI command string.
     ///
