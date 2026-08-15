@@ -228,13 +228,13 @@ impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
 pub(crate) fn test_resource_command(
     authority: &crate::bootstrap::authority::AuthorityHandle,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
     let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
         crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
             applied_outbox,
-            committed_apply,
+            canonical,
             resource_reads.clone(),
         ),
     );
@@ -258,13 +258,13 @@ pub(crate) fn test_outbox_delivery(
     side_effects: Arc<RootOutboxSideEffectState>,
     local_node: String,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> Arc<RootCommittedOutboxDelivery> {
     let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
         crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
             applied_outbox,
-            committed_apply,
+            canonical,
             resource_reads.clone(),
         ),
     );

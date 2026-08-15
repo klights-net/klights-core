@@ -323,8 +323,7 @@ pub(crate) mod support {
 
     pub async fn run_worker_actor_finalization_delivery_scenario()
     -> anyhow::Result<WorkerFinalizationDeliveryOutcome> {
-        let sqlite =
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory().await?;
+        let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture().await?;
         let canonical = sqlite.clone();
         let db = Arc::new(sqlite.clone());
         let _ports =
@@ -399,7 +398,7 @@ pub(crate) mod support {
         use klights_replication::proposal::RaftProposal as _;
         let proposal = crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         );
         let applied = proposal
@@ -427,8 +426,7 @@ pub(crate) mod support {
 
     pub async fn run_worker_actor_finalization_race()
     -> anyhow::Result<WorkerFinalizationRaceOutcome> {
-        let sqlite =
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory().await?;
+        let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture().await?;
         let canonical = sqlite.clone();
         let db = Arc::new(sqlite.clone());
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&sqlite);
@@ -475,7 +473,7 @@ pub(crate) mod support {
                 ),
                 "worker-1".to_string(),
                 Arc::new(canonical.clone()),
-                canonical.focused_committed_apply(),
+                Arc::new(canonical.clone()),
                 canonical.focused_read_store(),
             );
         let repository = IntegrationPodWorkerFixture::new(cluster_api.clone()).await;
@@ -1523,7 +1521,7 @@ pub(crate) mod support {
 
     impl IntegrationPodStoreFixture {
         pub async fn new() -> Self {
-            let sqlite = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .expect("Pod store integration fixture");
             let canonical = sqlite.clone();
@@ -1541,7 +1539,7 @@ pub(crate) mod support {
                     Arc::new(
                         crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                             Arc::new(canonical.clone()),
-                            canonical.focused_committed_apply(),
+                            Arc::new(canonical.clone()),
                             canonical.focused_read_store(),
                         ),
                     ),
@@ -1728,7 +1726,7 @@ pub(crate) mod support {
         Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         Arc<std::sync::atomic::AtomicBool>,
     ){
-        let sqlite = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .expect("delete CAS race datastore");
         let canonical = sqlite.clone();
@@ -1751,7 +1749,7 @@ pub(crate) mod support {
         let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
             &authority,
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         );
         let persistence = crate::bootstrap::composition_adapters::
@@ -1976,7 +1974,7 @@ pub(crate) mod support {
             } = options;
             let sqlite = match sqlite {
                 Some(sqlite) => sqlite,
-                None => klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+                None => crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                     .await
                     .expect("Pod repository integration composition"),
             };
@@ -2006,7 +2004,7 @@ pub(crate) mod support {
                     ),
                     "pod-repository-composition".to_string(),
                     Arc::new(canonical.clone()),
-                    canonical.focused_committed_apply(),
+                    Arc::new(canonical.clone()),
                     canonical.focused_read_store(),
                 );
             let native_resource_query = repository_cluster_api
@@ -2022,7 +2020,7 @@ pub(crate) mod support {
                     None,
                     Some(supervisor.clone()),
                     ports.applied_outbox.clone(),
-                    ports.committed_apply.clone(),
+                    Arc::new(canonical.clone()),
                     ports.read_ports.resource_reads(),
                     ports.ownership_reads.clone(),
                     ports.namespace_content_reads.clone(),
@@ -2127,7 +2125,7 @@ pub(crate) mod support {
                     resource_commands: Some(crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
                         &authority,
                         Arc::new(canonical.clone()),
-                        canonical.focused_committed_apply(),
+                        Arc::new(canonical.clone()),
                         canonical.focused_read_store(),
                     )),
                     remote_delivery_required,
@@ -2359,7 +2357,7 @@ pub(crate) mod support {
             let coordination = klights_controllers::ControllerCoordination::new();
             let applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger> =
                 self.db.clone();
-            let committed_apply = self.db.focused_committed_apply();
+            let committed_apply = self.db.clone();
             let resource_reads = self.db.focused_read_store();
             let ownership_reads = self.db.focused_read_store();
             let gc_store = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
@@ -2574,7 +2572,7 @@ pub(crate) mod support {
             let resource_reads = self.db.focused_read_store();
             let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 self.db.clone(),
-                self.db.focused_committed_apply(),
+                self.db.clone(),
                 resource_reads.clone(),
             );
             let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
@@ -2599,7 +2597,7 @@ pub(crate) mod support {
         ) -> anyhow::Result<()> {
             let leader = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
                 self.db.clone(),
-                self.db.focused_committed_apply(),
+                self.db.clone(),
                 self.db.focused_read_store(),
                 self.db.focused_read_store(),
             );

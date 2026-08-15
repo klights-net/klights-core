@@ -264,14 +264,14 @@ mod tests {
         Arc<RecordingApplyingProposal>,
         ClusterStoreLeaderMaintenance,
     ) {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let canonical = db.clone();
         let proposal = Arc::new(RecordingApplyingProposal {
             inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                 Arc::new(canonical.clone()),
-                canonical.focused_committed_apply(),
+                Arc::new(canonical.clone()),
                 canonical.focused_read_store(),
             ),
             commands: Default::default(),

@@ -132,7 +132,7 @@ async fn remote_client_and_leader_db_with_node_names(
     DatastoreHandle,
     tokio::task::JoinHandle<()>,
 ) {
-    let concrete_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let concrete_db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let passive_reads =

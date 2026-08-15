@@ -476,7 +476,7 @@ pub(crate) mod support {
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                     Arc::new(canonical.clone()),
-                    canonical.focused_committed_apply(),
+                    Arc::new(canonical.clone()),
                     canonical.focused_read_store(),
                 ),
             );
@@ -518,7 +518,7 @@ pub(crate) mod support {
                 None,
                 Some(supervisor.clone()),
                 canonical_ports.applied_outbox.clone(),
-                canonical_ports.committed_apply.clone(),
+                Arc::new(canonical.clone()),
                 canonical_ports.read_ports.resource_reads(),
                 canonical_ports.ownership_reads.clone(),
                 canonical_ports.namespace_content_reads.clone(),
@@ -1063,7 +1063,7 @@ pub(crate) mod support {
                 db.focused_read_store(),
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                     Arc::new(db.clone()),
-                    db.focused_committed_apply(),
+                    Arc::new(db.clone()),
                     db.focused_read_store(),
                 ),
             );

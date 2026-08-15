@@ -13,26 +13,10 @@ pub(crate) type SqliteTestStore = Arc<klights_cluster_datastore::sqlite::embedde
 
 pub(crate) type GrpcReplicationServer = klights_leader_rpc::server::GrpcReplicationServer;
 
-/// Root-composed SQLite fixture for leader-RPC tests. The canonical embedded
-/// store receives the root watch sink, so positioned watches observe committed
-/// changes without reintroducing the deleted root SQLite wrapper.
+/// Root-composed SQLite fixture for leader-RPC tests.
 pub(crate) async fn canonical_sqlite_fixture()
 -> anyhow::Result<klights_cluster_datastore::sqlite::embedded::Datastore> {
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let executor = klights_cluster_datastore::sqlite::open_in_memory(
-        supervisor,
-        "sqlite:leader-rpc-canonical-fixture",
-    )
-    .await?;
-    klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
-        executor,
-        crate::bootstrap::watch_commit_wiring::new_sink(),
-        crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
-        Arc::new(klights_supervisor::SystemWallClock),
-    )
-    .await
+    crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture().await
 }
 
 #[derive(Debug, Clone, PartialEq)]

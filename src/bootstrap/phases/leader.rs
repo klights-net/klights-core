@@ -170,12 +170,12 @@ mod tests {
 
     #[tokio::test]
     async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
-            ports.applied_outbox.clone(), ports.committed_apply.clone(), ports.read_ports.resource_reads(),
+            ports.applied_outbox.clone(), std::sync::Arc::new(db.clone()), ports.read_ports.resource_reads(),
         );
         let bootstrap_store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
             ports.read_ports.resource_reads(), ports.topology_reads, commands,

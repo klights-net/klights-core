@@ -680,12 +680,12 @@ impl klights_pod_api::PodRepositoryWritePersistence for WorkerPodPersistence {
 #[cfg(test)]
 pub(crate) fn new_pod_store(
     applied_outbox: std::sync::Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    canonical: std::sync::Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ownership_reads: std::sync::Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> PodStore {
     crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store_from_test_ports(
-        applied_outbox, committed_apply, resource_reads, ownership_reads,
+        applied_outbox, canonical, resource_reads, ownership_reads,
     )
 }
 

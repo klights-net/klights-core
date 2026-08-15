@@ -133,7 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_uses_exact_initial_snapshot_handoff() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let passive_reads =
@@ -170,7 +170,7 @@ mod tests {
             store: Arc::new(
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
                     ports.applied_outbox,
-                    ports.committed_apply,
+                    std::sync::Arc::new(db.clone()),
                     ports.read_ports.resource_reads(),
                     ports.ownership_reads,
                 ),

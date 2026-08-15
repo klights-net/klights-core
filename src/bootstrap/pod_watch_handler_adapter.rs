@@ -132,7 +132,7 @@ mod tests {
         klights_cluster_core::Resource,
         klights_cluster_core::Resource,
     ) {
-        let sqlite = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let pv = sqlite
@@ -185,7 +185,7 @@ mod tests {
             ports.ownership_reads,
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 ports.applied_outbox,
-                ports.committed_apply,
+                std::sync::Arc::new(sqlite.clone()),
                 ports.read_ports.resource_reads(),
             ),
             authority,

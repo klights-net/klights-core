@@ -152,7 +152,6 @@ impl IntegrationLeaderRpcRuntime {
 pub struct IntegrationLeaderRpcComposition {
     db: IntegrationDatastoreHandle,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 }
 
@@ -160,13 +159,12 @@ impl IntegrationLeaderRpcComposition {
     pub fn new(
         db: IntegrationDatastoreHandle,
         applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        _committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
         resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ) -> Self {
         Self {
             db,
             applied_outbox,
-            committed_apply,
             resource_reads,
         }
     }
@@ -348,7 +346,7 @@ impl IntegrationLeaderRpcComposition {
         let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
             crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                 self.applied_outbox.clone(),
-                self.committed_apply.clone(),
+                self.db.clone(),
                 self.resource_reads.clone(),
             ),
         );
@@ -405,7 +403,7 @@ impl IntegrationLeaderRpcComposition {
                 resource_query.clone(),
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 self.applied_outbox.clone(),
-                self.committed_apply.clone(),
+                self.db.clone(),
                 self.resource_reads.clone(),
                 ),
                 authority,
@@ -431,7 +429,7 @@ impl IntegrationLeaderRpcComposition {
         .await;
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
             self.applied_outbox.clone(),
-            self.committed_apply.clone(),
+            self.db.clone(),
             self.resource_reads.clone(),
         );
         let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
@@ -454,13 +452,13 @@ impl IntegrationLeaderRpcComposition {
     ) -> anyhow::Result<()> {
         let pod_store = crate::bootstrap::pod_repository_composition::new_pod_store(
             Arc::new(self.db.as_ref().clone()),
-            self.db.focused_committed_apply(),
+            self.db.clone(),
             self.db.focused_read_store(),
             self.db.focused_read_store(),
         );
         let endpoint_store = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
             Arc::new(self.db.as_ref().clone()),
-            self.db.focused_committed_apply(),
+            self.db.clone(),
             self.db.focused_read_store(),
             self.db.focused_read_store(),
         );
@@ -643,7 +641,7 @@ impl IntegrationLeaderRpcComposition {
         let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
             crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                 self.applied_outbox.clone(),
-                self.committed_apply.clone(),
+                self.db.clone(),
                 self.resource_reads.clone(),
             ),
         );
@@ -686,7 +684,7 @@ impl IntegrationLeaderRpcComposition {
         side_effects.set_non_pod_finalization(Arc::new(
             crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test(
                 self.applied_outbox.clone(),
-                self.committed_apply.clone(),
+                self.db.clone(),
                 self.resource_reads.clone(),
                 self.db.focused_read_store(),
             ),
@@ -695,7 +693,7 @@ impl IntegrationLeaderRpcComposition {
             committed_outbox_delivery_adapter::test_resource_command(
                 &authority_handle,
                 self.applied_outbox.clone(),
-                self.committed_apply.clone(),
+                self.db.clone(),
                 self.resource_reads.clone(),
             );
         let authenticated_outbox = crate::bootstrap::composition_adapters::
@@ -704,7 +702,7 @@ impl IntegrationLeaderRpcComposition {
                 side_effects,
                 "grpc-test".to_string(),
                 self.applied_outbox.clone(),
-                self.committed_apply.clone(),
+                self.db.clone(),
                 self.resource_reads.clone(),
             );
         let local_node_lease = Arc::new(

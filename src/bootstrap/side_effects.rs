@@ -16,7 +16,7 @@ pub(crate) fn default_registry(
     services: Option<Arc<dyn klights_network_api::ServiceRouter>>,
     task_supervisor: Option<Arc<klights_supervisor::TaskSupervisor>>,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
     namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
@@ -33,7 +33,7 @@ pub(crate) fn default_registry(
             Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                     applied_outbox,
-                    committed_apply,
+                    canonical,
                     resource_reads.clone(),
                 ),
             ),
@@ -175,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_side_effect_enqueues_daemonset_key_without_inline_reconcile() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -191,7 +191,7 @@ mod tests {
             None,
             Some(task_supervisor),
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_jobs_after_pod_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -280,7 +280,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -395,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_pod_side_effect_not_registered_for_generic_pod_hook() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -405,7 +405,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -489,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_endpoint_hooks_do_not_enqueue_service_reconcile() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -499,7 +499,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -540,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_replicationcontroller_owner_after_pod_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -550,7 +550,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -668,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_matching_replicaset_for_orphan_pod_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -678,7 +678,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -765,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_replicaset_parent_deployment_after_pod_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -775,7 +775,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,
@@ -892,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_job_without_explicit_selector_after_pod_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -902,7 +902,7 @@ mod tests {
             None,
             None,
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
             ports.namespace_content_reads,

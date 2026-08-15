@@ -106,7 +106,7 @@ impl IntegrationRaftComposition {
         let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
             &authority,
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         );
         let store = Arc::new(

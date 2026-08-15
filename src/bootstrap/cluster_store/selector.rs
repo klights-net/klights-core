@@ -266,6 +266,29 @@ pub(crate) async fn open_with_sink(
     }
 }
 
+/// Root-composed canonical SQLite fixture for bootstrap tests that require
+/// committed watch wakeups. The datastore remains the canonical embedded
+/// implementation; only the root-owned test sink is composed here.
+#[cfg(test)]
+pub(crate) async fn canonical_sqlite_fixture()
+-> anyhow::Result<klights_cluster_datastore::sqlite::embedded::Datastore> {
+    let supervisor = Arc::new(TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let executor = klights_cluster_datastore::sqlite::open_in_memory(
+        supervisor,
+        "sqlite:root-canonical-fixture",
+    )
+    .await?;
+    klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+        executor,
+        crate::bootstrap::watch_commit_wiring::new_sink(),
+        crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+        Arc::new(klights_supervisor::SystemWallClock),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

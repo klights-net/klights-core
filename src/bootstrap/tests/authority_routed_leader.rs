@@ -1222,7 +1222,7 @@ async fn stub_remote_forwarder_refuses_writes_with_retryable() {
 /// dispatch level without standing up the full bootstrap.
 #[tokio::test]
 async fn bootstrap_style_proxy_composition_dispatches_correctly() {
-    let concrete_db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let concrete_db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let canonical = concrete_db.clone();
@@ -1249,7 +1249,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
     let proposal = Arc::new(
         crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         ),
     );
@@ -1291,7 +1291,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
             local_side_effects,
             "cp1".to_string(),
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         );
     let proxy = AuthorityRoutedLeader::new(

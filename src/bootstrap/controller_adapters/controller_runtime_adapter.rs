@@ -32,22 +32,19 @@ impl RootControllerLeaderPort {
     #[cfg(test)]
     pub(crate) fn new_for_test(
         applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         resource_reads: Arc<dyn ClusterResourceRead>,
         ownership_reads: Arc<dyn ClusterOwnershipRead>,
     ) -> Self {
-        let commands = Self::resource_commands_for_test(
-            applied_outbox,
-            committed_apply,
-            resource_reads.clone(),
-        );
+        let commands =
+            Self::resource_commands_for_test(applied_outbox, canonical, resource_reads.clone());
         Self::new_with_commands(resource_reads, ownership_reads, commands)
     }
 
     #[cfg(test)]
     pub(crate) fn resource_commands_for_test(
         applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-        committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         resource_reads: Arc<dyn ClusterResourceRead>,
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let authority =
@@ -58,7 +55,7 @@ impl RootControllerLeaderPort {
                 Arc::new(
                     crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                         applied_outbox,
-                        committed_apply,
+                        canonical,
                         resource_reads,
                     ),
                 ),
@@ -1415,7 +1412,7 @@ fn runtime_dependencies_for_test(
     );
     let resource_commands = RootControllerLeaderPort::resource_commands_for_test(
         ports.applied_outbox.clone(),
-        ports.committed_apply.clone(),
+        std::sync::Arc::new(db.clone()),
         ports.read_ports.resource_reads(),
     );
     let (
@@ -1470,7 +1467,7 @@ fn runtime_dependencies_for_test(
     );
     let leader = Arc::new(RootControllerLeaderPort::new_for_test(
         ports.applied_outbox.clone(),
-        ports.committed_apply.clone(),
+        std::sync::Arc::new(db.clone()),
         ports.read_ports.resource_reads(),
         ports.ownership_reads.clone(),
     ));
@@ -1491,7 +1488,7 @@ fn runtime_dependencies_for_test(
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test(
             ports.applied_outbox,
-            ports.committed_apply,
+            std::sync::Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
         ),

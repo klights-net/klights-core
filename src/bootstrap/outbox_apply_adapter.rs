@@ -11,29 +11,30 @@ use async_trait::async_trait;
 use klights_cluster_core::{
     BuildOutboxOutcome, OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark, StorageCommand,
 };
-use klights_cluster_store::{
-    AppliedOutboxLedger, ClusterResourceRead, CommittedRaftApplyRequest,
-    PrivilegedCommittedRaftApply, ResourceGetRequest,
-};
+use klights_cluster_store::{AppliedOutboxLedger, ClusterResourceRead, ResourceGetRequest};
 use klights_replication::proposal::{RaftProposal, RaftProposalEffect};
 
 const TEST_RESOURCE_COMMAND_OPERATION: &str = "test-resource-command";
 
 pub(crate) struct BackendProposalFixture {
     outbox_ledger: Arc<dyn AppliedOutboxLedger>,
-    committed_apply: Arc<dyn PrivilegedCommittedRaftApply>,
+    /// Test composition keeps the canonical concrete store solely for the
+    /// existing post-commit publication boundary.  The focused privileged
+    /// apply port deliberately returns only its receipt, while this fixture
+    /// also has to drive the root-owned watch sink after durable commit.
+    canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 impl BackendProposalFixture {
     pub(crate) fn new(
         outbox_ledger: Arc<dyn AppliedOutboxLedger>,
-        committed_apply: Arc<dyn PrivilegedCommittedRaftApply>,
+        canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         resource_reads: Arc<dyn ClusterResourceRead>,
     ) -> Self {
         Self {
             outbox_ledger,
-            committed_apply,
+            canonical,
             resource_reads,
         }
     }
@@ -53,8 +54,8 @@ impl BackendProposalFixture {
             .await
             .map_err(|error| crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test(anyhow::Error::new(error)))?;
         let receipt = self
-            .committed_apply
-            .apply_committed_raft(CommittedRaftApplyRequest::new(commit))
+            .canonical
+            .apply_raft_log_apply_commit_receipt(commit)
             .await
             .map_err(|error| anyhow::anyhow!("test committed apply: {error:#}"))?;
         let mut result =
@@ -101,8 +102,8 @@ impl BackendProposalFixture {
                 terminal_error,
             } => {
                 let receipt = self
-                    .committed_apply
-                    .apply_committed_raft(CommittedRaftApplyRequest::new(commit))
+                    .canonical
+                    .apply_raft_log_apply_commit_receipt(commit)
                     .await
                     .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
                 if let Some(error) = terminal_error {
@@ -274,7 +275,7 @@ mod review_regressions {
 
     #[tokio::test]
     async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         db.create_resource(
@@ -301,7 +302,7 @@ mod review_regressions {
         let canonical = db.clone();
         let fixture = super::BackendProposalFixture::new(
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         );
         let result = fixture

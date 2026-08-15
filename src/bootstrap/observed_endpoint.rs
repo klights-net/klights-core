@@ -372,7 +372,7 @@ mod tests {
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
             {
-                Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store()))
+                Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store()))
             },
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         )
@@ -380,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_published_self_heals_when_local_node_has_external_ip() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -426,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_published_keeps_observing_without_external_ip() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();

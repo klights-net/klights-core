@@ -132,14 +132,14 @@ impl GcNonPodFinalizationAdapter {
     #[cfg(test)]
     pub(crate) fn new_for_test(
         applied_outbox: std::sync::Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-        committed_apply: std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+        canonical: std::sync::Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
         resource_reads: std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>,
         ownership_reads: std::sync::Arc<dyn ClusterOwnershipRead>,
     ) -> Self {
         let commands =
             super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 applied_outbox,
-                committed_apply,
+                canonical,
                 resource_reads.clone(),
             );
         Self::new_with_commands(resource_reads, ownership_reads, commands)
@@ -280,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_pod_port_rejects_pod_without_touching_datastore() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let pod = db
@@ -305,7 +305,7 @@ mod tests {
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let adapter = GcNonPodFinalizationAdapter::new_for_test(
             ports.applied_outbox,
-            ports.committed_apply,
+            std::sync::Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
         );
@@ -382,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_is_command_routed_end_to_end() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let owner = db
@@ -481,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_rejects_follower_without_local_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let owner = db

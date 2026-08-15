@@ -73,7 +73,7 @@ pub(crate) fn port(
 mod adapter_tests {
     #[tokio::test]
     async fn test_resource_quota_recount_name() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
@@ -82,7 +82,7 @@ mod adapter_tests {
             std::sync::Arc::new(
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
                     ports.applied_outbox,
-                    ports.committed_apply,
+                    std::sync::Arc::new(db.clone()),
                     ports.read_ports.resource_reads(),
                     ports.ownership_reads,
                 ),

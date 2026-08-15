@@ -656,7 +656,7 @@ mod tests {
         let joiner_fixture = crate::paths::test_data_root_fixture(&joiner_namespace);
         let leader_data_root = leader_fixture.path().to_path_buf();
         let joiner_data_root = joiner_fixture.path().to_path_buf();
-        let sqlite = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let db = std::sync::Arc::new(sqlite.clone());
@@ -668,7 +668,7 @@ mod tests {
             sqlite.focused_read_store(),
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 std::sync::Arc::new(sqlite.clone()),
-                sqlite.focused_committed_apply(),
+                std::sync::Arc::new(sqlite.clone()),
                 sqlite.focused_read_store(),
             ),
         );

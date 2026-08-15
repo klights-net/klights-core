@@ -39,7 +39,7 @@ mod tests {
     ) -> crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::RootPodRepositoryPersistenceParts{
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
         crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts_from_test_ports(
-            clock, ports.applied_outbox, ports.committed_apply, ports.read_ports.resource_reads(), ports.ownership_reads,
+            clock, ports.applied_outbox, Arc::new(db.clone()), ports.read_ports.resource_reads(), ports.ownership_reads,
         )
     }
 
@@ -479,7 +479,7 @@ mod tests {
         klights_cluster_datastore::sqlite::embedded::Datastore,
         std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let persistence = test_persistence(&db, clock.clone());
@@ -511,13 +511,13 @@ mod tests {
         klights_cluster_datastore::sqlite::embedded::Datastore,
         std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
         ));
@@ -547,13 +547,13 @@ mod tests {
     async fn probe_workqueue_for_persistence(
         persistence: impl PodWorkqueuePersistence + 'static,
     ) -> Arc<PodWorkqueue> {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
             ports.applied_outbox,
-            ports.committed_apply,
+            Arc::new(db.clone()),
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
         ));
@@ -618,7 +618,7 @@ mod tests {
         Arc<klights_supervisor::TaskSupervisor>,
         Arc<Notify>,
     ) {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let persistence = test_persistence(
@@ -908,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let persistence = test_persistence(
@@ -1093,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_lease_cannot_delete_unscheduled_pod_after_demote_promote_aba() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let persistence = test_persistence(
@@ -2174,7 +2174,7 @@ mod tests {
                 db.focused_read_store(),
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                     Arc::new(db.clone()),
-                    db.focused_committed_apply(),
+                    Arc::new(db.clone()),
                     db.focused_read_store(),
                 ),
             ),
@@ -2348,12 +2348,12 @@ mod tests {
     /// be delayed by the sleep duration.
     #[tokio::test]
     async fn reconciler_exits_on_root_cancellation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
             Arc::new(db.clone()),
-            db.focused_committed_apply(),
+            Arc::new(db.clone()),
             db.focused_read_store(),
             db.focused_read_store(),
         ));

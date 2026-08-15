@@ -42,7 +42,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_mirror_delete_hook_removes_mirrored_slice() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         db.create_resource(
@@ -77,7 +77,7 @@ mod tests {
         klights_controllers::side_effects::endpoint_mirror::effect(port(
             Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(
                 ports.applied_outbox,
-                ports.committed_apply,
+                std::sync::Arc::new(db.clone()),
                 ports.read_ports.resource_reads(),
                 ports.ownership_reads,
             )),

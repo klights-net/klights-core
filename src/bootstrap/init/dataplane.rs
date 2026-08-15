@@ -320,7 +320,7 @@ mod tests {
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
             {
-                std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(std::sync::Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store()))
+                std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(std::sync::Arc::new(canonical.clone()), std::sync::Arc::new(canonical.clone()), canonical.focused_read_store()))
             },
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         )
@@ -382,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_prefers_config_external_endpoint() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -397,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_falls_back_to_node_external_ip() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -434,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_none_without_endpoint_or_external_ip() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_publishes_node_dataplane_from_registered_external_ip() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -526,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_node_dataplane_published_writes_when_missing() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -558,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_node_dataplane_published_is_noop_when_row_exists() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -609,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_is_noop_without_resolvable_endpoint() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();

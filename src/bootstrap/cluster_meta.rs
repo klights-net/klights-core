@@ -163,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_creates_on_first_boot() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
 
@@ -223,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_idempotent_on_restart() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
 
@@ -272,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_cluster_metadata_returns_initialized_values() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         ensure_cluster_metadata_sqlite(&db).await.unwrap();
@@ -286,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_cluster_metadata_fails_before_init() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let result = read_cluster_metadata_sqlite(&db).await;
@@ -299,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn voters_row_round_trips() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         ensure_cluster_metadata_sqlite(&db).await.unwrap();
@@ -326,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn membership_change_commits_update_meta() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         ensure_cluster_metadata_sqlite(&db).await.unwrap();

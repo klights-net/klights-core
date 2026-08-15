@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalized_effects_route_bound_pod_children_to_actor_sink() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let canonical = db.clone();
@@ -377,7 +377,7 @@ mod tests {
                 Arc::new(
                     crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                         Arc::new(canonical.clone()),
-                        canonical.focused_committed_apply(),
+                        Arc::new(canonical.clone()),
                         canonical.focused_read_store(),
                     ),
                 ),

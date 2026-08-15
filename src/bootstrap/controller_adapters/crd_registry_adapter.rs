@@ -135,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn datastore_reader_is_registry_source_of_truth() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let registry = CrdRegistry::new();
@@ -200,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_runtime_syncs_datastore_applied_crds() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let passive_reads =

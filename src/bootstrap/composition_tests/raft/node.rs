@@ -656,7 +656,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(node_executor));
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -755,7 +755,7 @@ mod tests {
             .expect("open node-local executor");
             let node_local = Arc::new(SqliteRaftDurability::new(exec));
             let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-                klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+                crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                     .await
                     .unwrap(),
             );
@@ -922,7 +922,7 @@ mod tests {
             .expect("open node-local executor");
             let node_local = Arc::new(SqliteRaftDurability::new(exec));
             let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-                klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+                crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                     .await
                     .unwrap(),
             );
@@ -1039,7 +1039,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(exec));
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1127,7 +1127,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(exec));
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -2038,7 +2038,7 @@ mod tests {
 
     async fn test_db() -> Arc<klights_cluster_datastore::sqlite::embedded::Datastore> {
         Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         )
@@ -2662,7 +2662,7 @@ mod tests {
         .unwrap();
         let node_local = Arc::new(SqliteRaftDurability::new(executor));
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -3129,7 +3129,7 @@ mod tests {
         .unwrap();
         let nl1 = Arc::new(SqliteRaftDurability::new(exec1));
         let be1: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -3166,7 +3166,7 @@ mod tests {
         .unwrap();
         let nl2 = Arc::new(SqliteRaftDurability::new(exec2));
         let be2: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );

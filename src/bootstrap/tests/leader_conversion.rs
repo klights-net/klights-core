@@ -35,7 +35,7 @@ fn test_outbox_delivery(
             side_effects.clone(),
             local_node.to_string(),
             Arc::new(canonical.clone()),
-            canonical.focused_committed_apply(),
+            Arc::new(canonical.clone()),
             canonical.focused_read_store(),
         );
     (delivery, side_effects)
@@ -71,7 +71,7 @@ fn test_network_port(
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store())),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
     )
@@ -85,7 +85,7 @@ fn test_cleanup_port(
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
             crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db).pod_cleanup,
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), canonical.focused_committed_apply(), canonical.focused_read_store())),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
     )
@@ -241,7 +241,7 @@ fn cronjob_job() -> serde_json::Value {
 async fn cronjob_job_create_routes_exact_raft_command_without_passive_mutation() {
     use klights_controllers::cronjob::CronJobStore as _;
 
-    let passive = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let before_rv = passive.get_current_resource_version().await.unwrap();
@@ -290,7 +290,7 @@ async fn cronjob_job_create_routes_exact_raft_command_without_passive_mutation()
 async fn cronjob_job_create_follower_rejection_preserves_passive_store() {
     use klights_controllers::cronjob::CronJobStore as _;
 
-    let passive = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let before_rv = passive.get_current_resource_version().await.unwrap();
@@ -334,7 +334,7 @@ async fn cronjob_job_delete_and_status_preserve_strict_uid_rv_preconditions() {
     use klights_controllers::common::ControllerStatusStore as _;
     use klights_controllers::cronjob::CronJobStore as _;
 
-    let passive = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let commands = Arc::new(RecordingCronJobCommands {
@@ -404,7 +404,7 @@ async fn cronjob_job_delete_and_status_preserve_strict_uid_rv_preconditions() {
 async fn seed_bootstrap_mutation_uses_command_port_without_passive_write() {
     use klights_controllers::kube_service::KubernetesBootstrapStore as _;
 
-    let passive = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let commands = Arc::new(RecordingBootstrapCommands {
@@ -473,7 +473,7 @@ impl klights_leader_api::LeaderResourceCommand for RecordingNodeCleanupCommands 
 
 #[tokio::test]
 async fn node_hard_delete_cleanup_routes_one_raft_command_without_passive_rv_mutation() {
-    let passive = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let before_rv = passive.get_current_resource_version().await.unwrap();
@@ -558,7 +558,7 @@ async fn node_effect_ports_remote_rejects_cross_node_before_transport() {
 
 #[tokio::test]
 async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
@@ -599,7 +599,7 @@ async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
 
 #[tokio::test]
 async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stale_rv() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let created = db
@@ -631,7 +631,7 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
     );
     let resource_commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
         Arc::new(canonical.clone()),
-        canonical.focused_committed_apply(),
+        Arc::new(canonical.clone()),
         canonical.focused_read_store(),
     );
     let client = LocalNodeLifecycleStatusAdapter::new(resource_query, resource_commands, authority);
@@ -714,7 +714,7 @@ impl klights_leader_api::LeaderResourceCommand for RecordingNodeLifecycleCommand
 
 #[tokio::test]
 async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let created = db
@@ -877,7 +877,7 @@ fn pod_delete_payload_for(
 
 #[tokio::test]
 async fn local_client_reads_pods_through_focused_resource_query() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -917,7 +917,7 @@ async fn local_client_reads_pods_through_focused_resource_query() {
 
 #[tokio::test]
 async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let replacement = db
@@ -969,7 +969,7 @@ async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() 
 
 #[tokio::test]
 async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -1092,7 +1092,7 @@ async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
 
 #[tokio::test]
 async fn local_client_apply_outbox_returns_committed_resource_version() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -1144,7 +1144,7 @@ async fn local_client_apply_outbox_returns_committed_resource_version() {
 
 #[tokio::test]
 async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_namespace(
@@ -1230,7 +1230,7 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
                     db.focused_read_store(),
                     db.focused_read_store(),
                     crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
-                        Arc::new(db.clone()), db.focused_committed_apply(), db.focused_read_store(),
+                        Arc::new(db.clone()), Arc::new(db.clone()), db.focused_read_store(),
                     ),
                 ),
                 klights_controllers::side_effects::SideEffectMetrics::new(),
@@ -1239,7 +1239,7 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
     side_effects.set_non_pod_finalization(Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test(
             Arc::new(db.clone()),
-            db.focused_committed_apply(),
+            Arc::new(db.clone()),
             db.focused_read_store(),
             db.focused_read_store(),
         ),
@@ -1288,7 +1288,7 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
 
 #[tokio::test]
 async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -1346,7 +1346,7 @@ async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
     side_effects.set_non_pod_finalization(Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test(
             Arc::new(db.clone()),
-            db.focused_committed_apply(),
+            Arc::new(db.clone()),
             db.focused_read_store(),
             db.focused_read_store(),
         ),
@@ -1400,7 +1400,7 @@ async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
 
 #[tokio::test]
 async fn local_client_serves_network_metadata_without_calling_forwarder() {
-    let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let network = test_network_port(&db);

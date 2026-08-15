@@ -748,7 +748,7 @@ pub(crate) fn new_root_parts_with_delete_cas_hook(
 pub(crate) fn new_root_parts_from_test_ports(
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> RootPodRepositoryPersistenceParts {
@@ -763,7 +763,7 @@ pub(crate) fn new_root_parts_from_test_ports(
             Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                     applied_outbox,
-                    committed_apply,
+                    canonical,
                     resource_reads,
                 ),
             ),
@@ -777,7 +777,7 @@ pub(crate) fn new_root_parts_from_test_ports(
 #[cfg(test)]
 pub(crate) fn new_store_from_test_ports(
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
-    committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> PodStore {
@@ -792,7 +792,7 @@ pub(crate) fn new_store_from_test_ports(
             Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
                     applied_outbox,
-                    committed_apply,
+                    canonical,
                     resource_reads,
                 ),
             ),
@@ -892,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_root_actor_finalization_submits_uid_bound_delete_without_local_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let created = db
@@ -962,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_root_unscheduled_delete_submits_exact_cas_without_local_mutation() {
-        let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let created = db
@@ -1034,7 +1034,7 @@ mod tests {
             (CommandDisposition::Conflict, true),
             (CommandDisposition::NotLeader, false),
         ] {
-            let db = klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory()
+            let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap();
             let created = db
