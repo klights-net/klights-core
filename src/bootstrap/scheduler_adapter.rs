@@ -27,8 +27,24 @@ impl LeaderSchedulerRuntime {
 impl SchedulerRuntime for LeaderSchedulerRuntime {
     async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError> {
         let mut sessions = Vec::with_capacity(2);
-        for (api_version, kind) in [("v1", "Pod"), ("v1", "Node")] {
-            let request = WatchRequest::try_new(api_version, kind, None, None, None, None, None)?;
+        for (api_version, kind, scope) in [
+            (
+                "v1",
+                "Pod",
+                klights_leader_api::ResourceListScope::AllNamespaces,
+            ),
+            ("v1", "Node", klights_leader_api::ResourceListScope::Cluster),
+        ] {
+            let request = WatchRequest::try_new_with_scope(
+                api_version,
+                kind,
+                None,
+                scope,
+                None,
+                None,
+                None,
+                None,
+            )?;
             sessions.push(self.positioned_watch.watch_resources(request).await?);
         }
         Ok(sessions)

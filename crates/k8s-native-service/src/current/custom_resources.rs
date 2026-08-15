@@ -981,10 +981,11 @@ async fn list_cr_inner(
             } else {
                 Some(requested_rv)
             };
-            let request = match klights_leader_api::WatchRequest::try_new(
+            let request = match klights_leader_api::WatchRequest::try_new_with_scope(
                 av.clone(),
                 kind.clone(),
                 watch_ns.clone(),
+                watch_scope.clone(),
                 label_selector.clone(),
                 field_selector.clone(),
                 start_resource_version,

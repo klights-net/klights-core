@@ -310,8 +310,15 @@ pub async fn run_focused_peer_watch(
             }
         }
 
-        let request = match klights_leader_api::WatchRequest::try_new(
-            "v1", "Node", None, None, None, None, None,
+        let request = match klights_leader_api::WatchRequest::try_new_with_scope(
+            "v1",
+            "Node",
+            None,
+            klights_leader_api::ResourceListScope::Cluster,
+            None,
+            None,
+            None,
+            None,
         )
         .and_then(|request| request.with_resume_cursor(cursor))
         {

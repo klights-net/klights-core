@@ -5,18 +5,68 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_cluster_store::{
-    AllocatorStateError, AllocatorStateFuture, DurableAllocatorRead, DurableAllocatorState,
-    DurableWatchEvent, DurableWatchHistoryRead, DurableWatchTarget, ResourceGetRequest,
-    ResourceListPage, ResourceListRead, ResourceListRequest, ResourceListSnapshot,
-    ResourceReadFuture, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead,
-    WatchHistoryRequest,
+    AllocatorStateError, AllocatorStateFuture, ClusterResourceScopeRead, DurableAllocatorRead,
+    DurableAllocatorState, DurableWatchEvent, DurableWatchHistoryRead, DurableWatchTarget,
+    ResourceGetRequest, ResourceKeyScopeRequest, ResourceListPage, ResourceListRead,
+    ResourceListRequest, ResourceListSnapshot, ResourceReadFuture,
+    ResourceSnapshotAtPositionRequest, ResourceSnapshotRead, ResourceWatchTargetsRequest,
+    WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
 };
 use klights_leader_api::{LeaderWatch, WatchEventType, WatchRequest};
 use klights_watch::{
     PositionedWatchService, ProjectedWatchBaselineRead, ProjectedWatchBaselineRequest,
-    ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope, WatchScopeResolver,
+    ProjectedWatchPlan, SnapshotProjectedWatchBaseline, WatchResourceProjection,
     WatchSignalReceiver, WatchSignalSubscribe, WatchTopic,
 };
+
+struct ExpiredSnapshot;
+
+impl ClusterResourceScopeRead for ExpiredSnapshot {
+    fn list_resources_for_watch_targets(
+        &self,
+        _: ResourceWatchTargetsRequest,
+    ) -> ResourceReadFuture<'_, klights_cluster_store::ResourceScopeSnapshot> {
+        Box::pin(async { unreachable!() })
+    }
+    fn list_resource_keys_for_scope(
+        &self,
+        _: ResourceKeyScopeRequest,
+    ) -> ResourceReadFuture<'_, Vec<klights_cluster_store::ResourceCollectionKey>> {
+        Box::pin(async { unreachable!() })
+    }
+    fn list_cluster_resources(&self) -> ResourceReadFuture<'_, Vec<Resource>> {
+        Box::pin(async { unreachable!() })
+    }
+    fn snapshot_resources_at_position(
+        &self,
+        _: ResourceSnapshotAtPositionRequest,
+    ) -> ResourceReadFuture<'_, ResourceSnapshotRead> {
+        Box::pin(async { Ok(ResourceSnapshotRead::Expired) })
+    }
+}
+
+#[tokio::test]
+async fn projected_snapshot_baseline_preserves_typed_expiry_position() {
+    let position = position(7, 11);
+    let baseline = SnapshotProjectedWatchBaseline::new(Arc::new(ExpiredSnapshot));
+    let result = baseline
+        .read_baseline(ProjectedWatchBaselineRequest::new(
+            vec![DurableWatchTarget::namespaced("example.io/v1", "Widget")],
+            None,
+            None,
+            position,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ResourceListRead::Expired {
+            requested: 7,
+            oldest_available: 8,
+            ..
+        }
+    ));
+}
 
 fn position(resource_version: i64, event_id: i64) -> WatchReplayPosition {
     WatchReplayPosition {
@@ -112,21 +162,6 @@ struct OrderedSignals {
     subscribed: Arc<AtomicBool>,
 }
 
-struct NamespacedScopes;
-
-impl WatchScopeResolver for NamespacedScopes {
-    fn resource_scope<'a>(
-        &'a self,
-        _api_version: &'a str,
-        _kind: &'a str,
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<WatchResourceScope, klights_leader_api::LeaderWatchError>,
-    > {
-        Box::pin(async { Ok(WatchResourceScope::Namespaced) })
-    }
-}
-
 impl WatchSignalSubscribe for OrderedSignals {
     fn subscribe(&self, _topic: WatchTopic) -> WatchSignalReceiver {
         self.subscribed.store(true, Ordering::Release);
@@ -168,7 +203,6 @@ async fn omitted_cursor_subscribes_before_atomic_anchor_and_replays_the_gap() {
         Arc::new(OrderedSignals {
             subscribed: subscribed.clone(),
         }),
-        Arc::new(NamespacedScopes),
     );
 
     let mut stream = service
@@ -233,7 +267,6 @@ async fn exact_list_position_is_the_authoritative_watch_cursor() {
         Arc::new(OrderedSignals {
             subscribed: subscribed.clone(),
         }),
-        Arc::new(NamespacedScopes),
     );
 
     let _stream = service
@@ -374,7 +407,6 @@ async fn projected_multi_target_session_uses_one_membership_and_replay_state_mac
         Arc::new(history),
         Arc::new(ForbiddenAllocator),
         Arc::new(CountingSignals(subscriptions.clone())),
-        Arc::new(NamespacedScopes),
     );
     let request = WatchRequest::try_new(
         "example.io/v2",
@@ -396,7 +428,6 @@ async fn projected_multi_target_session_uses_one_membership_and_replay_state_mac
             WatchTopic::new("example.io/v1", "Widget"),
             WatchTopic::new("example.io/v1beta1", "Widget"),
         ],
-        WatchResourceScope::Namespaced,
         Arc::new(EmptyProjectedBaseline {
             expected: start,
             subscriptions: subscriptions.clone(),

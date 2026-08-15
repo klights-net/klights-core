@@ -80,15 +80,13 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // Resolve worker credential: use persisted node client cert when available,
     // otherwise bootstrap one via CSR before creating steady-state clients.
     let (client_cert_pem, client_key_pem) = {
-        use crate::bootstrap::composition_adapters::{
-            worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore,
-            worker_csr_http_adapter::HttpCsrBootstrapClient,
-        };
         use klights_auth::worker_credential::{
             WorkerCredentialSource, bootstrap_worker_credential, resolve_worker_credential,
         };
-        let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-            &config.containerd_namespace,
+        use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
+        use klights_auth::worker_csr_http_client::HttpCsrBootstrapClient;
+        let store = SupervisedFilesystemWorkerCredentialStore::new(
+            crate::paths::etc_dir_path(&config.containerd_namespace),
             &config.node_name,
             task_supervisor.clone(),
         );

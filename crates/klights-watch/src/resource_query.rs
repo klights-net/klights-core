@@ -1,4 +1,4 @@
-//! Composition-owned passive resource query.
+//! Canonical positioned resource-query policy.
 //!
 //! The selected cluster store is adapted to the transport-neutral query port
 //! at the bootstrap boundary.  Local leader effects may consume that port,
@@ -23,14 +23,13 @@ use klights_cluster_store::{
     ResourceVersionMatch,
 };
 
-use crate::bootstrap::authority::AuthorityHandle;
 use klights_cluster_core::Resource;
 
 const PRIVATE_CONTINUATION_CODEC_VERSION: u8 = 2;
 /// Kubernetes clients must be able to restart a chunked LIST after bounded
 /// server-side retention. Keep the private pinned snapshot lifetime aligned
 /// with the upstream compaction cadence rather than an unbounded row count.
-pub(crate) const PRIVATE_PINNED_CONTINUATION_TTL: Duration = Duration::from_secs(5 * 60);
+pub const PRIVATE_PINNED_CONTINUATION_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Root-owned, versioned LIST cursor payload. It is intentionally private:
 /// native HTTP and leader RPC only transport its ASCII representation, while
@@ -311,9 +310,9 @@ fn private_crd_plan_ref(definition: &Resource) -> Result<PrivateCrdPlanRef, Reso
     })
 }
 
-pub(crate) struct DatastoreResourceQueryAdapter {
+pub struct DatastoreResourceQueryAdapter {
     resource_reads: Arc<dyn ClusterResourceRead>,
-    authority: AuthorityHandle,
+    authority: Arc<dyn klights_leader_api::LeaderAuthority>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
@@ -321,11 +320,14 @@ impl DatastoreResourceQueryAdapter {
     /// The root-selected public LIST path. The focused read port receives
     /// decoded typed cursors and the root injects the clock that defines a
     /// pinned pagination session's bounded lifetime.
-    pub(crate) fn new_with_resource_reads_and_clock<A: Into<AuthorityHandle>>(
+    pub fn new_with_resource_reads_and_clock<A>(
         resource_reads: Arc<dyn ClusterResourceRead>,
         authority: A,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    ) -> Arc<Self> {
+    ) -> Arc<Self>
+    where
+        A: Into<Arc<dyn klights_leader_api::LeaderAuthority>>,
+    {
         Arc::new(Self {
             resource_reads,
             authority: authority.into(),
@@ -333,11 +335,13 @@ impl DatastoreResourceQueryAdapter {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_focused_for_test<A: Into<AuthorityHandle>>(
+    pub fn new_focused_for_test<A>(
         resource_reads: Arc<dyn ClusterResourceRead>,
         authority: A,
-    ) -> Arc<Self> {
+    ) -> Arc<Self>
+    where
+        A: Into<Arc<dyn klights_leader_api::LeaderAuthority>>,
+    {
         Arc::new(Self {
             resource_reads,
             authority: authority.into(),
@@ -345,12 +349,14 @@ impl DatastoreResourceQueryAdapter {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_focused_for_test_with_clock<A: Into<AuthorityHandle>>(
+    pub fn new_focused_for_test_with_clock<A>(
         resource_reads: Arc<dyn ClusterResourceRead>,
         authority: A,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    ) -> Arc<Self> {
+    ) -> Arc<Self>
+    where
+        A: Into<Arc<dyn klights_leader_api::LeaderAuthority>>,
+    {
         Arc::new(Self {
             resource_reads,
             authority: authority.into(),
@@ -442,11 +448,16 @@ impl DatastoreResourceQueryAdapter {
         if consistency != ResourceQueryConsistency::LeaderFresh {
             return Ok(None);
         }
-        self.authority.local_permit().map(Some).map_err(|_| {
-            ResourceQueryError::retryable(
+        match self.authority.route() {
+            klights_leader_api::AuthorityRoute::Local(permit)
+                if self.authority.validate(&permit).is_ok() =>
+            {
+                Ok(Some(permit))
+            }
+            _ => Err(ResourceQueryError::retryable(
                 "leader-fresh resource query reached a non-authoritative local store",
-            )
-        })
+            )),
+        }
     }
 
     fn focused_read_error(error: ResourceReadError) -> ResourceQueryError {
@@ -1230,6 +1241,33 @@ impl LeaderResourceQuery for DatastoreResourceQueryAdapter {
 mod tests {
     use super::*;
 
+    struct AlwaysLeader(klights_leader_api::AuthorityPermitIssuer);
+    impl klights_leader_api::LeaderAuthority for AlwaysLeader {
+        fn route(&self) -> klights_leader_api::AuthorityRoute {
+            klights_leader_api::AuthorityRoute::Local(self.0.issue(1))
+        }
+        fn validate(
+            &self,
+            _: &klights_leader_api::AuthorityPermit,
+        ) -> Result<(), klights_leader_api::AuthorityError> {
+            Ok(())
+        }
+        fn acquire(&self) -> klights_leader_api::AuthorityAcquireFuture<'_> {
+            Box::pin(async move { Ok(self.0.issue(1)) })
+        }
+        fn wait_for_revocation<'a>(
+            &'a self,
+            _: &'a klights_leader_api::AuthorityPermit,
+        ) -> klights_leader_api::AuthorityRevocationFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+    fn always_leader_authority() -> Arc<dyn klights_leader_api::LeaderAuthority> {
+        Arc::new(AlwaysLeader(
+            klights_leader_api::AuthorityPermitIssuer::new(),
+        ))
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct CrdMergeSpyCall {
         api_version: String,
@@ -1359,7 +1397,7 @@ mod tests {
         let reads: Arc<dyn ClusterResourceRead> = Arc::new(spy.clone());
         let adapter = DatastoreResourceQueryAdapter::new_focused_for_test(
             reads.clone(),
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+            always_leader_authority(),
         );
         let plan = crd_merge_plan(position);
         let first = adapter
@@ -1542,7 +1580,7 @@ mod tests {
         };
         let adapter = DatastoreResourceQueryAdapter::new_focused_for_test_with_clock(
             Arc::new(CrdMergeSpy::new(position)),
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+            always_leader_authority(),
             Arc::new(FixedClock(
                 UNIX_EPOCH + Duration::from_millis(NOW_UNIX_MS as u64),
             )),

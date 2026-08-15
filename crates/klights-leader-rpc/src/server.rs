@@ -1668,10 +1668,32 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         // the new leader instead of streaming from a deposed node.
         let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
-        let watch_request = klights_leader_api::WatchRequest::try_new(
+        let scope = match klights_internal_protobuf::ResourceListScope::try_from(req.scope) {
+            Ok(klights_internal_protobuf::ResourceListScope::Cluster) => {
+                klights_leader_api::ResourceListScope::Cluster
+            }
+            Ok(klights_internal_protobuf::ResourceListScope::AllNamespaces) => {
+                klights_leader_api::ResourceListScope::AllNamespaces
+            }
+            Ok(klights_internal_protobuf::ResourceListScope::Namespace) => {
+                match req.namespace.clone() {
+                    Some(namespace) => klights_leader_api::ResourceListScope::Namespace(namespace),
+                    None => {
+                        return Err(Status::invalid_argument(
+                            "watch namespace scope requires namespace",
+                        ));
+                    }
+                }
+            }
+            Ok(klights_internal_protobuf::ResourceListScope::Unspecified) | Err(_) => {
+                return Err(Status::invalid_argument("watch scope must be specified"));
+            }
+        };
+        let watch_request = klights_leader_api::WatchRequest::try_new_with_scope(
             req.api_version.clone(),
             req.kind.clone(),
             req.namespace.clone(),
+            scope,
             req.label_selector.clone(),
             req.field_selector.clone(),
             req.start_resource_version,

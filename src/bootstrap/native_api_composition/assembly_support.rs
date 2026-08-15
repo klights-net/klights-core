@@ -468,7 +468,7 @@ pub(crate) mod support {
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority()
             });
             let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
-                crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
+                klights_watch::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
                     passive_reads.resource_reads(),
                     resource_query_authority,
                     list_cursor_clock,

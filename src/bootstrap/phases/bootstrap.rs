@@ -516,8 +516,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             supervisor.clone(),
         )) as Arc<dyn klights_node_api::NodeMetricsSampler>
     });
-    let node_metrics: Arc<dyn klights_node_api::NodeMetrics> = Arc::new(
-        crate::bootstrap::composition_adapters::node_metrics_adapter::RootNodeMetrics::new(
+    let node_metrics: Arc<dyn klights_node_api::NodeMetrics> =
+        Arc::new(klights_kubelet::metrics::RoutedNodeMetrics::new(
             config.node_name.clone(),
             local_node_metrics,
             replication_service_for_router.clone().map(|service| {
@@ -525,8 +525,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     as Arc<dyn klights_node_api::NodeMetrics>
             }),
             supervisor.clone(),
-        ),
-    );
+        ));
 
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let namespace_lifecycle_store =

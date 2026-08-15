@@ -23,9 +23,9 @@ impl CustomResourceReadAdapter {
         positioned_watch: klights_watch::PositionedWatchService,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Arc<Self> {
-        let projected_baseline = Arc::new(CrdProjectedWatchBaseline {
-            resource_scopes: resource_scopes.clone(),
-        });
+        let projected_baseline = Arc::new(klights_watch::SnapshotProjectedWatchBaseline::new(
+            resource_scopes.clone(),
+        ));
         Arc::new(Self {
             positioned_watch: positioned_watch.clone(),
             watch_source: super::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
@@ -96,14 +96,6 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
                 } => klights_watch::WatchTopic::new(api_version, kind),
             })
             .collect();
-        let resource_scope = if targets
-            .iter()
-            .all(|target| matches!(target, CustomResourceWatchTarget::Cluster { .. }))
-        {
-            klights_watch::WatchResourceScope::Cluster
-        } else {
-            klights_watch::WatchResourceScope::Namespaced
-        };
         let durable_targets = targets
             .iter()
             .map(custom_target_to_durable_target)
@@ -112,7 +104,6 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
             request,
             durable_targets,
             topics,
-            resource_scope,
             self.projected_baseline.clone(),
             Arc::new(CustomResourceProjectionAdapter(projection)),
         ) {
@@ -204,65 +195,5 @@ fn custom_target_to_durable_target(
             kind,
             namespace,
         ),
-    }
-}
-
-struct CrdProjectedWatchBaseline {
-    resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
-}
-
-impl klights_watch::ProjectedWatchBaselineRead for CrdProjectedWatchBaseline {
-    fn read_baseline(
-        &self,
-        request: klights_watch::ProjectedWatchBaselineRequest,
-    ) -> futures::future::BoxFuture<
-        '_,
-        Result<klights_cluster_store::ResourceListRead, klights_leader_api::LeaderWatchError>,
-    > {
-        Box::pin(async move {
-            match self
-                .resource_scopes
-                .snapshot_resources_at_position(
-                    klights_cluster_store::ResourceSnapshotAtPositionRequest::try_new(
-                        request.targets().to_vec(),
-                        request.label_selector().map(str::to_owned),
-                        None,
-                        request.position(),
-                    )
-                    .map_err(|error| {
-                        klights_leader_api::LeaderWatchError::unavailable(error.to_string())
-                    })?,
-                )
-                .await
-                .map_err(|error| {
-                    klights_leader_api::LeaderWatchError::unavailable(format!("{error:?}"))
-                })? {
-                klights_cluster_store::ResourceSnapshotRead::Historical(list) => {
-                    let snapshot = list.snapshot();
-                    let page = klights_cluster_store::ResourceListPage::try_new(
-                        list.into_items(),
-                        snapshot,
-                        None,
-                        None,
-                    )
-                    .map_err(|error| {
-                        klights_leader_api::LeaderWatchError::malformed_event(error.to_string())
-                    })?;
-                    Ok(klights_cluster_store::ResourceListRead::Historical(page))
-                }
-                klights_cluster_store::ResourceSnapshotRead::Expired => {
-                    Ok(klights_cluster_store::ResourceListRead::Expired {
-                        requested: request.position().resource_version,
-                        oldest_available: request.position().resource_version.saturating_add(1),
-                        replacement: None,
-                    })
-                }
-                klights_cluster_store::ResourceSnapshotRead::Current => {
-                    Err(klights_leader_api::LeaderWatchError::malformed_event(
-                        "CRD positioned baseline returned an unpinned Current sentinel",
-                    ))
-                }
-            }
-        })
     }
 }

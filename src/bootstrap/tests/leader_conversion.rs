@@ -20,7 +20,7 @@ fn test_outbox_delivery(
     Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState>,
 ){
     let authority = crate::bootstrap::authority::AuthorityHandle::from(
-        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
     );
     let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
     let canonical = db.clone();
@@ -625,9 +625,9 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
     let canonical = db.clone();
     let authority =
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+    let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         canonical.focused_read_store(),
-        authority.clone(),
+        crate::bootstrap::authority::AuthorityHandle::from(authority.clone()).authority_arc(),
     );
     let resource_commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
         Arc::new(canonical.clone()),
@@ -734,9 +734,9 @@ async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
         .expect("create Node");
     let authority =
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+    let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         db.focused_read_store(),
-        authority.clone(),
+        crate::bootstrap::authority::AuthorityHandle::from(authority.clone()).authority_arc(),
     );
     let resource_commands = Arc::new(RecordingNodeLifecycleCommands {
         commands: Mutex::new(Vec::new()),
@@ -898,9 +898,9 @@ async fn local_client_reads_pods_through_focused_resource_query() {
     )
     .await
     .expect("create pod");
-    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+    let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         db.focused_read_store(),
-        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
     );
 
     assert!(

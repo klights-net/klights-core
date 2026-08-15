@@ -394,9 +394,9 @@ impl IntegrationLeaderRpcComposition {
     ) {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
             self.resource_reads.clone(),
-            authority.clone(),
+            crate::bootstrap::authority::AuthorityHandle::from(authority.clone()).authority_arc(),
         );
         let lifecycle_status =
             crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
@@ -660,14 +660,18 @@ impl IntegrationLeaderRpcComposition {
             ),
         );
         let resource_query = match passive_reads.as_ref() {
-            Some(passive_reads) => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
-                passive_reads.ports.resource_reads(),
-                authority.clone(),
-                Arc::new(klights_supervisor::SystemWallClock),
-            ),
-            None => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            Some(passive_reads) => {
+                klights_watch::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
+                    passive_reads.ports.resource_reads(),
+                    crate::bootstrap::authority::AuthorityHandle::from(authority.clone())
+                        .authority_arc(),
+                    Arc::new(klights_supervisor::SystemWallClock),
+                )
+            }
+            None => klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
                 self.resource_reads.clone(),
-                authority.clone(),
+                crate::bootstrap::authority::AuthorityHandle::from(authority.clone())
+                    .authority_arc(),
             ),
         };
         let authority_handle =

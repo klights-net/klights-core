@@ -1762,8 +1762,15 @@ mod tests {
     impl PodLogFollowWatchPort for RecordingWatchPort {
         fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
             Box::pin(async move {
-                let request = klights_leader_api::WatchRequest::try_new(
-                    "v1", "Pod", None, None, None, None, None,
+                let request = klights_leader_api::WatchRequest::try_new_with_scope(
+                    "v1",
+                    "Pod",
+                    None,
+                    klights_leader_api::ResourceListScope::AllNamespaces,
+                    None,
+                    None,
+                    None,
+                    None,
                 )?;
                 self.requests.lock().unwrap().push(request);
                 Ok(klights_leader_api::WatchStream::positioned(

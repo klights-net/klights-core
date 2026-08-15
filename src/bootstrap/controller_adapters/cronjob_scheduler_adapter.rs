@@ -90,10 +90,11 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
                 )));
             }
         };
-        let request = WatchRequest::try_new(
+        let request = WatchRequest::try_new_with_scope(
             "batch/v1",
             "CronJob",
             None,
+            klights_leader_api::ResourceListScope::AllNamespaces,
             None,
             None,
             Some(page.snapshot().resource_version()),

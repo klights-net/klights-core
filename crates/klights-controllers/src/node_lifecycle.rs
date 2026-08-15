@@ -11,7 +11,7 @@ use klights_cluster_core::k8s_time::format_time as k8s_time_format;
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
 use klights_leader_api::{
     ControllerCoordination, ControllerScope, LeaderWatch, LeaderWatchError, ResourceEvent,
-    WatchEventType, WatchRequest, WatchStream,
+    ResourceListScope, WatchEventType, WatchRequest, WatchStream,
 };
 use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
@@ -270,15 +270,25 @@ async fn open_node_lifecycle_watches(
     watch: &dyn LeaderWatch,
 ) -> std::result::Result<futures::stream::SelectAll<WatchStream>, LeaderWatchError> {
     let mut sessions = Vec::with_capacity(2);
-    for (api_version, kind, namespace) in [
-        ("v1", "Node", None),
+    for (api_version, kind, namespace, scope) in [
+        ("v1", "Node", None, ResourceListScope::Cluster),
         (
             "coordination.k8s.io/v1",
             "Lease",
             Some("kube-node-lease".to_string()),
+            ResourceListScope::Namespace("kube-node-lease".to_string()),
         ),
     ] {
-        let request = WatchRequest::try_new(api_version, kind, namespace, None, None, None, None)?;
+        let request = WatchRequest::try_new_with_scope(
+            api_version,
+            kind,
+            namespace,
+            scope,
+            None,
+            None,
+            None,
+            None,
+        )?;
         sessions.push(watch.watch_resources(request).await?);
     }
     Ok(futures::stream::select_all(sessions))

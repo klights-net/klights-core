@@ -395,6 +395,7 @@ message WatchResourcesRequest {
   optional int64 start_resource_version = 5;
   optional string label_selector = 6;
   optional WatchReplayPosition start_watch_replay_position = 7;
+  ResourceListScope scope = 8;
 }
 
 message WatchEvent {

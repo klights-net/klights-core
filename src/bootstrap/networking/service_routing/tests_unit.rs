@@ -332,7 +332,7 @@ async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {
     let api = std::sync::Arc::new(FreshServiceInventoryClient::default());
 
     let specs = service_specs_from_api(
-        &crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+        &klights_networking::service_routing::LeaderRoutingStateSource::new(api.clone()),
     )
     .await
     .expect("service specs should build");
@@ -382,7 +382,7 @@ async fn service_specs_from_api_uses_bounded_bulk_fresh_inventory() {
     });
 
     let specs = service_specs_from_api(
-        &crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+        &klights_networking::service_routing::LeaderRoutingStateSource::new(api.clone()),
     )
     .await
     .expect("service specs should build from bulk inventory");
@@ -427,7 +427,7 @@ async fn coalesced_sync_uses_cached_inventory_after_initial_snapshot() {
     let api = std::sync::Arc::new(FreshServiceInventoryClient::default());
     // Initial snapshot: builds inventory from the API.
     let inventory = bootstrap_inventory_from_api(
-        &crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+        &klights_networking::service_routing::LeaderRoutingStateSource::new(api.clone()),
     )
     .await
     .expect("bootstrap inventory");
@@ -473,7 +473,7 @@ async fn service_route_sync_does_not_query_api_per_service() {
     // Set up several services so the count is meaningful.
     let api = std::sync::Arc::new(FreshServiceInventoryClient::default());
     let inventory = bootstrap_inventory_from_api(
-        &crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+        &klights_networking::service_routing::LeaderRoutingStateSource::new(api.clone()),
     )
     .await
     .expect("bootstrap inventory");

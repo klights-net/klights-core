@@ -461,6 +461,7 @@ async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
             start_resource_version: None,
             label_selector: None,
             start_watch_replay_position: None,
+            scope: klights_internal_protobuf::ResourceListScope::AllNamespaces as i32,
         })
         .await
         .unwrap()
@@ -514,6 +515,7 @@ async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatchi
             start_resource_version: Some(0),
             label_selector: None,
             start_watch_replay_position: None,
+            scope: klights_internal_protobuf::ResourceListScope::AllNamespaces as i32,
         })
         .await
         .unwrap()
@@ -659,6 +661,7 @@ async fn watch_stream_replays_lower_matching_pod_on_nonmatching_high_rv_signal()
             start_resource_version: Some(0),
             label_selector: None,
             start_watch_replay_position: None,
+            scope: klights_internal_protobuf::ResourceListScope::AllNamespaces as i32,
         })
         .await
         .unwrap()
@@ -756,6 +759,7 @@ fn watch_pods_request() -> klights_internal_protobuf::WatchResourcesRequest {
         start_resource_version: Some(0),
         label_selector: None,
         start_watch_replay_position: None,
+        scope: klights_internal_protobuf::ResourceListScope::AllNamespaces as i32,
     }
 }
 
@@ -770,6 +774,7 @@ fn watch_configmaps_from_rv(
         start_resource_version: Some(start_resource_version),
         label_selector: None,
         start_watch_replay_position: None,
+        scope: klights_internal_protobuf::ResourceListScope::AllNamespaces as i32,
     }
 }
 
@@ -865,6 +870,11 @@ fn custom_resource_watch_request(
         start_resource_version: Some(0),
         label_selector: None,
         start_watch_replay_position: None,
+        scope: if kind == "ClusterWidget" {
+            klights_internal_protobuf::ResourceListScope::Cluster as i32
+        } else {
+            klights_internal_protobuf::ResourceListScope::AllNamespaces as i32
+        },
     }
 }
 

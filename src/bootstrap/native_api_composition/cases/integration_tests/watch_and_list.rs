@@ -8867,11 +8867,7 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
 
     clock.advance_to(
         START_UNIX_MS
-            + i64::try_from(
-                crate::bootstrap::composition_adapters::resource_query_adapter::PRIVATE_PINNED_CONTINUATION_TTL
-                    .as_millis(),
-            )
-            .unwrap(),
+            + i64::try_from(klights_watch::PRIVATE_PINNED_CONTINUATION_TTL.as_millis()).unwrap(),
     );
 
     let compacted_resp = app
@@ -9102,11 +9098,7 @@ async fn test_paginated_original_token_ttl_recovery_preserves_chunking_accountin
 
     clock.advance_to(
         START_UNIX_MS
-            + i64::try_from(
-                crate::bootstrap::composition_adapters::resource_query_adapter::PRIVATE_PINNED_CONTINUATION_TTL
-                    .as_millis(),
-            )
-            .unwrap(),
+            + i64::try_from(klights_watch::PRIVATE_PINNED_CONTINUATION_TTL.as_millis()).unwrap(),
     );
     let expired = app
         .clone()

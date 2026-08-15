@@ -239,7 +239,7 @@ pub(crate) fn test_resource_command(
         ),
     );
     let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
-        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
             resource_reads.clone(),
             authority.clone(),
         );
@@ -269,7 +269,7 @@ pub(crate) fn test_outbox_delivery(
         ),
     );
     let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
-        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+        klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
             resource_reads.clone(),
             authority.clone(),
         );

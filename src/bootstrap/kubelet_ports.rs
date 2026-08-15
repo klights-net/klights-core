@@ -55,10 +55,11 @@ impl PodWatchSource for DatastorePodWatchSource {
             let requests = [
                 (
                     PodWatchScope::Pod,
-                    klights_leader_api::WatchRequest::try_new(
+                    klights_leader_api::WatchRequest::try_new_with_scope(
                         "v1",
                         "Pod",
                         None,
+                        klights_leader_api::ResourceListScope::AllNamespaces,
                         None,
                         Some(format!("spec.nodeName={node_name}")),
                         None,
@@ -67,10 +68,11 @@ impl PodWatchSource for DatastorePodWatchSource {
                 ),
                 (
                     PodWatchScope::PersistentVolumeClaim,
-                    klights_leader_api::WatchRequest::try_new(
+                    klights_leader_api::WatchRequest::try_new_with_scope(
                         "v1",
                         "PersistentVolumeClaim",
                         None,
+                        klights_leader_api::ResourceListScope::AllNamespaces,
                         None,
                         None,
                         None,
@@ -79,10 +81,11 @@ impl PodWatchSource for DatastorePodWatchSource {
                 ),
                 (
                     PodWatchScope::PersistentVolume,
-                    klights_leader_api::WatchRequest::try_new(
+                    klights_leader_api::WatchRequest::try_new_with_scope(
                         "v1",
                         "PersistentVolume",
                         None,
+                        klights_leader_api::ResourceListScope::Cluster,
                         None,
                         None,
                         None,
@@ -91,16 +94,24 @@ impl PodWatchSource for DatastorePodWatchSource {
                 ),
                 (
                     PodWatchScope::Secret,
-                    klights_leader_api::WatchRequest::try_new(
-                        "v1", "Secret", None, None, None, None, None,
+                    klights_leader_api::WatchRequest::try_new_with_scope(
+                        "v1",
+                        "Secret",
+                        None,
+                        klights_leader_api::ResourceListScope::AllNamespaces,
+                        None,
+                        None,
+                        None,
+                        None,
                     )?,
                 ),
                 (
                     PodWatchScope::ConfigMap,
-                    klights_leader_api::WatchRequest::try_new(
+                    klights_leader_api::WatchRequest::try_new_with_scope(
                         "v1",
                         "ConfigMap",
                         None,
+                        klights_leader_api::ResourceListScope::AllNamespaces,
                         None,
                         None,
                         None,
@@ -109,10 +120,11 @@ impl PodWatchSource for DatastorePodWatchSource {
                 ),
                 (
                     PodWatchScope::Namespace,
-                    klights_leader_api::WatchRequest::try_new(
+                    klights_leader_api::WatchRequest::try_new_with_scope(
                         "v1",
                         "Namespace",
                         None,
+                        klights_leader_api::ResourceListScope::Cluster,
                         None,
                         None,
                         None,
@@ -153,9 +165,17 @@ impl PodWatchSource for DatastorePodWatchSource {
 
 impl klights_kubelet::node_api::logs::PodLogFollowWatchPort for DatastorePodWatchSource {
     fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
-        let request =
-            klights_leader_api::WatchRequest::try_new("v1", "Pod", None, None, None, None, None)
-                .expect("Pod log follow watch identity is valid");
+        let request = klights_leader_api::WatchRequest::try_new_with_scope(
+            "v1",
+            "Pod",
+            None,
+            klights_leader_api::ResourceListScope::AllNamespaces,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Pod log follow watch identity is valid");
         self.leader_watch.watch_resources(request)
     }
 }
@@ -165,8 +185,15 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
         Box::pin(async move {
             let mut heartbeat = self.heartbeat_watch.lock().await;
             if heartbeat.stream.is_none() {
-                let request = klights_leader_api::WatchRequest::try_new(
-                    "v1", "Node", None, None, None, None, None,
+                let request = klights_leader_api::WatchRequest::try_new_with_scope(
+                    "v1",
+                    "Node",
+                    None,
+                    klights_leader_api::ResourceListScope::Cluster,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .expect("Node heartbeat watch identity is valid");
                 let request = if let Some(cursor) = heartbeat.cursor {

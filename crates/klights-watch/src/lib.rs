@@ -8,8 +8,12 @@ mod cache;
 mod event;
 mod event_bus;
 mod filter;
+#[cfg(feature = "session")]
+mod freshness;
 mod remote_cache;
 mod replay;
+#[cfg(feature = "session")]
+mod resource_query;
 mod selection;
 #[cfg(feature = "session")]
 mod session;
@@ -27,6 +31,8 @@ pub use event_bus::WatchBus;
 #[cfg(any(test, feature = "integration-test-harness"))]
 pub use event_bus::WatchReceiver;
 pub use filter::WatchEventFilter;
+#[cfg(feature = "session")]
+pub use freshness::wait_until_resource_version_fresh;
 pub use klights_cluster_core::{PositionedWatchEvent, WatchReplayPosition};
 pub use remote_cache::{
     PreparedWatchTransition, RemoteInformerCache, SelectorWatchTransitionProjector,
@@ -36,12 +42,14 @@ pub use replay::{
     PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayRead, WatchTarget,
     WatchTargetScope,
 };
+#[cfg(feature = "session")]
+pub use resource_query::{DatastoreResourceQueryAdapter, PRIVATE_PINNED_CONTINUATION_TTL};
 pub use selection::WatchEventSelection;
 #[cfg(feature = "session")]
 pub use session::{
     PendingWatchSelectorTransition, PositionedWatchService, ProjectedWatchBaselineRead,
-    ProjectedWatchBaselineRequest, ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope,
-    WatchScopeResolver, WatchSelectorMembership,
+    ProjectedWatchBaselineRequest, ProjectedWatchPlan, SnapshotProjectedWatchBaseline,
+    WatchResourceProjection, WatchSelectorMembership,
 };
 #[cfg(feature = "integration-test-harness")]
 pub use signal::test_support;

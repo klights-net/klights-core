@@ -14,9 +14,7 @@ use klights_leader_api::{
     ResourceListScope, ResourceQueryConsistency, WatchEventType, WatchRequest,
 };
 use klights_types::ResourceKey;
-use klights_watch::{
-    PositionedWatchService, WatchCache, WatchResourceScope, WatchScopeResolver, WatchSignalHub,
-};
+use klights_watch::{PositionedWatchService, WatchCache, WatchSignalHub};
 
 fn position(resource_version: i64, event_id: i64) -> WatchReplayPosition {
     WatchReplayPosition {
@@ -189,21 +187,6 @@ impl DurableWatchHistoryRead for LeaveHistory {
     }
 }
 
-struct NamespacedScopes;
-
-impl WatchScopeResolver for NamespacedScopes {
-    fn resource_scope<'a>(
-        &'a self,
-        _api_version: &'a str,
-        _kind: &'a str,
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<WatchResourceScope, klights_leader_api::LeaderWatchError>,
-    > {
-        Box::pin(async { Ok(WatchResourceScope::Namespaced) })
-    }
-}
-
 #[tokio::test]
 async fn selector_baseline_is_positioned_and_leave_reuses_the_cached_matching_object() {
     let baseline_position = position(10, 20);
@@ -222,7 +205,6 @@ async fn selector_baseline_is_positioned_and_leave_reuses_the_cached_matching_ob
             DurableAllocatorState::try_new(baseline_position).expect("allocator state"),
         )),
         Arc::new(WatchSignalHub::new(1)),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -279,7 +261,6 @@ async fn selector_baseline_requires_the_exact_complete_unique_matching_snapshot(
                 DurableAllocatorState::try_new(requested).unwrap(),
             )),
             Arc::new(WatchSignalHub::new(1)),
-            Arc::new(NamespacedScopes),
         );
         let result = service
             .watch_resources(

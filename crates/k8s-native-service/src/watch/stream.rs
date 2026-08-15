@@ -841,10 +841,11 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
     } else {
         Some(requested_rv)
     };
-    let watch_request = match klights_leader_api::WatchRequest::try_new(
+    let watch_request = match klights_leader_api::WatchRequest::try_new_with_scope(
         api_version.clone(),
         kind.clone(),
         watch_namespace.clone(),
+        scope.clone(),
         label_selector.clone(),
         field_selector.clone(),
         start_resource_version,

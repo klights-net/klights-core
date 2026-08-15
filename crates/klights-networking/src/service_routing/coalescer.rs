@@ -591,10 +591,15 @@ struct ServiceRoutingWatchTarget {
 
 impl ServiceRoutingWatchTarget {
     fn request(self) -> klights_leader_api::WatchRequest {
-        klights_leader_api::WatchRequest::try_new(
+        klights_leader_api::WatchRequest::try_new_with_scope(
             self.api_version,
             self.kind,
             None,
+            if self.kind == "Namespace" {
+                klights_leader_api::ResourceListScope::Cluster
+            } else {
+                klights_leader_api::ResourceListScope::AllNamespaces
+            },
             None,
             None,
             None,

@@ -336,11 +336,11 @@ async fn load_local_node_client_identity(
     node_name: &str,
     supervisor: Arc<TaskSupervisor>,
 ) -> Result<ClientIdentity> {
-    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
     use klights_auth::worker_credential::{WorkerCredentialSource, resolve_worker_credential};
+    use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
-    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-        namespace,
+    let store = SupervisedFilesystemWorkerCredentialStore::new(
+        crate::paths::etc_dir_path(namespace),
         node_name,
         supervisor.clone(),
     );

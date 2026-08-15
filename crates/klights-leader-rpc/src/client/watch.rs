@@ -116,10 +116,11 @@ pub async fn run_watch_driver(
                 }
             }
         }
-        let watch_request = WatchRequest::try_new(
+        let watch_request = WatchRequest::try_new_with_scope(
             request.api_version().to_string(),
             request.kind().to_string(),
             request.namespace().map(str::to_owned),
+            request.scope().clone(),
             request.label_selector().map(str::to_owned),
             request.field_selector().map(str::to_owned),
             next_resource_version,

@@ -1,6 +1,7 @@
 mod coalescer;
 mod hostport;
 mod inventory;
+mod leader_state_source;
 mod mode;
 mod network_policy;
 mod nft_table;
@@ -11,6 +12,7 @@ mod session_affinity;
 mod state_source;
 
 pub use inventory::{InventoryApply, ServiceRouteInventory};
+pub use leader_state_source::LeaderRoutingStateSource;
 pub use planner::RoutePlan;
 
 pub use coalescer::{

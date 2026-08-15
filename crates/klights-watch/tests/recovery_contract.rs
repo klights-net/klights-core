@@ -13,10 +13,9 @@ use klights_cluster_store::{
     ResourceListRequest, ResourceReadFuture, WatchHistoryFuture, WatchHistoryPage,
     WatchHistoryRead, WatchHistoryRequest,
 };
-use klights_leader_api::{LeaderWatch, WatchRequest};
+use klights_leader_api::{LeaderWatch, ResourceListScope, WatchRequest};
 use klights_watch::{
-    PositionedWatchService, WatchAdvance, WatchResourceScope, WatchScopeResolver, WatchSignal,
-    WatchSignalHub, WatchTopic,
+    PositionedWatchService, WatchAdvance, WatchSignal, WatchSignalHub, WatchTopic,
 };
 
 fn position(resource_version: i64, event_id: i64) -> WatchReplayPosition {
@@ -81,37 +80,6 @@ impl DurableAllocatorRead for FixedAllocator {
     fn read_allocator_state(&self) -> AllocatorStateFuture<'_, DurableAllocatorState> {
         let state = self.0;
         Box::pin(async move { Ok(state) })
-    }
-}
-
-struct NamespacedScopes;
-
-impl WatchScopeResolver for NamespacedScopes {
-    fn resource_scope<'a>(
-        &'a self,
-        _api_version: &'a str,
-        _kind: &'a str,
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<WatchResourceScope, klights_leader_api::LeaderWatchError>,
-    > {
-        Box::pin(async { Ok(WatchResourceScope::Namespaced) })
-    }
-}
-
-struct FixedScope(WatchResourceScope);
-
-impl WatchScopeResolver for FixedScope {
-    fn resource_scope<'a>(
-        &'a self,
-        _api_version: &'a str,
-        _kind: &'a str,
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<WatchResourceScope, klights_leader_api::LeaderWatchError>,
-    > {
-        let scope = self.0;
-        Box::pin(async move { Ok(scope) })
     }
 }
 
@@ -192,7 +160,6 @@ async fn short_nonempty_pages_preserve_same_rv_event_order_before_waiting_for_si
             DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -246,7 +213,6 @@ async fn expired_history_returns_typed_relist_error() {
             DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -306,7 +272,6 @@ async fn lagged_bounded_subscriber_recovers_exclusively_from_durable_position() 
             DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         hub.clone(),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -365,7 +330,6 @@ async fn scalar_resource_version_uses_the_atomic_event_high_water_filter() {
             DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -451,7 +415,6 @@ async fn dropping_stream_cancels_in_flight_replay_without_a_background_task() {
             DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -496,7 +459,6 @@ async fn regressing_history_page_is_rejected_before_waiting_for_a_live_signal() 
             DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
-        Arc::new(NamespacedScopes),
     );
     let mut stream = service
         .watch_resources(
@@ -561,7 +523,6 @@ async fn malformed_equal_cursor_and_non_exact_event_pages_are_rejected() {
                 DurableAllocatorState::try_new(anchor).expect("allocator"),
             )),
             Arc::new(WatchSignalHub::new(1)),
-            Arc::new(NamespacedScopes),
         );
         let mut stream = service
             .watch_resources(
@@ -588,8 +549,8 @@ async fn malformed_equal_cursor_and_non_exact_event_pages_are_rejected() {
 #[tokio::test]
 async fn replay_rejects_cluster_and_all_namespaces_scope_mismatches_before_yield() {
     for (scope, event_namespace) in [
-        (WatchResourceScope::Cluster, Some("default")),
-        (WatchResourceScope::Namespaced, None),
+        (ResourceListScope::Cluster, Some("default")),
+        (ResourceListScope::AllNamespaces, None),
     ] {
         let anchor = position(8, 20);
         let delivered = position(9, 21);
@@ -616,12 +577,20 @@ async fn replay_rejects_cluster_and_all_namespaces_scope_mismatches_before_yield
                 DurableAllocatorState::try_new(anchor).expect("allocator"),
             )),
             Arc::new(WatchSignalHub::new(1)),
-            Arc::new(FixedScope(scope)),
         );
         let mut stream = service
             .watch_resources(
-                WatchRequest::try_new("v1", "ConfigMap", None, None, None, Some(8), Some(anchor))
-                    .expect("watch"),
+                WatchRequest::try_new_with_scope(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    scope,
+                    None,
+                    None,
+                    Some(8),
+                    Some(anchor),
+                )
+                .expect("watch"),
             )
             .await
             .expect("watch opens");

@@ -23,9 +23,12 @@ pub mod rbac_policy_store;
 pub mod rbac_rule_evaluator;
 pub mod request_attributes;
 pub mod service_account;
+pub mod tls_policy;
 pub mod user;
 pub mod webhook_auth;
 pub mod worker_credential;
+pub mod worker_credential_store;
+pub mod worker_csr_http_client;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

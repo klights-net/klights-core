@@ -448,6 +448,30 @@ impl ResourceListScope {
     }
 }
 
+fn validate_watch_scope(
+    namespace: Option<&str>,
+    scope: &ResourceListScope,
+) -> Result<(), LeaderWatchError> {
+    match (scope, namespace) {
+        (ResourceListScope::Cluster | ResourceListScope::AllNamespaces, None) => Ok(()),
+        (ResourceListScope::Namespace(expected), Some(actual)) if expected == actual => Ok(()),
+        (ResourceListScope::Namespace(_), None) => Err(LeaderWatchError::invalid(
+            "watch.scope",
+            "namespace scope requires watch.namespace",
+        )),
+        (ResourceListScope::Namespace(_), Some(_)) => Err(LeaderWatchError::invalid(
+            "watch.scope",
+            "namespace scope must equal watch.namespace",
+        )),
+        (ResourceListScope::Cluster | ResourceListScope::AllNamespaces, Some(_)) => {
+            Err(LeaderWatchError::invalid(
+                "watch.scope",
+                "cluster and all-namespaces scopes must not carry watch.namespace",
+            ))
+        }
+    }
+}
+
 /// Failure returned by the focused leader resource-query capability.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1460,6 +1484,7 @@ pub struct WatchRequest {
     api_version: String,
     kind: String,
     namespace: Option<String>,
+    scope: ResourceListScope,
     label_selector: Option<String>,
     field_selector: Option<String>,
     start_resource_version: Option<i64>,
@@ -1467,6 +1492,33 @@ pub struct WatchRequest {
 }
 
 impl WatchRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_scope(
+        api_version: impl Into<String>,
+        kind: impl Into<String>,
+        namespace: Option<String>,
+        scope: ResourceListScope,
+        label_selector: Option<String>,
+        field_selector: Option<String>,
+        start_resource_version: Option<i64>,
+        start_watch_replay_position: Option<WatchReplayPosition>,
+    ) -> Result<Self, LeaderWatchError> {
+        let mut request = Self::try_new(
+            api_version,
+            kind,
+            namespace,
+            label_selector,
+            field_selector,
+            start_resource_version,
+            start_watch_replay_position,
+        )?;
+        scope
+            .validate()
+            .map_err(|error| LeaderWatchError::invalid("watch.scope", error.to_string()))?;
+        validate_watch_scope(request.namespace.as_deref(), &scope)?;
+        request.scope = scope;
+        Ok(request)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         api_version: impl Into<String>,
@@ -1497,10 +1549,15 @@ impl WatchRequest {
                 LeaderWatchError::invalid("watch.field_selector", error.to_string())
             })?;
         }
+        let scope = namespace
+            .clone()
+            .map(ResourceListScope::Namespace)
+            .unwrap_or(ResourceListScope::AllNamespaces);
         Ok(Self {
             api_version,
             kind,
             namespace,
+            scope,
             label_selector,
             field_selector,
             start_resource_version,
@@ -1514,6 +1571,10 @@ impl WatchRequest {
 
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    pub fn scope(&self) -> &ResourceListScope {
+        &self.scope
     }
 
     pub fn namespace(&self) -> Option<&str> {

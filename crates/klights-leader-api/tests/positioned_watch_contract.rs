@@ -3,8 +3,8 @@ use std::sync::Arc;
 use klights_cluster_core::{Resource, WatchReplayPosition};
 use klights_leader_api::{
     CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
-    LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, WatchEventType, WatchRequest,
-    WatchResumeCursor,
+    LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, ResourceListScope,
+    WatchEventType, WatchRequest, WatchResumeCursor,
 };
 use serde_json::json;
 
@@ -90,6 +90,43 @@ fn request_preserves_selectors_and_prefers_exact_event_id_intent() {
         .expect("legacy scalar request");
     assert_eq!(scalar_only.start_resource_version(), Some(17));
     assert_eq!(scalar_only.preferred_replay_position(), None);
+}
+
+#[test]
+fn watch_scope_is_explicit_and_cannot_alias_collection_shapes() {
+    let namespaced = WatchRequest::try_new_with_scope(
+        "v1",
+        "Pod",
+        Some("team-a".into()),
+        ResourceListScope::Namespace("team-a".into()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("matching namespace scope");
+    assert_eq!(
+        namespaced.scope(),
+        &ResourceListScope::Namespace("team-a".into())
+    );
+
+    for (scope, namespace) in [
+        (ResourceListScope::Cluster, Some("team-a".to_string())),
+        (ResourceListScope::AllNamespaces, Some("team-a".to_string())),
+        (ResourceListScope::Namespace("team-a".to_string()), None),
+        (
+            ResourceListScope::Namespace("other".to_string()),
+            Some("team-a".to_string()),
+        ),
+    ] {
+        assert!(matches!(
+            WatchRequest::try_new_with_scope("v1", "Pod", namespace, scope, None, None, None, None),
+            Err(LeaderWatchError::InvalidRequest {
+                field: "watch.scope",
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

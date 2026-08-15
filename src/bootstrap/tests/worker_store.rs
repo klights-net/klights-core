@@ -69,9 +69,10 @@ fn worker_store_from_local(
     );
     WorkerStoreAdapter::from_focused_ports(
         WorkerStorePorts {
-            resource_query: crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            resource_query: klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
                 canonical.focused_read_store(),
-                authority.clone(),
+                crate::bootstrap::authority::AuthorityHandle::from(authority.clone())
+                    .authority_arc(),
             ),
             leader_watch: Arc::new(
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(

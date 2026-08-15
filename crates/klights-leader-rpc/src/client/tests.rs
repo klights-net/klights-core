@@ -22,7 +22,7 @@ mod cases {
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_util::sync::CancellationToken;
 
-    use klights_leader_rpc::tls_policy::ResolvedLeaderTlsVerification;
+    use klights_auth::tls_policy::ResolvedLeaderTlsVerification;
 
     fn unavailable_runtimes() -> NodeControlRuntimes {
         NodeControlRuntimes::new(
@@ -99,6 +99,7 @@ mod cases {
                 start_resource_version: expected,
                 label_selector: None,
                 start_watch_replay_position: None,
+                scope: klights_internal_protobuf::ResourceListScope::AllNamespaces as i32,
             };
             let bytes = prost::Message::encode_to_vec(&request);
             let decoded =

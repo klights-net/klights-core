@@ -1242,7 +1242,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
             "cp1".to_string(),
             "klights".to_string(),
             crate::paths::service_account_signing_key_path("klights"),
-            rx.clone(),
+            crate::bootstrap::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
             crate::bootstrap::file_blocking::test_file_process_executor(),
         ),
     );
@@ -1257,7 +1257,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             opened.topology_reads.clone(),
             proposal.clone(),
-            rx.clone(),
+            crate::bootstrap::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
         ),
     );
     let pod_cleanup = Arc::new(
@@ -1268,11 +1268,10 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         ),
     );
     let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));
-    let local_resource_query =
-        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-            opened.read_ports.resource_reads(),
-            rx.clone(),
-        );
+    let local_resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+        opened.read_ports.resource_reads(),
+        crate::bootstrap::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
+    );
     let local_watch = Arc::new(
         crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
             &passive_reads,

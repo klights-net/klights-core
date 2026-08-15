@@ -34,7 +34,10 @@ impl IntegrationRaftComposition {
         let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(),
+            authority.clone(),
+        );
         Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
@@ -100,8 +103,10 @@ impl IntegrationRaftComposition {
         let authority = crate::bootstrap::authority::AuthorityHandle::from(
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
-        let query =
-            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(),
+            authority.clone(),
+        );
         let canonical = self.db.as_ref();
         let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
             &authority,
@@ -131,8 +136,10 @@ impl IntegrationRaftComposition {
         let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query =
-            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(),
+            authority.clone(),
+        );
         let commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
@@ -165,7 +172,10 @@ impl IntegrationRaftComposition {
         let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(),
+            authority.clone(),
+        );
         let commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
@@ -192,7 +202,10 @@ impl IntegrationRaftComposition {
         let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(),
+            authority.clone(),
+        );
         let commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),

@@ -18,6 +18,7 @@ workspace = true
 [dependencies]
 klights-types = { workspace = true }
 klights-network-api = { workspace = true }
+klights-cluster-core = { workspace = true }
 klights-node-store = { workspace = true }
 klights-leader-api = { workspace = true }
 klights-supervisor = { workspace = true }

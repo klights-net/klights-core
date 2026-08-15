@@ -351,11 +351,10 @@ pub(crate) mod support {
             }),
         )
         .await?;
-        let cluster_api = crate::bootstrap::composition_adapters::resource_query_adapter::
-            DatastoreResourceQueryAdapter::new_focused_for_test(
-                sqlite.focused_read_store(),
-                crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
-            );
+        let cluster_api = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            sqlite.focused_read_store(),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+        );
         let repository = IntegrationPodWorkerFixture::new(cluster_api).await;
         let queued = repository
             .finalize_pod_deletion_after_actor_cleanup(
@@ -454,11 +453,10 @@ pub(crate) mod support {
                 }),
             )
             .await?;
-        let cluster_api = crate::bootstrap::composition_adapters::resource_query_adapter::
-            DatastoreResourceQueryAdapter::new_focused_for_test(
-                sqlite.focused_read_store(),
-                crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
-            );
+        let cluster_api = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            sqlite.focused_read_store(),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+        );
         let authority = crate::bootstrap::authority::AuthorityHandle::from(
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
@@ -1532,8 +1530,9 @@ pub(crate) mod support {
             let authority =
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(
                 );
-            let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-                ports.read_ports.resource_reads(), authority.clone(),
+            let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+                ports.read_ports.resource_reads(),
+                authority.clone(),
             );
             let commands = Arc::new(
                 klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
@@ -1744,8 +1743,9 @@ pub(crate) mod support {
         let authority = crate::bootstrap::authority::AuthorityHandle::from(
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-            ports.read_ports.resource_reads(), authority.clone(),
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(),
+            authority.clone(),
         );
         let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
             &authority,
@@ -1992,11 +1992,10 @@ pub(crate) mod support {
             let authority = crate::bootstrap::authority::AuthorityHandle::from(
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
             );
-            let local_query = crate::bootstrap::composition_adapters::resource_query_adapter::
-                DatastoreResourceQueryAdapter::new_focused_for_test(
-                    ports.read_ports.resource_reads(),
-                    authority.clone(),
-                );
+            let local_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+                ports.read_ports.resource_reads(),
+                authority.authority_arc(),
+            );
             let local_outbox_delivery = crate::bootstrap::composition_adapters::
                 committed_outbox_delivery_adapter::test_outbox_delivery(
                     &authority,

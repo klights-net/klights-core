@@ -77,6 +77,12 @@ impl From<Arc<dyn klights_leader_api::LeaderAuthority>> for AuthorityHandle {
     }
 }
 
+impl From<AuthorityHandle> for Arc<dyn klights_leader_api::LeaderAuthority> {
+    fn from(authority: AuthorityHandle) -> Self {
+        authority.authority
+    }
+}
+
 #[cfg(test)]
 impl From<watch::Receiver<bool>> for AuthorityHandle {
     fn from(receiver: watch::Receiver<bool>) -> Self {

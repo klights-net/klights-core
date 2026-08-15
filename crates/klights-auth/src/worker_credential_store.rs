@@ -1,35 +1,27 @@
-//! Private supervised filesystem adapter for auth-owned worker credentials.
+//! Supervised filesystem implementation for auth-owned worker credentials.
 
 use std::{path::PathBuf, sync::Arc};
 
-use async_trait::async_trait;
-use klights_auth::{
+use crate::{
     CredentialOperationError,
     worker_credential::{WorkerCredential, WorkerCredentialStore},
 };
+use async_trait::async_trait;
 use klights_supervisor::TaskSupervisor;
 
-pub(crate) struct SupervisedFilesystemWorkerCredentialStore {
+pub struct SupervisedFilesystemWorkerCredentialStore {
     dir: PathBuf,
     node_name: String,
     supervisor: Arc<TaskSupervisor>,
 }
 
 impl SupervisedFilesystemWorkerCredentialStore {
-    pub(crate) fn new(dir: PathBuf, node_name: &str, supervisor: Arc<TaskSupervisor>) -> Self {
+    pub fn new(dir: PathBuf, node_name: &str, supervisor: Arc<TaskSupervisor>) -> Self {
         Self {
             dir,
             node_name: node_name.to_string(),
             supervisor,
         }
-    }
-
-    pub(crate) fn for_namespace(
-        namespace: &str,
-        node_name: &str,
-        supervisor: Arc<TaskSupervisor>,
-    ) -> Self {
-        Self::new(crate::paths::etc_dir_path(namespace), node_name, supervisor)
     }
 
     fn key(&self) -> String {

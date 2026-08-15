@@ -755,8 +755,9 @@ pub(crate) fn new_root_parts_from_test_ports(
     let authority = crate::bootstrap::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
-    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-        resource_reads.clone(), authority.clone(),
+    let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+        resource_reads.clone(),
+        authority.clone(),
     );
     let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
@@ -784,8 +785,9 @@ pub(crate) fn new_store_from_test_ports(
     let authority = crate::bootstrap::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
-    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-        resource_reads.clone(), authority.clone(),
+    let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+        resource_reads.clone(),
+        authority.clone(),
     );
     let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
@@ -852,8 +854,9 @@ mod tests {
         let passive = db.focused_read_store();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-            passive.clone(), authority,
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            passive.clone(),
+            authority,
         );
         new_raft_root_parts(
             query,

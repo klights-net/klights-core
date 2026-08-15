@@ -167,10 +167,11 @@ impl WorkerStoreAdapter {
 
     fn worker_watch_requests(&self) -> Vec<(WatchRequest, ResourceListScope)> {
         let mut reqs = vec![(
-            WatchRequest::try_new(
+            WatchRequest::try_new_with_scope(
                 "v1",
                 "Pod",
                 None,
+                ResourceListScope::AllNamespaces,
                 None,
                 Some(format!("spec.nodeName={}", self.node_name)),
                 None,
@@ -199,10 +200,11 @@ impl WorkerStoreAdapter {
             ),
         ] {
             reqs.push((
-                WatchRequest::try_new(
+                WatchRequest::try_new_with_scope(
                     api_version,
                     kind,
                     namespace.map(str::to_string),
+                    scope.clone(),
                     None,
                     None,
                     None,

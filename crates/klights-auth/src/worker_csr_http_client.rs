@@ -1,28 +1,28 @@
-//! Private HTTP/TLS adapter for the auth-owned worker CSR bootstrap port.
+//! HTTP/TLS implementation of the auth-owned worker CSR bootstrap port.
 
 use std::{path::PathBuf, sync::Arc};
 
-use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose};
-use klights_auth::{
+use crate::tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
+use crate::{
     CredentialOperationError,
     worker_credential::{WorkerCsrBootstrapClient, validate_insecure_bootstrap_authentication},
 };
-use klights_leader_rpc::tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
 use klights_supervisor::TaskSupervisor;
 use serde_json::json;
 
 const CSR_WATCH_TIMEOUT_SECONDS: u64 = 5;
 const CSR_EMPTY_WATCH_RETRIES: usize = 12;
 
-pub(crate) struct HttpCsrBootstrapClient {
+pub struct HttpCsrBootstrapClient {
     client: reqwest::Client,
     base_url: String,
     token: String,
 }
 
 impl HttpCsrBootstrapClient {
-    pub(crate) async fn new(
+    pub async fn new(
         leader_endpoint: String,
         token: String,
         ca_cert_path: Option<PathBuf>,
@@ -118,7 +118,7 @@ impl HttpCsrBootstrapClient {
 impl WorkerCsrBootstrapClient for HttpCsrBootstrapClient {
     async fn submit_kubelet_client_csr(
         &self,
-        csr: &klights_auth::kubelet_client_cert::KubeletClientCsr,
+        csr: &crate::kubelet_client_cert::KubeletClientCsr,
     ) -> Result<String, CredentialOperationError> {
         let body = json!({
             "apiVersion": "certificates.k8s.io/v1",
@@ -126,8 +126,8 @@ impl WorkerCsrBootstrapClient for HttpCsrBootstrapClient {
             "metadata": {"generateName": "klights-node-client-"},
             "spec": {
                 "request": general_purpose::STANDARD.encode(&csr.csr_pem),
-                "signerName": klights_auth::csr_policy::KUBELET_CLIENT_SIGNER_NAME,
-                "usages": [klights_auth::csr_policy::KUBELET_CLIENT_AUTH_USAGE],
+                "signerName": crate::csr_policy::KUBELET_CLIENT_SIGNER_NAME,
+                "usages": [crate::csr_policy::KUBELET_CLIENT_AUTH_USAGE],
             }
         });
         let response = self
@@ -307,7 +307,7 @@ mod tests {
 
     fn generate_tls_identity() -> (String, String, String) {
         let (ca_certificate, ca_key, ca_pem, _) =
-            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+            crate::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
                 .expect("test CA");
         let server_key = rcgen::KeyPair::generate().expect("server key");
         let mut parameters = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
@@ -385,7 +385,7 @@ mod tests {
         )
         .await
         .expect("explicit-CA client");
-        let csr = klights_auth::kubelet_client_cert::generate_kubelet_client_csr("worker-a")
+        let csr = crate::kubelet_client_cert::generate_kubelet_client_csr("worker-a")
             .expect("test kubelet CSR");
         let csr_name = client
             .submit_kubelet_client_csr(&csr)
@@ -474,7 +474,8 @@ mod tests {
     #[tokio::test]
     async fn explicit_ca_ignores_same_subject_system_root() {
         const CHILD_MARKER: &str = "KLIGHTS_WORKER_CSR_CA_ISOLATION_CHILD";
-        const TEST_NAME: &str = "bootstrap::composition_adapters::worker_csr_http_adapter::tests::explicit_ca_ignores_same_subject_system_root";
+        const TEST_NAME: &str =
+            "worker_csr_http_client::tests::explicit_ca_ignores_same_subject_system_root";
         if std::env::var_os(CHILD_MARKER).is_some() {
             submit_to_explicit_ca_server().await;
             return;
@@ -482,7 +483,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("temporary system-root fixture");
         let (_, _, stale_ca_pem, _) =
-            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+            crate::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
                 .expect("stale CA");
         let stale_ca_path = directory.path().join("stale-system-ca.crt");
         let empty_ca_dir = directory.path().join("empty-ca-dir");
@@ -507,7 +508,8 @@ mod tests {
     #[tokio::test]
     async fn client_connects_directly_despite_proxy_environment() {
         const CHILD_MARKER: &str = "KLIGHTS_WORKER_CSR_NO_PROXY_CHILD";
-        const TEST_NAME: &str = "bootstrap::composition_adapters::worker_csr_http_adapter::tests::client_connects_directly_despite_proxy_environment";
+        const TEST_NAME: &str =
+            "worker_csr_http_client::tests::client_connects_directly_despite_proxy_environment";
         if std::env::var_os(CHILD_MARKER).is_some() {
             submit_to_explicit_ca_server().await;
             return;

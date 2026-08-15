@@ -4,9 +4,8 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use k8s_native_service::admission::{
-    AdmissionDependencyError, AdmissionEngine, AdmissionQuery, AdmissionResource,
-    AdmissionWebhookClient, ReqwestAdmissionWebhookClient, ServiceWebhookTargetResolver,
-    WebhookTargetResolver,
+    AdmissionDependencyError, AdmissionQuery, AdmissionResource, AdmissionWebhookClient,
+    ReqwestAdmissionWebhookClient, ServiceWebhookTargetResolver, WebhookTargetResolver,
 };
 use klights_cluster_store::{
     ClusterResourceRead, ResourceCollectionScope, ResourceGetRequest, ResourceListQuery,
@@ -127,26 +126,15 @@ impl ResourceAdmissionAdapter {
 
     fn execute_admission<'a>(
         &'a self,
-        mut context: k8s_native_service::admission::AdmissionRequestContext,
+        context: k8s_native_service::admission::AdmissionRequestContext,
     ) -> k8s_native_service::generic_command::GenericCommandFuture<'a, Value> {
-        Box::pin(async move {
-            let engine = AdmissionEngine::new(
-                self.identity.as_ref(),
-                self.query.as_ref(),
-                self.target_resolver.as_ref(),
-                self.webhook_client.as_ref(),
-            );
-            let admitted = engine
-                .run_with_context(&context, true)
-                .await
-                .map_err(k8s_native_service::map_mutating_admission_error)?;
-            context.object = admitted.clone();
-            engine
-                .run_with_context(&context, false)
-                .await
-                .map_err(k8s_native_service::map_validating_admission_error)?;
-            Ok(admitted)
-        })
+        Box::pin(k8s_native_service::admission::execute_admission_pipeline(
+            self.identity.as_ref(),
+            self.query.as_ref(),
+            self.target_resolver.as_ref(),
+            self.webhook_client.as_ref(),
+            context,
+        ))
     }
 }
 

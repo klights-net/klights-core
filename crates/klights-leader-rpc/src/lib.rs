@@ -14,7 +14,6 @@ pub mod raft_rpc;
 pub mod semantic_operations;
 pub mod server;
 pub mod storage_wire_codec;
-pub mod tls_policy;
 pub mod transport_policy;
 
 pub use transport_policy::{GrpcTransportPolicy, SharedGrpcTransportPolicy};

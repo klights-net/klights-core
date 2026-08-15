@@ -164,7 +164,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             klights_networking::service_routing::NftServiceRouterDefaultBoot::new(
                 klights_networking::service_routing::NftServiceRouterStores::new(
                     Arc::new(
-                        crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(
+                        klights_networking::service_routing::LeaderRoutingStateSource::new(
                             resource_query,
                         ),
                     ),

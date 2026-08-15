@@ -25,8 +25,9 @@ pub(crate) fn default_registry(
 ) -> SideEffectRegistry {
     let authority =
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
-        resource_reads.clone(), authority.clone(),
+    let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+        resource_reads.clone(),
+        authority.clone(),
     );
     let resource_commands = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(

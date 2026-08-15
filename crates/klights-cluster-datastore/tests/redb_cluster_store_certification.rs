@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use klights_cluster_core::{
@@ -35,6 +35,17 @@ use klights_cluster_store::{
 };
 use klights_supervisor::{SystemWallClock, TaskCategoryConfig, TaskSupervisor};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+
+// The SQLite historical-window pause hook is process-global test instrumentation.
+// These two tests must hold the same guard while awaiting that hook so parallel
+// libtest workers cannot consume each other's pause/resume permits.
+static SQLITE_HISTORICAL_WINDOW_PAUSE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_sqlite_historical_window_pause() -> MutexGuard<'static, ()> {
+    SQLITE_HISTORICAL_WINDOW_PAUSE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[derive(Clone)]
 struct JsonCodec;
@@ -2061,6 +2072,7 @@ async fn sqlite_head_position_selector_underfill_uses_bounded_current_windows() 
 
 #[tokio::test]
 async fn sqlite_head_position_falls_back_to_historical_when_head_moves_between_windows() {
+    let _pause_guard = lock_sqlite_historical_window_pause();
     let (reads, executor) = seed_sqlite_historical_window().await;
     let head = reads.read_allocator_state().await.unwrap().position();
     sqlite::reset_physical_bound_counters_for_test();
@@ -2126,6 +2138,7 @@ async fn sqlite_head_position_falls_back_to_historical_when_head_moves_between_w
 
 #[tokio::test]
 async fn sqlite_compaction_between_bounded_windows_expires_without_snapshot_drift() {
+    let _pause_guard = lock_sqlite_historical_window_pause();
     let (reads, executor) = seed_sqlite_historical_window().await;
     let head = reads.read_allocator_state().await.unwrap().position();
     let position = WatchReplayPosition {

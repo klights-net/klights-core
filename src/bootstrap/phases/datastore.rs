@@ -459,10 +459,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     &passive_read_ports,
                     watch_commit_wiring.signals.clone(),
                 );
-            let local_resource_query = crate::bootstrap::composition_adapters::
-                resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
+            let local_resource_query =
+                klights_watch::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
                     passive_read_ports.resource_reads(),
-                    leader_authority.clone(),
+                    leader_authority.clone() as Arc<dyn klights_leader_api::LeaderAuthority>,
                     Arc::new(klights_supervisor::SystemWallClock),
                 );
             let local_network = Arc::new(
@@ -1406,10 +1406,10 @@ async fn controlplane_join_client_identity_for_token(
     node_name: &str,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> anyhow::Result<ControlplaneJoinClientIdentity> {
-    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+    use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
-    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-        namespace,
+    let store = SupervisedFilesystemWorkerCredentialStore::new(
+        crate::paths::etc_dir_path(namespace),
         node_name,
         supervisor.clone(),
     );
@@ -1620,8 +1620,8 @@ mod tests {
 
     #[tokio::test]
     async fn tokenless_controlplane_join_uses_persisted_node_client_cert() {
-        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
         use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
+        use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
         use tempfile::TempDir;
 
         let data_root = TempDir::new().expect("create isolated controlplane credential root");
@@ -1667,14 +1667,14 @@ mod tests {
 
     #[tokio::test]
     async fn token_controlplane_join_prefers_persisted_node_client_cert_for_steady_state_rpcs() {
-        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
         use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
+        use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
         let namespace = format!("cp-token-join-node-cert-{}", uuid::Uuid::new_v4());
         let node_name = "mn-controlplane2";
         let supervisor = test_supervisor();
-        let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-            &namespace,
+        let store = SupervisedFilesystemWorkerCredentialStore::new(
+            crate::paths::etc_dir_path(&namespace),
             node_name,
             supervisor.clone(),
         );
@@ -1739,14 +1739,14 @@ mod tests {
 
     #[tokio::test]
     async fn seed_leader_remote_identity_uses_persisted_node_client_cert() {
-        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
         use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
+        use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
         let namespace = format!("leader-seed-node-cert-{}", uuid::Uuid::new_v4());
         let node_name = "mn-controlplane1";
         let supervisor = test_supervisor();
-        let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-            &namespace,
+        let store = SupervisedFilesystemWorkerCredentialStore::new(
+            crate::paths::etc_dir_path(&namespace),
             node_name,
             supervisor.clone(),
         );
@@ -1790,14 +1790,14 @@ mod tests {
 
     #[tokio::test]
     async fn seed_controlplane_remote_identity_uses_persisted_node_client_cert() {
-        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
         use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
+        use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
         let namespace = format!("cp-seed-node-cert-{}", uuid::Uuid::new_v4());
         let node_name = "mn-controlplane1";
         let supervisor = test_supervisor();
-        let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-            &namespace,
+        let store = SupervisedFilesystemWorkerCredentialStore::new(
+            crate::paths::etc_dir_path(&namespace),
             node_name,
             supervisor.clone(),
         );

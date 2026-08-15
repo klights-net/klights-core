@@ -48,10 +48,11 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
                 )));
             }
         };
-        let request = WatchRequest::try_new(
+        let request = WatchRequest::try_new_with_scope(
             "apiextensions.k8s.io/v1",
             "CustomResourceDefinition",
             None,
+            klights_leader_api::ResourceListScope::Cluster,
             None,
             None,
             Some(page.snapshot().resource_version()),

@@ -284,8 +284,8 @@ async fn controlplane_rpc_client_identity_for_token(
         return Ok((None, None));
     }
 
-    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
     use klights_auth::worker_credential::{WorkerCredentialSource, resolve_worker_credential};
+    use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
     let store = SupervisedFilesystemWorkerCredentialStore::new(
         etc_dir.to_path_buf(),
@@ -306,12 +306,12 @@ async fn controlplane_rpc_client_identity_for_token(
 }
 
 async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
-    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
     use klights_auth::csr_signer::CsrSigner;
     use klights_auth::worker_credential::{
         WorkerCredential, WorkerCredentialSource, WorkerCredentialStore, resolve_worker_credential,
         worker_credential_has_group,
     };
+    use klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore;
 
     let etc_dir = std::path::Path::new(&cfg.etc_dir);
     let store = SupervisedFilesystemWorkerCredentialStore::new(
@@ -625,7 +625,8 @@ mod tests {
         .await
         .expect("seed controlplane identity setup");
 
-        let store = crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore::new(
+        let store =
+            klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore::new(
                 data_root.path().join("etc"),
                 "mn-controlplane1",
                 supervisor.clone(),
@@ -798,7 +799,8 @@ mod tests {
         .await
         .expect("controlplane token join should persist node client cert from leader CA");
 
-        let store = crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore::new(
+        let store =
+            klights_auth::worker_credential_store::SupervisedFilesystemWorkerCredentialStore::new(
                 joiner_etc_dir.clone(),
                 "mn-controlplane2",
                 joiner_supervisor.clone(),

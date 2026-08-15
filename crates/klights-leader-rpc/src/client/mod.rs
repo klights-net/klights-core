@@ -46,12 +46,12 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::Service;
 
-use crate::tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
 use crate::transport_policy::GrpcTransportPolicy;
 use crate::{
     JOIN_TOKEN_METADATA_KEY, entry_from_proto, resource_command_request_to_proto,
     watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
+use klights_auth::tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
 use klights_internal_protobuf::replication_client::ReplicationClient as TonicClient;
 use klights_types::ResourceKey;
 /// Response from SignControlplaneCsr RPC.
@@ -1022,6 +1022,17 @@ impl ReplicationGrpcClient {
             start_watch_replay_position: req
                 .start_watch_replay_position()
                 .map(watch_replay_position_to_proto),
+            scope: match req.scope() {
+                ResourceListScope::Cluster => {
+                    klights_internal_protobuf::ResourceListScope::Cluster as i32
+                }
+                ResourceListScope::AllNamespaces => {
+                    klights_internal_protobuf::ResourceListScope::AllNamespaces as i32
+                }
+                ResourceListScope::Namespace(_) => {
+                    klights_internal_protobuf::ResourceListScope::Namespace as i32
+                }
+            },
         };
         let response = self
             .streaming_open_call(

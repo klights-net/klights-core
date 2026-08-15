@@ -11,32 +11,14 @@ use klights_cluster_store::{
     WatchHistoryError, WatchHistoryRead, WatchHistoryRequest,
 };
 use klights_leader_api::{
-    LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, WatchEventType, WatchRequest,
-    WatchResumeCursor, WatchStream,
+    LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, ResourceListScope,
+    WatchEventType, WatchRequest, WatchResumeCursor, WatchStream,
 };
 
 use crate::{
     WatchSignalReceiveError, WatchSignalReceiver, WatchSignalSubscribe, WatchTopic,
     filter::ResourceFilter,
 };
-
-/// Kubernetes collection scope required to distinguish an all-namespaces watch
-/// from a cluster-scoped resource when `metadata.namespace` is absent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WatchResourceScope {
-    Cluster,
-    Namespaced,
-}
-
-/// Focused metadata fact injected by the composition root. The watch kernel
-/// does not import datastore schemas, discovery registries, or API handlers.
-pub trait WatchScopeResolver: Send + Sync {
-    fn resource_scope<'a>(
-        &'a self,
-        api_version: &'a str,
-        kind: &'a str,
-    ) -> BoxFuture<'a, Result<WatchResourceScope, LeaderWatchError>>;
-}
 
 #[derive(Clone)]
 pub struct ProjectedWatchBaselineRequest {
@@ -85,6 +67,67 @@ pub trait ProjectedWatchBaselineRead: Send + Sync {
     ) -> BoxFuture<'_, Result<ResourceListRead, LeaderWatchError>>;
 }
 
+/// Reads the exact durable snapshot used by a converted/served-resource watch.
+/// The conversion boundary supplies targets; snapshot and expiry semantics stay
+/// with the positioned-watch owner.
+pub struct SnapshotProjectedWatchBaseline {
+    resources: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
+}
+
+impl SnapshotProjectedWatchBaseline {
+    pub fn new(resources: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>) -> Self {
+        Self { resources }
+    }
+}
+
+impl ProjectedWatchBaselineRead for SnapshotProjectedWatchBaseline {
+    fn read_baseline(
+        &self,
+        request: ProjectedWatchBaselineRequest,
+    ) -> BoxFuture<'_, Result<ResourceListRead, LeaderWatchError>> {
+        Box::pin(async move {
+            match self
+                .resources
+                .snapshot_resources_at_position(
+                    klights_cluster_store::ResourceSnapshotAtPositionRequest::try_new(
+                        request.targets().to_vec(),
+                        request.label_selector().map(str::to_owned),
+                        None,
+                        request.position(),
+                    )
+                    .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| LeaderWatchError::unavailable(format!("{error:?}")))?
+            {
+                klights_cluster_store::ResourceSnapshotRead::Historical(list) => {
+                    let snapshot = list.snapshot();
+                    let page = klights_cluster_store::ResourceListPage::try_new(
+                        list.into_items(),
+                        snapshot,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| LeaderWatchError::malformed_event(error.to_string()))?;
+                    Ok(ResourceListRead::Historical(page))
+                }
+                klights_cluster_store::ResourceSnapshotRead::Expired => {
+                    Ok(ResourceListRead::Expired {
+                        requested: request.position().resource_version,
+                        oldest_available: request.position().resource_version.saturating_add(1),
+                        replacement: None,
+                    })
+                }
+                klights_cluster_store::ResourceSnapshotRead::Current => {
+                    Err(LeaderWatchError::malformed_event(
+                        "projected positioned baseline returned an unpinned Current sentinel",
+                    ))
+                }
+            }
+        })
+    }
+}
+
 pub trait WatchResourceProjection: Send + Sync {
     fn project_resources(
         &self,
@@ -96,7 +139,6 @@ pub struct ProjectedWatchPlan {
     request: WatchRequest,
     targets: Vec<DurableWatchTarget>,
     topics: Vec<WatchTopic>,
-    resource_scope: WatchResourceScope,
     baseline: Arc<dyn ProjectedWatchBaselineRead>,
     projection: Arc<dyn WatchResourceProjection>,
 }
@@ -106,7 +148,6 @@ impl ProjectedWatchPlan {
         request: WatchRequest,
         targets: Vec<DurableWatchTarget>,
         topics: Vec<WatchTopic>,
-        resource_scope: WatchResourceScope,
         baseline: Arc<dyn ProjectedWatchBaselineRead>,
         projection: Arc<dyn WatchResourceProjection>,
     ) -> Result<Self, LeaderWatchError> {
@@ -120,7 +161,6 @@ impl ProjectedWatchPlan {
             request,
             targets,
             topics,
-            resource_scope,
             baseline,
             projection,
         })
@@ -135,7 +175,6 @@ pub struct PositionedWatchService {
     history: Arc<dyn DurableWatchHistoryRead>,
     allocator: Arc<dyn DurableAllocatorRead>,
     signals: Arc<dyn WatchSignalSubscribe>,
-    scopes: Arc<dyn WatchScopeResolver>,
 }
 
 impl PositionedWatchService {
@@ -144,14 +183,12 @@ impl PositionedWatchService {
         history: Arc<dyn DurableWatchHistoryRead>,
         allocator: Arc<dyn DurableAllocatorRead>,
         signals: Arc<dyn WatchSignalSubscribe>,
-        scopes: Arc<dyn WatchScopeResolver>,
     ) -> Self {
         Self {
             resources,
             history,
             allocator,
             signals,
-            scopes,
         }
     }
 
@@ -160,11 +197,7 @@ impl PositionedWatchService {
         // This synchronous subscription is intentionally first. Every await
         // after it is covered by durable replay from the chosen cursor.
         let signal_rx = self.signals.subscribe(topic.clone());
-        let resource_scope = self
-            .scopes
-            .resource_scope(request.api_version(), request.kind())
-            .await?;
-        let target = durable_target(&request, resource_scope);
+        let target = durable_target(&request);
         let replay_position = match request.start_watch_replay_position() {
             Some(position) => position,
             None => {
@@ -188,12 +221,12 @@ impl PositionedWatchService {
                 ResourceVersionMatch::AtPosition(replay_position),
             )
             .map_err(map_resource_read_error)?;
-            let scope = match (resource_scope, request.namespace()) {
-                (WatchResourceScope::Cluster, _) => ResourceCollectionScope::Cluster,
-                (WatchResourceScope::Namespaced, Some(namespace)) => {
-                    ResourceCollectionScope::Namespace(namespace.to_string())
+            let scope = match request.scope() {
+                ResourceListScope::Cluster => ResourceCollectionScope::Cluster,
+                ResourceListScope::AllNamespaces => ResourceCollectionScope::AllNamespaces,
+                ResourceListScope::Namespace(namespace) => {
+                    ResourceCollectionScope::Namespace(namespace.clone())
                 }
-                (WatchResourceScope::Namespaced, None) => ResourceCollectionScope::AllNamespaces,
             };
             let baseline = self
                 .resources
@@ -267,7 +300,6 @@ impl PositionedWatchService {
             request,
             targets,
             topics,
-            resource_scope,
             baseline,
             projection,
         } = plan;
@@ -292,7 +324,7 @@ impl PositionedWatchService {
         };
         let filter = ResourceFilter::for_watch(&request)?;
         let mut membership = SelectorMembership::default();
-        let delivery_scope = durable_target(&request, resource_scope).scope().clone();
+        let delivery_scope = durable_target(&request).scope().clone();
         if filter.has_selector() {
             let read = baseline
                 .read_baseline(ProjectedWatchBaselineRequest::new(
@@ -329,7 +361,7 @@ impl PositionedWatchService {
                     validate_selector_baseline(
                         &projected_page,
                         replay_position,
-                        &durable_target(&request, resource_scope),
+                        &durable_target(&request),
                         &filter,
                     )?;
                     membership.replace(projected_page.items());
@@ -456,19 +488,17 @@ impl LeaderWatch for PositionedWatchService {
     }
 }
 
-fn durable_target(request: &WatchRequest, scope: WatchResourceScope) -> DurableWatchTarget {
-    match (scope, request.namespace()) {
-        (WatchResourceScope::Cluster, _) => {
+fn durable_target(request: &WatchRequest) -> DurableWatchTarget {
+    match request.scope() {
+        ResourceListScope::Cluster => {
             DurableWatchTarget::cluster(request.api_version(), request.kind())
         }
-        (WatchResourceScope::Namespaced, Some(namespace)) => {
-            DurableWatchTarget::namespaced_in_namespace(
-                request.api_version(),
-                request.kind(),
-                namespace,
-            )
-        }
-        (WatchResourceScope::Namespaced, None) => {
+        ResourceListScope::Namespace(namespace) => DurableWatchTarget::namespaced_in_namespace(
+            request.api_version(),
+            request.kind(),
+            namespace,
+        ),
+        ResourceListScope::AllNamespaces => {
             DurableWatchTarget::namespaced(request.api_version(), request.kind())
         }
     }

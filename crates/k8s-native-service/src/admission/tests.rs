@@ -142,6 +142,24 @@ fn test_ctx(
     }
 }
 
+#[tokio::test]
+async fn admission_pipeline_keeps_native_mutating_then_validating_ownership() {
+    let query = FakeAdmissionQuery::default();
+    let resolver = FakeWebhookTargetResolver;
+    let client = FakeAdmissionWebhookClient::default();
+    let context = test_ctx("v1", "configmaps", "CREATE", Some("default"), None);
+    let admitted = execute_admission_pipeline(
+        &DeterministicApiIdentity,
+        &query,
+        &resolver,
+        &client,
+        context,
+    )
+    .await
+    .expect("empty admission configuration is accepted");
+    assert_eq!(admitted, json!({"metadata":{"name":"obj"}}));
+}
+
 // ========================
 // matches_webhook_rules tests
 // ========================

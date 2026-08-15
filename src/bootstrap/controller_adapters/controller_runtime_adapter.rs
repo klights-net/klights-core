@@ -49,7 +49,10 @@ impl RootControllerLeaderPort {
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(resource_reads.clone(), authority.clone());
+        let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
+            resource_reads.clone(),
+            authority.clone(),
+        );
         Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 Arc::new(
@@ -1406,9 +1409,9 @@ fn runtime_dependencies_for_test(
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+    let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         ports.read_ports.resource_reads(),
-        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
     );
     let resource_commands = RootControllerLeaderPort::resource_commands_for_test(
         ports.applied_outbox.clone(),

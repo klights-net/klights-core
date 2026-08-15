@@ -1,14 +1,156 @@
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use klights_node_api::{
-    NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample, NodeMetricsPodSample,
-    NodeMetricsRequest, NodeMetricsResult,
+    NodeMetrics, NodeMetricsContainerSample, NodeMetricsError, NodeMetricsFuture,
+    NodeMetricsNodeSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResult,
+    NodeMetricsSampler as NodeApiMetricsSampler,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, watch};
 
 const NODE_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MetricsRequestKey {
+    node_name: String,
+    pod_uids: Vec<String>,
+}
+
+impl From<&NodeMetricsRequest> for MetricsRequestKey {
+    fn from(request: &NodeMetricsRequest) -> Self {
+        Self {
+            node_name: request.target().node_name().to_string(),
+            pod_uids: request.pod_uids().to_vec(),
+        }
+    }
+}
+
+type MetricsResponseWatch = watch::Receiver<Option<Result<NodeMetricsResult, NodeMetricsError>>>;
+
+#[derive(Default)]
+struct MetricsRequestCoalescer {
+    in_flight: Mutex<HashMap<MetricsRequestKey, MetricsResponseWatch>>,
+}
+
+impl MetricsRequestCoalescer {
+    async fn collect<F>(
+        self: &Arc<Self>,
+        key: MetricsRequestKey,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        fetch: F,
+    ) -> Result<NodeMetricsResult, NodeMetricsError>
+    where
+        F: Future<Output = Result<NodeMetricsResult, NodeMetricsError>> + Send + 'static,
+    {
+        let (mut receiver, spawn, sender) = {
+            let mut in_flight = self.in_flight.lock().await;
+            if let Some(rx) = in_flight.get(&key) {
+                (rx.clone(), false, None)
+            } else {
+                let (tx, rx) = watch::channel(None);
+                in_flight.insert(key.clone(), rx.clone());
+                (rx, true, Some(tx))
+            }
+        };
+        if spawn {
+            let coalescer = self.clone();
+            let cleanup = key.clone();
+            let sender = sender.expect("new request sender");
+            if let Err(error) = supervisor
+                .spawn_async(
+                    klights_supervisor::TaskCategory::Network,
+                    "metrics_node_runtime_sample",
+                    async move {
+                        let result = fetch.await;
+                        let _ = sender.send(Some(result));
+                        coalescer.in_flight.lock().await.remove(&cleanup);
+                    },
+                )
+                .await
+            {
+                self.in_flight.lock().await.remove(&key);
+                return Err(NodeMetricsError::unavailable(format!(
+                    "failed to spawn node metrics request for '{}': {error:#}",
+                    key.node_name
+                )));
+            }
+        }
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            if receiver.changed().await.is_err() {
+                self.in_flight.lock().await.remove(&key);
+                return Err(NodeMetricsError::closed(format!(
+                    "node '{}' metrics request closed before response",
+                    key.node_name
+                )));
+            }
+        }
+    }
+}
+
+/// Kubelet-owned local/remote metrics routing and identical-request coalescing.
+pub struct RoutedNodeMetrics {
+    local_node_name: String,
+    local_sampler: Option<Arc<dyn NodeApiMetricsSampler>>,
+    remote: Option<Arc<dyn NodeMetrics>>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    coalescer: Arc<MetricsRequestCoalescer>,
+}
+
+impl RoutedNodeMetrics {
+    pub fn new(
+        local_node_name: String,
+        local_sampler: Option<Arc<dyn NodeApiMetricsSampler>>,
+        remote: Option<Arc<dyn NodeMetrics>>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
+        Self {
+            local_node_name,
+            local_sampler,
+            remote,
+            supervisor,
+            coalescer: Arc::new(MetricsRequestCoalescer::default()),
+        }
+    }
+}
+
+impl NodeMetrics for RoutedNodeMetrics {
+    fn collect_metrics(
+        &self,
+        request: NodeMetricsRequest,
+    ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+        Box::pin(async move {
+            let key = MetricsRequestKey::from(&request);
+            let local = request.target().node_name() == self.local_node_name;
+            let sampler = self.local_sampler.clone();
+            let remote = self.remote.clone();
+            self.coalescer
+                .collect(key, self.supervisor.clone(), async move {
+                    if local {
+                        match sampler {
+                            Some(s) => s.sample_metrics(request).await,
+                            None => Err(NodeMetricsError::unavailable(
+                                "local node metrics sampler is not available",
+                            )),
+                        }
+                    } else {
+                        match remote {
+                            Some(r) => r.collect_metrics(request).await,
+                            None => Err(NodeMetricsError::unavailable(
+                                "remote node metrics transport is not available",
+                            )),
+                        }
+                    }
+                })
+                .await
+        })
+    }
+}
 
 async fn collect_local_cri_node_metrics_request(
     cri: Option<Arc<tokio::sync::Mutex<crate::cri::CriClient>>>,
@@ -264,6 +406,7 @@ fn parse_meminfo_kib(meminfo: &str, key: &str) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn converts_cri_pod_stats_to_transport_neutral_sample() {
@@ -321,5 +464,162 @@ mod tests {
         assert_eq!(usage.cpu_total_jiffies, 170);
         assert_eq!(usage.cpu_idle_jiffies, 105);
         assert_eq!(usage.memory_used_bytes, 768 * 1024);
+    }
+
+    struct CountingSampler(Arc<AtomicUsize>);
+    impl klights_node_api::NodeMetricsSampler for CountingSampler {
+        fn sample_metrics(
+            &self,
+            request: NodeMetricsRequest,
+        ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+            let calls = self.0.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(NodeMetricsResult::new(
+                    request.target().clone(),
+                    None,
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+
+    struct BlockingSampler {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl klights_node_api::NodeMetricsSampler for BlockingSampler {
+        fn sample_metrics(
+            &self,
+            request: NodeMetricsRequest,
+        ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+            let calls = self.calls.clone();
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                started.wait().await;
+                release.notified().await;
+                Ok(NodeMetricsResult::new(
+                    request.target().clone(),
+                    None,
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+    struct CountingRemote(Arc<AtomicUsize>);
+    impl NodeMetrics for CountingRemote {
+        fn collect_metrics(
+            &self,
+            request: NodeMetricsRequest,
+        ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+            let calls = self.0.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(NodeMetricsResult::new(
+                    request.target().clone(),
+                    None,
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+    fn request(node: &str, pods: Vec<&str>) -> NodeMetricsRequest {
+        NodeMetricsRequest::new(
+            klights_node_api::NodeMetricsTarget::try_new(node).unwrap(),
+            pods.into_iter().map(str::to_string).collect(),
+        )
+    }
+    #[tokio::test]
+    async fn routed_metrics_coalesces_identical_and_retries_after_completion() {
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let metrics = Arc::new(RoutedNodeMetrics::new(
+            "local".into(),
+            Some(Arc::new(BlockingSampler {
+                calls: calls.clone(),
+                started: started.clone(),
+                release: release.clone(),
+            })),
+            None,
+            supervisor.clone(),
+        ));
+        let first = {
+            let metrics = metrics.clone();
+            tokio::spawn(async move { metrics.collect_metrics(request("local", vec!["p"])).await })
+        };
+        started.wait().await;
+        let second = {
+            let metrics = metrics.clone();
+            tokio::spawn(async move { metrics.collect_metrics(request("local", vec!["p"])).await })
+        };
+        release.notify_waiters();
+        let (a, b) = tokio::join!(first, second);
+        assert!(a.unwrap().is_ok() && b.unwrap().is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let retry = tokio::spawn({
+            let metrics = metrics.clone();
+            async move { metrics.collect_metrics(request("local", vec!["p"])).await }
+        });
+        started.wait().await;
+        release.notify_waiters();
+        assert!(retry.await.unwrap().is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+    }
+    #[tokio::test]
+    async fn routed_metrics_routes_distinct_local_remote_and_unavailable_requests() {
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let local = Arc::new(AtomicUsize::new(0));
+        let remote = Arc::new(AtomicUsize::new(0));
+        let metrics = RoutedNodeMetrics::new(
+            "local".into(),
+            Some(Arc::new(CountingSampler(local.clone()))),
+            Some(Arc::new(CountingRemote(remote.clone()))),
+            supervisor.clone(),
+        );
+        assert!(
+            metrics
+                .collect_metrics(request("local", vec!["a"]))
+                .await
+                .is_ok()
+        );
+        assert!(
+            metrics
+                .collect_metrics(request("remote", vec!["a"]))
+                .await
+                .is_ok()
+        );
+        assert!(
+            metrics
+                .collect_metrics(request("local", vec!["b"]))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            (local.load(Ordering::SeqCst), remote.load(Ordering::SeqCst)),
+            (2, 1)
+        );
+        let none = RoutedNodeMetrics::new("local".into(), None, None, supervisor.clone());
+        assert!(
+            none.collect_metrics(request("local", vec![]))
+                .await
+                .is_err()
+        );
+        assert!(
+            none.collect_metrics(request("remote", vec![]))
+                .await
+                .is_err()
+        );
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
     }
 }

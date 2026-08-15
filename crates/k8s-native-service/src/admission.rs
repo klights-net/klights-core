@@ -383,3 +383,26 @@ impl<'a> AdmissionEngine<'a> {
         Ok(mutated_resource)
     }
 }
+
+/// Runs Kubernetes mutating admission before validating admission using the
+/// object returned by the mutating pass. This ordering is admission policy,
+/// not a composition concern.
+pub async fn execute_admission_pipeline(
+    identity: &dyn crate::ApiIdentityGenerator,
+    query: &dyn AdmissionQuery,
+    target_resolver: &dyn WebhookTargetResolver,
+    webhook_client: &dyn AdmissionWebhookClient,
+    mut context: AdmissionRequestContext,
+) -> Result<serde_json::Value, crate::AppError> {
+    let engine = AdmissionEngine::new(identity, query, target_resolver, webhook_client);
+    let admitted = engine
+        .run_with_context(&context, true)
+        .await
+        .map_err(crate::map_mutating_admission_error)?;
+    context.object = admitted.clone();
+    engine
+        .run_with_context(&context, false)
+        .await
+        .map_err(crate::map_validating_admission_error)?;
+    Ok(admitted)
+}

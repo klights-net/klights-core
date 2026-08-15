@@ -1,3 +1,5 @@
+//! Auth-owned resolution of leader TLS verification material.
+
 use anyhow::{Context as _, Result};
 use klights_supervisor::TaskSupervisor;
 use std::path::PathBuf;

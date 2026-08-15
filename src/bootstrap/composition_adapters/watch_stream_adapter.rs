@@ -1,6 +1,5 @@
 use k8s_native_service::watch::{WatchSourceListFuture, WatchSourceWaitFuture, WatchStreamSource};
 use klights_cluster_store::DurableAllocatorRead;
-
 pub(crate) struct DatastoreWatchStreamAdapter {
     resource_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
     allocator_reads: std::sync::Arc<dyn DurableAllocatorRead>,
@@ -32,11 +31,12 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
         kind: &'a str,
         task_supervisor: &'a klights_supervisor::TaskSupervisor,
     ) -> WatchSourceWaitFuture<'a> {
-        Box::pin(wait_until_fresh(
+        Box::pin(klights_watch::wait_until_resource_version_fresh(
             self.allocator_reads.as_ref(),
             self.signals.as_ref(),
             target_rv,
             klights_watch::WatchTopic::new(api_version, kind),
+            k8s_native_service::watch::READ_FRESHNESS_TIMEOUT,
             task_supervisor,
         ))
     }
@@ -73,62 +73,5 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
         Box::pin(async move {
             klights_leader_api::LeaderWatch::watch_resources(&positioned_watch, request).await
         })
-    }
-}
-
-async fn wait_until_fresh(
-    allocator_reads: &dyn DurableAllocatorRead,
-    signals: &dyn klights_watch::WatchSignalSubscribe,
-    target_rv: i64,
-    topic: klights_watch::WatchTopic,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-) {
-    if target_rv <= 0 {
-        return;
-    }
-    let mut fresh_rx = crate::bootstrap::watch_commit_wiring::subscribe(signals, topic);
-    if allocator_reads
-        .read_allocator_state()
-        .await
-        .map(|state| state.position().resource_version)
-        .unwrap_or(0)
-        >= target_rv
-    {
-        return;
-    }
-    let sleep = task_supervisor.sleep(
-        "watch_read_freshness_wait",
-        k8s_native_service::watch::READ_FRESHNESS_TIMEOUT,
-    );
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => {
-                tracing::warn!(
-                    target_rv,
-                    "watch read-freshness wait timed out; serving best-effort from local state"
-                );
-                return;
-            }
-            recv = fresh_rx.recv() => match recv {
-                Ok(signal) => {
-                    if signal.advances.iter().any(|advance| advance.high_rv >= target_rv) {
-                        return;
-                    }
-                }
-                Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
-                    if allocator_reads
-                        .read_allocator_state()
-                        .await
-                        .map(|state| state.position().resource_version)
-                        .unwrap_or(0)
-                        >= target_rv
-                    {
-                        return;
-                    }
-                }
-                Err(klights_watch::WatchSignalReceiveError::Closed) => return,
-            },
-        }
     }
 }
