@@ -646,7 +646,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
     let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
     let registration_profile =
-        crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
+        crate::bootstrap::node_registration_adapter::build_profile_from_process_inputs(
+            node_mode, &cli.role,
+        );
     let kubelet_capacity =
         klights_kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
             &kubelet_file_process,
@@ -968,7 +970,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let initial_raft_shape = raft_node.as_ref().map(|node| node.current_shape());
     let initial_is_leader = initial_raft_shape.as_ref().is_none_or(|s| s.is_leader);
     let initial_declared_role =
-        crate::bootstrap::node_registration_profile::build(node_mode, &cli.role).role();
+        crate::bootstrap::node_registration_adapter::build_profile_from_process_inputs(
+            node_mode, &cli.role,
+        )
+        .role();
     let initial_role_projection = initial_raft_shape.as_ref().map(|shape| {
         crate::bootstrap::composition_adapters::authority_adapter::project_raft_shape(
             &initial_declared_role,
@@ -1149,7 +1154,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             config.external_endpoint.clone(),
         );
         let registration_profile =
-            crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
+            crate::bootstrap::node_registration_adapter::build_profile_from_process_inputs(
+                node_mode, &cli.role,
+            );
         let registration = klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
             &kubelet_services.local_execution().file_process,
             &config.node_name,
@@ -1223,7 +1230,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let node_ip_task = node_ip.to_string();
         let external_endpoint_task = config.external_endpoint.clone();
         let registration_profile_task =
-            crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
+            crate::bootstrap::node_registration_adapter::build_profile_from_process_inputs(
+                node_mode, &cli.role,
+            );
         let file_process_task = kubelet_services.local_execution().file_process;
         let is_leader_tx_task = is_leader_tx.clone();
         let grpc_port_task = if cli.role.runs_full_stack() {

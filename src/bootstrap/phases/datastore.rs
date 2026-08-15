@@ -763,7 +763,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     *skip_ca
                 };
                 let registration_profile =
-                    crate::bootstrap::node_registration_profile::build(node_mode, r);
+                    crate::bootstrap::node_registration_adapter::build_profile_from_process_inputs(
+                        node_mode, r,
+                    );
                 let join_node_registration =
                     klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
                         &klights_supervisor::FileProcessExecutor::from_supervisor(

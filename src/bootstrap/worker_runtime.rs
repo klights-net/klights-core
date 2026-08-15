@@ -334,7 +334,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let registration_addresses =
         klights_kubelet::node::NodeRegistrationAddresses::new(node_ip.clone(), None);
     let registration_profile =
-        crate::bootstrap::node_registration_profile::build(&node_mode, &cli.role);
+        crate::bootstrap::node_registration_adapter::build_profile_from_process_inputs(
+            &node_mode, &cli.role,
+        );
     let registration = klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
         &file_process,
         &config.node_name,

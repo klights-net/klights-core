@@ -1,6 +1,50 @@
 use anyhow::Result;
 
-use klights_kubelet::node_registration::{NodeRegistrationSnapshot, NodeRegistrationStore};
+use crate::bootstrap::{NodeMode, NodeRole};
+use klights_kubelet::{
+    node_config::KubeletNodeRole,
+    node_registration::{NodeRegistrationSnapshot, NodeRegistrationStore},
+    node_registration_profile::{NodeRegistrationProcessInputs, build_profile},
+};
+
+/// Map validated root process inputs to the kubelet-owned registration policy.
+pub(crate) fn build_profile_from_process_inputs(
+    node_mode: &NodeMode,
+    node_role: &NodeRole,
+) -> klights_kubelet::node_config::NodeRegistrationProfile {
+    let peer_mode = match node_mode {
+        NodeMode::Root => klights_network_api::NodePeerMode::Root,
+        NodeMode::Rootless { .. } => klights_network_api::NodePeerMode::Rootless,
+    };
+    let (role, joins_existing_cluster) = match node_role {
+        NodeRole::Leader {
+            bootstrap:
+                crate::bootstrap::node_role::LeaderBootstrap::Seed
+                | crate::bootstrap::node_role::LeaderBootstrap::Bootstrap { .. },
+        } => (KubeletNodeRole::Leader, false),
+        NodeRole::Leader {
+            bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Join { .. },
+        } => (KubeletNodeRole::Leader, true),
+        NodeRole::Controlplane {
+            leader_endpoints,
+            as_learner,
+            ..
+        } => (
+            KubeletNodeRole::Controlplane {
+                as_learner: *as_learner,
+            },
+            !leader_endpoints.is_empty(),
+        ),
+        NodeRole::Worker { .. } => (KubeletNodeRole::Worker, true),
+    };
+
+    build_profile(NodeRegistrationProcessInputs::new(
+        peer_mode,
+        role,
+        joins_existing_cluster,
+        crate::version::build_identity(),
+    ))
+}
 
 struct WorkerNodeRegistrationStore<'a> {
     store: &'a klights_kubelet::worker_store::WorkerStoreAdapter,

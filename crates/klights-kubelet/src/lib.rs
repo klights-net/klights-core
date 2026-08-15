@@ -19,6 +19,7 @@ pub mod node_ip;
 pub mod node_leader_labels;
 pub mod node_outbox;
 pub mod node_registration;
+pub mod node_registration_profile;
 mod node_role_labels;
 mod node_status_merge;
 mod node_status_projection;
