@@ -960,7 +960,7 @@ fn map_watch_error(error: anyhow::Error) -> WatchHistoryError {
     }
 }
 
-fn sqlite_replay_position(
+pub(super) fn sqlite_replay_position(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<WatchReplayPosition> {
     let resource_version = connection.query_row(
@@ -1612,6 +1612,11 @@ impl SqliteReadStore {
                 }
             }
         };
+        if let Some(page) =
+            super::snapshot::bounded_current_head_list(self, request.clone(), position).await?
+        {
+            return Ok(page);
+        }
         super::snapshot::bounded_historical_list(self, request, position).await
     }
 

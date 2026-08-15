@@ -1053,8 +1053,8 @@ async fn positive_limit_pages_decode_only_bounded_physical_windows() {
     assert_limit_two_progress(&sqlite, sqlite_position).await;
     let sqlite_bounds = sqlite::physical_bound_counters_for_test();
     assert!(
-        sqlite_bounds.resource_decodes <= 6,
-        "two current pages decode at most limit+1 each"
+        sqlite_bounds.resource_decodes <= 12,
+        "two current and two live-head positioned pages decode at most limit+1 each"
     );
     assert!(
         sqlite_bounds.event_decodes <= 9,
@@ -2014,6 +2014,114 @@ async fn sqlite_historical_selector_underfill_crosses_bounded_identity_windows()
         ["window-069"]
     );
     assert!(page.continuation().is_none());
+}
+
+/// A positioned LIST at the exact live SQLite head must keep the same bounded
+/// physical-read contract as an ordinary current page.  It is still returned
+/// as a Historical page because its public continuation is pinned.
+#[tokio::test]
+async fn sqlite_head_position_selector_underfill_uses_bounded_current_windows() {
+    let (reads, _) = seed_sqlite_historical_window().await;
+    let head = reads.read_allocator_state().await.unwrap().position();
+    sqlite::reset_physical_bound_counters_for_test();
+    let first = ClusterResourceRead::list_resources(
+        &reads,
+        ResourceListRequest::new(
+            "v1",
+            "ConfigMap",
+            ResourceCollectionScope::Namespace("tenant-a".to_string()),
+            ResourceListQuery::try_new(
+                Some("tier=selected".to_string()),
+                None,
+                Some(2),
+                None,
+                ResourceVersionMatch::AtPosition(head),
+            )
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, ResourceListRead::Historical(_)));
+    assert_eq!(
+        first
+            .items()
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["window-069"],
+    );
+    let bounds = sqlite::physical_bound_counters_for_test();
+    assert_eq!(
+        bounds.event_decodes, 0,
+        "live-head page must not replay history"
+    );
+    assert!(bounds.candidate_batch_max <= 64);
+}
+
+#[tokio::test]
+async fn sqlite_head_position_falls_back_to_historical_when_head_moves_between_windows() {
+    let (reads, executor) = seed_sqlite_historical_window().await;
+    let head = reads.read_allocator_state().await.unwrap().position();
+    sqlite::reset_physical_bound_counters_for_test();
+    sqlite::arm_historical_window_pause_for_test(head);
+    let pending_reads = reads.clone();
+    let pending = tokio::spawn(async move {
+        ClusterResourceRead::list_resources(
+            &pending_reads,
+            ResourceListRequest::new(
+                "v1",
+                "ConfigMap",
+                ResourceCollectionScope::Namespace("tenant-a".to_string()),
+                ResourceListQuery::try_new(
+                    Some("tier=selected".to_string()),
+                    None,
+                    Some(2),
+                    None,
+                    ResourceVersionMatch::AtPosition(head),
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    sqlite::wait_for_historical_window_pause_for_test().await;
+    executor
+        .call_raw("test:advance-head-between-current-windows", |connection| {
+            connection.execute(
+                "UPDATE metadata SET value = '71' WHERE key = 'resource_version'",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO watch_events (api_version, kind, namespace, name, resource_version, event_type, data) VALUES ('v1', 'ConfigMap', 'tenant-a', 'head-move', 71, 'ADDED', ?1)",
+                [serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"namespace": "tenant-a", "name": "head-move", "resourceVersion": "71"},
+                })).unwrap()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    sqlite::resume_historical_window_pause_for_test();
+    let page = pending.await.unwrap();
+    assert_eq!(
+        page.snapshot().map(|snapshot| snapshot.position()),
+        Some(head)
+    );
+    assert_eq!(
+        page.items()
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["window-069"],
+        "fallback must reconstruct the original pinned head, never mix windows"
+    );
+    assert!(
+        sqlite::historical_window_counts_for_test().1 > 0,
+        "a moved head must take the historical reconstruction path"
+    );
 }
 
 #[tokio::test]

@@ -19,14 +19,15 @@ use serde_json::Value;
 
 use klights_cluster_core::{Resource, WatchReplayPosition};
 use klights_cluster_store::{
-    DurableWatchTarget, ResourceCollectionKey, ResourceCollectionScope, ResourceListPage,
-    ResourceListQuery, ResourceListRead, ResourceListRequest, ResourceListSnapshot,
-    ResourceReadError,
+    DurableWatchTarget, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
+    ResourceListPage, ResourceListQuery, ResourceListRead, ResourceListRequest,
+    ResourceListSnapshot, ResourceReadError,
 };
 use klights_types::LabelSelector;
 
+use super::read_helpers::{row_to_cluster_resource, row_to_namespaced_resource};
 use super::read_queries as queries;
-use super::read_store::SqliteReadStore;
+use super::read_store::{SqliteReadStore, sqlite_replay_position};
 use super::scope::use_namespaced_table;
 
 /// A historical page deliberately reads a small number of identities per DB
@@ -760,27 +761,7 @@ pub(crate) async fn bounded_historical_list(
             }
         };
         record_physical_candidate_batch(&candidates);
-        {
-            use std::sync::atomic::Ordering;
-            let control = historical_window_test_control();
-            control.candidate_windows.fetch_add(1, Ordering::AcqRel);
-            let should_pause = {
-                let mut pause_position = control
-                    .pause_position
-                    .lock()
-                    .expect("historical window pause mutex poisoned");
-                if *pause_position == Some(position) {
-                    *pause_position = None;
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_pause {
-                control.reached.add_permits(1);
-                control.resume.acquire().await.unwrap().forget();
-            }
-        }
+        pause_after_bounded_candidate_window(position).await;
         if candidates.is_empty() {
             more_candidates = false;
             break;
@@ -871,6 +852,330 @@ pub(crate) async fn bounded_historical_list(
         continuation,
         remaining_item_count,
     )?))
+}
+
+/// Fast path for a positive-limit LIST whose typed replay position is exactly
+/// the current SQLite head. The public page remains historical so its
+/// continuation stays pinned to the exact caller-supplied position.
+pub(crate) async fn bounded_current_head_list(
+    store: &SqliteReadStore,
+    request: ResourceListRequest,
+    position: WatchReplayPosition,
+) -> std::result::Result<Option<ResourceListRead>, ResourceReadError> {
+    let labels = request
+        .query()
+        .label_selector()
+        .filter(|value| !value.trim().is_empty())
+        .map(LabelSelector::parse)
+        .transpose()
+        .map_err(|error| ResourceReadError::InvalidSelector {
+            message: error.to_string(),
+        })?;
+    let fields = request
+        .query()
+        .field_selector()
+        .filter(|value| !value.trim().is_empty())
+        .map(klights_types::FieldSelector::parse)
+        .transpose()
+        .map_err(|error| ResourceReadError::InvalidSelector {
+            message: error.to_string(),
+        })?;
+    let Some(limit) = request
+        .query()
+        .limit()
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return Ok(None);
+    };
+    let target = durable_target_for_scope(&request);
+    let probe = limit.saturating_add(1);
+    let candidate_cap = if labels.is_none() && fields.is_none() {
+        probe.min(HISTORICAL_CANDIDATE_CAP)
+    } else {
+        HISTORICAL_CANDIDATE_CAP
+    };
+    let mut emitted = Vec::with_capacity(probe.min(HISTORICAL_CANDIDATE_CAP));
+    let mut after = request.query().start_after().cloned();
+    let public_after = after.clone();
+    loop {
+        let candidates = match current_head_candidate_window(
+            store,
+            &request,
+            &target,
+            position,
+            after.clone(),
+            candidate_cap,
+        )
+        .await?
+        {
+            CurrentHeadCandidateWindow::Items(items) => items,
+            // Do not mix windows from two heads. Reconstruct the original
+            // pinned position from durable history instead.
+            CurrentHeadCandidateWindow::HeadMoved => return Ok(None),
+        };
+        record_physical_current_candidate_batch(&candidates);
+        pause_after_bounded_candidate_window(position).await;
+        if candidates.is_empty() {
+            break;
+        }
+        let more_candidates = candidates.len() == candidate_cap;
+        for candidate in candidates {
+            after = Some(ResourceCollectionKey::new(
+                candidate.namespace.clone(),
+                candidate.name.clone(),
+            ));
+            if labels
+                .as_ref()
+                .is_some_and(|selector| !selector.matches_resource(&candidate.data))
+                || fields.as_ref().is_some_and(|selector| {
+                    !selector.matches_resource_with_identity(
+                        &candidate.api_version,
+                        &candidate.kind,
+                        &candidate.data,
+                    )
+                })
+            {
+                continue;
+            }
+            emitted.push(candidate);
+            if emitted.len() == probe {
+                break;
+            }
+        }
+        if emitted.len() == probe || !more_candidates {
+            break;
+        }
+    }
+
+    let exact_total = if labels.is_none() && fields.is_none() {
+        match current_head_remaining_count(store, &request, &target, position, public_after).await?
+        {
+            Some(total) => Some(total),
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
+    let has_more = exact_total
+        .is_some_and(|total| total > i64::try_from(emitted.len()).unwrap_or(i64::MAX))
+        || emitted.len() > limit;
+    emitted.truncate(limit);
+    let snapshot = ResourceListSnapshot::try_new(position)?;
+    let continuation = has_more
+        .then(|| {
+            emitted.last().map(|resource| {
+                ResourceContinuation::new(
+                    ResourceCollectionKey::new(resource.namespace.clone(), resource.name.clone()),
+                    snapshot,
+                )
+            })
+        })
+        .flatten();
+    let remaining_item_count = exact_total
+        .filter(|total| *total > i64::try_from(emitted.len()).unwrap_or(i64::MAX))
+        .map(|total| {
+            total
+                .checked_sub(i64::try_from(emitted.len()).unwrap_or(i64::MAX))
+                .ok_or_else(|| ResourceReadError::CorruptData {
+                    message: "current-head LIST remaining item count underflowed".to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(Some(ResourceListRead::Historical(
+        ResourceListPage::try_new(emitted, snapshot, continuation, remaining_item_count)?,
+    )))
+}
+
+fn durable_target_for_scope(request: &ResourceListRequest) -> DurableWatchTarget {
+    match request.scope() {
+        ResourceCollectionScope::Cluster => {
+            DurableWatchTarget::cluster(request.api_version(), request.kind())
+        }
+        ResourceCollectionScope::AllNamespaces => {
+            DurableWatchTarget::namespaced(request.api_version(), request.kind())
+        }
+        ResourceCollectionScope::Namespace(namespace) => {
+            DurableWatchTarget::namespaced_in_namespace(
+                request.api_version(),
+                request.kind(),
+                namespace,
+            )
+        }
+    }
+}
+
+enum CurrentHeadCandidateWindow {
+    Items(Vec<Resource>),
+    HeadMoved,
+}
+
+async fn current_head_candidate_window(
+    store: &SqliteReadStore,
+    request: &ResourceListRequest,
+    target: &DurableWatchTarget,
+    position: WatchReplayPosition,
+    after: Option<ResourceCollectionKey>,
+    candidate_cap: usize,
+) -> std::result::Result<CurrentHeadCandidateWindow, ResourceReadError> {
+    let av = request.api_version().to_string();
+    let kind = request.kind().to_string();
+    let scope = request.scope().clone();
+    let target = target.clone();
+    store
+        .read_db_call("cluster-read:current-head-candidate-window", move |connection| {
+            // Validate future/retention state and prove the exact current head
+            // in every independently supervised DB closure.
+            if historical_floor(connection, &target, position)?.is_some()
+                || sqlite_replay_position(connection)? != position
+            {
+                return Ok(CurrentHeadCandidateWindow::HeadMoved);
+            }
+            let namespaces = av == "v1"
+                && kind == "Namespace"
+                && matches!(scope, ResourceCollectionScope::Cluster);
+            let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+            let mut sql = if namespaces {
+                "SELECT name, resource_version, uid, data FROM namespaces WHERE 1 = 1".to_string()
+            } else {
+                values.push(Box::new(av));
+                values.push(Box::new(kind));
+                match &scope {
+                    ResourceCollectionScope::Cluster => "SELECT id, api_version, kind, name, resource_version, uid, data FROM cluster_resources WHERE api_version = ?1 AND kind = ?2".to_string(),
+                    ResourceCollectionScope::AllNamespaces => "SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2 AND json_type(data, '$.metadata.namespace') = 'text'".to_string(),
+                    ResourceCollectionScope::Namespace(namespace) => {
+                        values.push(Box::new(namespace.clone()));
+                        "SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2 AND namespace = ?3 AND json_extract(data, '$.metadata.namespace') = ?3".to_string()
+                    }
+                }
+            };
+            append_lexical_after(&mut sql, &mut values, &scope, after.as_ref());
+            sql.push_str(" ORDER BY ");
+            if matches!(scope, ResourceCollectionScope::AllNamespaces) {
+                sql.push_str("namespace, name");
+            } else {
+                sql.push_str("name");
+            }
+            sql.push_str(&format!(" LIMIT ?{}", values.len() + 1));
+            values.push(Box::new(i64::try_from(candidate_cap).unwrap_or(i64::MAX)));
+            let refs = values.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
+            let mut statement = connection.prepare(&sql)?;
+            let items = if namespaces {
+                statement
+                    .query_map(refs.as_slice(), |row| {
+                        let data = json_from_bytes(row.get(3)?)?;
+                        let name: String = row.get(0)?;
+                        record_physical_resource_decode(&name);
+                        Ok(Resource {
+                            id: 0,
+                            api_version: "v1".to_string(),
+                            kind: "Namespace".to_string(),
+                            namespace: None,
+                            name,
+                            resource_version: row.get(1)?,
+                            uid: row.get(2)?,
+                            data: Arc::new(data),
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else if matches!(scope, ResourceCollectionScope::Cluster) {
+                statement
+                    .query_map(refs.as_slice(), row_to_cluster_resource)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                statement
+                    .query_map(refs.as_slice(), row_to_namespaced_resource)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if sqlite_replay_position(connection)? != position {
+                return Ok(CurrentHeadCandidateWindow::HeadMoved);
+            }
+            Ok(CurrentHeadCandidateWindow::Items(items))
+        })
+        .await
+        .map_err(|error| ResourceReadError::retryable(error.to_string()))
+}
+
+/// Selector-free `remainingItemCount` is part of the public pagination
+/// contract. Count identities without materializing their JSON and retain the
+/// same per-closure head proof as the bounded data windows.
+async fn current_head_remaining_count(
+    store: &SqliteReadStore,
+    request: &ResourceListRequest,
+    target: &DurableWatchTarget,
+    position: WatchReplayPosition,
+    after: Option<ResourceCollectionKey>,
+) -> std::result::Result<Option<i64>, ResourceReadError> {
+    let av = request.api_version().to_string();
+    let kind = request.kind().to_string();
+    let scope = request.scope().clone();
+    let target = target.clone();
+    store
+        .read_db_call("cluster-read:current-head-remaining-count", move |connection| {
+            if historical_floor(connection, &target, position)?.is_some()
+                || sqlite_replay_position(connection)? != position
+            {
+                return Ok(None);
+            }
+            let namespaces = av == "v1"
+                && kind == "Namespace"
+                && matches!(scope, ResourceCollectionScope::Cluster);
+            let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+            let mut sql = if namespaces {
+                "SELECT COUNT(*) FROM namespaces WHERE 1 = 1".to_string()
+            } else {
+                values.push(Box::new(av));
+                values.push(Box::new(kind));
+                match &scope {
+                    ResourceCollectionScope::Cluster => "SELECT COUNT(*) FROM cluster_resources WHERE api_version = ?1 AND kind = ?2".to_string(),
+                    ResourceCollectionScope::AllNamespaces => "SELECT COUNT(*) FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2 AND json_type(data, '$.metadata.namespace') = 'text'".to_string(),
+                    ResourceCollectionScope::Namespace(namespace) => {
+                        values.push(Box::new(namespace.clone()));
+                        "SELECT COUNT(*) FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2 AND namespace = ?3 AND json_extract(data, '$.metadata.namespace') = ?3".to_string()
+                    }
+                }
+            };
+            append_lexical_after(&mut sql, &mut values, &scope, after.as_ref());
+            let refs = values.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
+            let total = connection.query_row(&sql, refs.as_slice(), |row| row.get(0))?;
+            if sqlite_replay_position(connection)? != position {
+                return Ok(None);
+            }
+            Ok(Some(total))
+        })
+        .await
+        .map_err(|error| ResourceReadError::retryable(error.to_string()))
+}
+
+fn record_physical_current_candidate_batch(items: &[Resource]) {
+    if items
+        .iter()
+        .all(|item| item.name.starts_with(PHYSICAL_BOUND_PREFIX))
+    {
+        PHYSICAL_CANDIDATE_BATCH_MAX
+            .fetch_max(items.len() as u64, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+async fn pause_after_bounded_candidate_window(position: WatchReplayPosition) {
+    use std::sync::atomic::Ordering;
+    let control = historical_window_test_control();
+    control.candidate_windows.fetch_add(1, Ordering::AcqRel);
+    let should_pause = {
+        let mut pause_position = control
+            .pause_position
+            .lock()
+            .expect("historical window pause mutex poisoned");
+        if *pause_position == Some(position) {
+            *pause_position = None;
+            true
+        } else {
+            false
+        }
+    };
+    if should_pause {
+        control.reached.add_permits(1);
+        control.resume.acquire().await.unwrap().forget();
+    }
 }
 
 enum HistoricalCandidateWindow {
