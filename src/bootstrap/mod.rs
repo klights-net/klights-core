@@ -7,6 +7,7 @@ pub mod config;
 pub(crate) mod controller_adapters;
 pub(crate) mod controlplane_join_adapters;
 pub mod credential_store;
+pub(crate) mod entry;
 pub(crate) mod file_blocking;
 pub(crate) mod finalizer_lifecycle_adapter;
 pub(crate) mod grpc_raft_transport_adapter;
