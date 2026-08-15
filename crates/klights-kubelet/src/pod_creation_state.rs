@@ -10,6 +10,26 @@ use tokio::sync::Mutex;
 pub type PodCreationTracker = Arc<Mutex<HashSet<String>>>;
 pub type PodStartRetryTracker = Arc<Mutex<PodStartRetryState>>;
 
+/// Kubelet-owned projection of the retry tracker used by API diagnostics.
+///
+/// Bootstrap constructs this adapter but does not interpret retry state or
+/// duplicate its key/value representation.
+pub struct PodStartRetryDiagnosticsAdapter {
+    tracker: PodStartRetryTracker,
+}
+
+impl PodStartRetryDiagnosticsAdapter {
+    pub fn new(tracker: PodStartRetryTracker) -> Arc<Self> {
+        Arc::new(Self { tracker })
+    }
+}
+
+impl klights_pod_api::PodStartRetryDiagnostics for PodStartRetryDiagnosticsAdapter {
+    fn pending_pod_start_retries(&self) -> klights_pod_api::PodStartRetryDiagnosticsFuture<'_> {
+        Box::pin(async move { self.tracker.lock().await.pending_key_pairs() })
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PodStartSource {
@@ -215,6 +235,28 @@ pub fn pod_startup_retry_policy_for_error(
 #[cfg(any(test, feature = "test-support"))]
 pub fn is_transient_pod_start_error(err: &anyhow::Error) -> bool {
     classify_legacy_startup_error(err).retry_policy("Always") == PodStartupRetryPolicy::Retry
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    use klights_pod_api::PodStartRetryDiagnostics as _;
+
+    #[tokio::test]
+    async fn pod_start_retry_diagnostics_adapter_is_kubelet_owned() {
+        fn assert_diagnostics<T: klights_pod_api::PodStartRetryDiagnostics>() {}
+        assert_diagnostics::<PodStartRetryDiagnosticsAdapter>();
+
+        let tracker = Arc::new(Mutex::new(PodStartRetryState::new()));
+        tracker.lock().await.next_delay("default", "image-pull");
+        let diagnostics = PodStartRetryDiagnosticsAdapter::new(tracker);
+
+        assert_eq!(
+            diagnostics.pending_pod_start_retries().await,
+            vec![("default".to_string(), "image-pull (attempts=1)".to_string())]
+        );
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

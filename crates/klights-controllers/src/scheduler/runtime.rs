@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use klights_leader_api::{LeaderWatchError, ResourceEvent, WatchEventType, WatchStream};
+use klights_leader_api::{
+    LeaderWatch, LeaderWatchError, ResourceEvent, ResourceListScope, WatchEventType, WatchRequest,
+    WatchStream,
+};
 use klights_reconcile_api::ControllerStoreResult;
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +30,62 @@ pub trait SchedulerRuntime: Send + Sync {
     async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError>;
 
     async fn schedule_all_unbound_pods(&self) -> ControllerStoreResult<()>;
+}
+
+/// Canonical leader adapter for the scheduler's focused watch and Pod ports.
+///
+/// Root bootstrap supplies the concrete positioned watch and Pod scheduling
+/// service. The scheduler owner defines which Kubernetes resources wake it and
+/// enforces the controller lease before issuing a scheduling sweep.
+pub struct LeaderSchedulerRuntime {
+    pods: Arc<dyn klights_pod_api::PodScheduling>,
+    watch: Arc<dyn LeaderWatch>,
+}
+
+impl LeaderSchedulerRuntime {
+    pub fn new(watch: Arc<dyn LeaderWatch>, pods: Arc<dyn klights_pod_api::PodScheduling>) -> Self {
+        Self { pods, watch }
+    }
+}
+
+#[async_trait]
+impl SchedulerRuntime for LeaderSchedulerRuntime {
+    async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError> {
+        let mut sessions = Vec::with_capacity(2);
+        for (api_version, kind, scope) in [
+            ("v1", "Pod", ResourceListScope::AllNamespaces),
+            ("v1", "Node", ResourceListScope::Cluster),
+        ] {
+            let request = WatchRequest::try_new_with_scope(
+                api_version,
+                kind,
+                None,
+                scope,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            sessions.push(self.watch.watch_resources(request).await?);
+        }
+        Ok(sessions)
+    }
+
+    async fn schedule_all_unbound_pods(&self) -> ControllerStoreResult<()> {
+        klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+            klights_reconcile_api::ControllerStoreError::unavailable(format!(
+                "controller authority rejected effect: {error}"
+            ))
+        })?;
+        self.pods
+            .schedule_all_unbound_pods()
+            .await
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::unavailable(format!(
+                    "schedule unbound Pods failed: {error}"
+                ))
+            })
+    }
 }
 
 /// Scheduler controller configuration.
@@ -126,6 +185,42 @@ pub async fn run_scheduler_watch(runtime: Arc<dyn SchedulerRuntime>, cancel: Can
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    struct RecordingWatch {
+        requests: Mutex<Vec<WatchRequest>>,
+    }
+
+    impl LeaderWatch for RecordingWatch {
+        fn watch_resources(
+            &self,
+            request: WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async {
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
+            })
+        }
+    }
+
+    struct UnusedScheduling;
+
+    impl klights_pod_api::PodScheduling for UnusedScheduling {
+        fn schedule_all_unbound_pods(&self) -> klights_pod_api::PodSchedulingFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn schedule_pending_pod(
+            &self,
+            _namespace: String,
+            _name: String,
+        ) -> klights_pod_api::PodSchedulingFuture<'_, Option<klights_cluster_core::Resource>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+    }
 
     fn event(value: serde_json::Value) -> ResourceEvent {
         let resource =
@@ -211,5 +306,24 @@ mod tests {
     fn scheduler_uses_local_watch_not_http_watch() {
         // Structural assertion: the controller uses the positioned leader-watch port,
         // not any HTTP watch client.
+    }
+
+    #[tokio::test]
+    async fn leader_scheduler_runtime_is_controller_owned() {
+        fn assert_runtime<T: SchedulerRuntime>() {}
+        assert_runtime::<LeaderSchedulerRuntime>();
+
+        let watch = Arc::new(RecordingWatch {
+            requests: Mutex::new(Vec::new()),
+        });
+        let runtime = LeaderSchedulerRuntime::new(watch.clone(), Arc::new(UnusedScheduling));
+
+        let sessions = runtime.open_watch_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        let requests = watch.requests.lock().unwrap();
+        assert_eq!(requests[0].kind(), "Pod");
+        assert_eq!(requests[0].scope(), &ResourceListScope::AllNamespaces);
+        assert_eq!(requests[1].kind(), "Node");
+        assert_eq!(requests[1].scope(), &ResourceListScope::Cluster);
     }
 }

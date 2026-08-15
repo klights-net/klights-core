@@ -1,66 +1,10 @@
+//! Concrete root construction for the controller-owned scheduler runtime.
+
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
-
-use klights_controllers::scheduler::SchedulerRuntime;
-use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
-
-pub(crate) struct LeaderSchedulerRuntime {
-    pods: Arc<dyn klights_pod_api::PodScheduling>,
+pub(crate) fn leader_scheduler_runtime(
     positioned_watch: klights_watch::PositionedWatchService,
-}
-
-impl LeaderSchedulerRuntime {
-    pub(crate) fn new(
-        positioned_watch: klights_watch::PositionedWatchService,
-        pods: Arc<dyn klights_pod_api::PodScheduling>,
-    ) -> Self {
-        Self {
-            positioned_watch,
-            pods,
-        }
-    }
-}
-
-#[async_trait]
-impl SchedulerRuntime for LeaderSchedulerRuntime {
-    async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError> {
-        let mut sessions = Vec::with_capacity(2);
-        for (api_version, kind, scope) in [
-            (
-                "v1",
-                "Pod",
-                klights_leader_api::ResourceListScope::AllNamespaces,
-            ),
-            ("v1", "Node", klights_leader_api::ResourceListScope::Cluster),
-        ] {
-            let request = WatchRequest::try_new_with_scope(
-                api_version,
-                kind,
-                None,
-                scope,
-                None,
-                None,
-                None,
-                None,
-            )?;
-            sessions.push(self.positioned_watch.watch_resources(request).await?);
-        }
-        Ok(sessions)
-    }
-
-    async fn schedule_all_unbound_pods(&self) -> ControllerStoreResult<()> {
-        klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
-            ControllerStoreError::unavailable(format!(
-                "controller authority rejected effect: {error}"
-            ))
-        })?;
-        self.pods
-            .schedule_all_unbound_pods()
-            .await
-            .map_err(|error| {
-                ControllerStoreError::unavailable(format!("schedule unbound Pods failed: {error}"))
-            })
-    }
+    pods: Arc<dyn klights_pod_api::PodScheduling>,
+) -> klights_controllers::scheduler::LeaderSchedulerRuntime {
+    klights_controllers::scheduler::LeaderSchedulerRuntime::new(Arc::new(positioned_watch), pods)
 }

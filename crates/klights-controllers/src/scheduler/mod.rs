@@ -25,6 +25,7 @@ pub mod types;
 
 pub use placement::SchedulerPlacement;
 pub use runtime::{
-    SchedulerControllerConfig, SchedulerRuntime, run_scheduler_watch, should_wake_scheduler,
+    LeaderSchedulerRuntime, SchedulerControllerConfig, SchedulerRuntime, run_scheduler_watch,
+    should_wake_scheduler,
 };
 pub use service::{SCHED_BIND_CONCURRENCY, SchedulerService, SchedulerServiceDependencies};

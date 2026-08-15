@@ -30,21 +30,3 @@ impl klights_leader_api::LeaderClusterStatusMetadata for ApiClusterStatusMetadat
         })
     }
 }
-
-pub(crate) struct ApiPodStartRetryDiagnostics {
-    tracker: klights_kubelet::pod_creation_state::PodStartRetryTracker,
-}
-
-impl ApiPodStartRetryDiagnostics {
-    pub(crate) fn new(
-        tracker: klights_kubelet::pod_creation_state::PodStartRetryTracker,
-    ) -> Arc<Self> {
-        Arc::new(Self { tracker })
-    }
-}
-
-impl klights_pod_api::PodStartRetryDiagnostics for ApiPodStartRetryDiagnostics {
-    fn pending_pod_start_retries(&self) -> klights_pod_api::PodStartRetryDiagnosticsFuture<'_> {
-        Box::pin(async move { self.tracker.lock().await.pending_key_pairs() })
-    }
-}

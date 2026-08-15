@@ -240,7 +240,7 @@ async fn start_leader_scoped_tasks(
     );
 
     let scheduler_runtime: Arc<dyn klights_controllers::scheduler::SchedulerRuntime> = Arc::new(
-        crate::bootstrap::scheduler_adapter::LeaderSchedulerRuntime::new(
+        crate::bootstrap::scheduler_adapter::leader_scheduler_runtime(
             positioned_watch,
             pod_scheduling,
         ),

@@ -195,30 +195,16 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
     ) -> FinalizerLifecycleFuture<'_, ()> {
         Box::pin(async move {
             let resource = request.resource;
-            if let Err(error) = klights_controllers::gc::cascade_delete_with_uid(
+            klights_controllers::gc::run_finalized_resource_effects(
                 self.lifecycle.gc.as_ref(),
-                &resource.uid,
-                &resource.api_version,
-                &resource.name,
-                &resource.kind,
-                resource.namespace.clone(),
+                &resource,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
                 self.coordination.as_ref(),
+                self.side_effects.as_ref(),
+                self.metrics.as_ref(),
             )
-            .await
-            {
-                self.metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(
-                    namespace = ?resource.namespace,
-                    name = %resource.name,
-                    error = %error,
-                    "cascade delete after finalizer-drained hard delete failed"
-                );
-            }
-            let _ = self.side_effects.run_hooks(&resource.data).await;
+            .await;
             Ok(())
         })
     }

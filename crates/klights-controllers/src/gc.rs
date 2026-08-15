@@ -906,6 +906,47 @@ pub async fn cascade_delete_with_uid(
     .await
 }
 
+/// Run the controller-owned post-finalization cascade and mutation effects.
+///
+/// The resource has already been hard-deleted by the lifecycle owner. A
+/// cascade failure is therefore observable and retry-independent: record it,
+/// continue the remaining side effects, and preserve the historical
+/// best-effort completion contract.
+pub async fn run_finalized_resource_effects(
+    db: &(impl GcResourceStore + ?Sized),
+    resource: &Resource,
+    pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
+    side_effects: &crate::side_effects::SideEffectRegistry,
+    metrics: &crate::side_effects::SideEffectMetrics,
+) {
+    if let Err(error) = cascade_delete_with_uid(
+        db,
+        &resource.uid,
+        &resource.api_version,
+        &resource.name,
+        &resource.kind,
+        resource.namespace.clone(),
+        pod_delete_sink,
+        non_pod_finalization,
+        coordination,
+    )
+    .await
+    {
+        metrics
+            .cascade_delete_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            namespace = ?resource.namespace,
+            name = %resource.name,
+            error = %error,
+            "cascade delete after finalizer-drained hard delete failed"
+        );
+    }
+    let _ = side_effects.run_hooks(&resource.data).await;
+}
+
 struct CascadeDeleteRequest<'a> {
     owner_uid: &'a str,
     owner_api_version: &'a str,
@@ -1852,5 +1893,74 @@ mod tests {
         .expect("UID-qualified owner identity must be accepted");
         assert_eq!(key.uid, "owner-uid");
         assert_eq!(key.namespace.as_deref(), Some("default"));
+    }
+
+    #[tokio::test]
+    async fn finalized_resource_effects_are_controller_owned() {
+        let store = crate::internal_test_support::in_memory().await;
+        let owner = store
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "owner",
+                json!({"metadata": {"uid": "owner-uid"}}),
+            )
+            .await
+            .unwrap();
+        store
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "child",
+                json!({
+                    "metadata": {
+                        "uid": "child-uid",
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1",
+                            "kind": "Deployment",
+                            "name": "owner",
+                            "uid": "owner-uid"
+                        }]
+                    },
+                    "spec": {"nodeName": "worker-1"}
+                }),
+            )
+            .await
+            .unwrap();
+        let coordination = crate::ControllerCoordination::new();
+        let side_effects = crate::side_effects::SideEffectRegistry::new();
+        let metrics = crate::side_effects::SideEffectMetrics::new();
+
+        run_finalized_resource_effects(
+            &store,
+            &owner,
+            &store,
+            &store,
+            &coordination,
+            &side_effects,
+            &metrics,
+        )
+        .await;
+
+        let child = store
+            .get_resource("v1", "Pod", Some("default"), "child")
+            .await
+            .unwrap()
+            .expect("actor-owned Pod row remains present");
+        assert_eq!(
+            child
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(serde_json::Value::as_str),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            metrics
+                .cascade_delete_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

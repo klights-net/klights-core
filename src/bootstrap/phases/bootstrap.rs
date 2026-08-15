@@ -1813,7 +1813,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         node_port_forward,
         Some(pod_lifecycle_router.clone()),
         Some(
-            crate::bootstrap::operational_adapters::ApiPodStartRetryDiagnostics::new(
+            klights_kubelet::pod_creation_state::PodStartRetryDiagnosticsAdapter::new(
                 pod_start_retry_state.clone(),
             ),
         ),
