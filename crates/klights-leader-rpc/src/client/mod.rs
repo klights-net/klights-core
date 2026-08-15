@@ -135,6 +135,102 @@ impl NodeControlRuntimes {
     }
 }
 
+/// Start the worker control-stream recovery task for this RPC client.
+///
+/// Rejoining, heartbeat acknowledgement, endpoint rotation, and bounded
+/// reconnect timing are RPC-runtime behavior. Bootstrap supplies the concrete
+/// node runtimes and shutdown token, but does not own that recovery policy.
+pub async fn start_worker_control_stream(
+    client: Arc<ReplicationGrpcClient>,
+    runtimes: NodeControlRuntimes,
+    supervisor: Arc<TaskSupervisor>,
+    cancel: CancellationToken,
+) -> Result<klights_supervisor::SupervisedJoinHandle<()>> {
+    client.clear_stream().await;
+    let supervisor_for_task = supervisor.clone();
+    supervisor
+        .spawn_async(
+            TaskCategory::Network,
+            "worker_leader_control_stream",
+            async move {
+                run_worker_control_stream(client, runtimes, supervisor_for_task, cancel).await;
+            },
+        )
+        .await
+        .map_err(Into::into)
+}
+
+async fn run_worker_control_stream(
+    client: Arc<ReplicationGrpcClient>,
+    runtimes: NodeControlRuntimes,
+    supervisor: Arc<TaskSupervisor>,
+    cancel: CancellationToken,
+) {
+    let mut observed_rv = 0_i64;
+    let mut attempt = 0_u32;
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        match client.ensure_joined_with_runtimes(runtimes.clone()).await {
+            Ok(_) => {
+                tracing::info!("worker leader control stream connected");
+                attempt = 0;
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        next = client.stream_next() => match next {
+                            Ok(StreamItem::Heartbeat { current_rv }) => {
+                                observed_rv = observed_rv.max(current_rv);
+                                if let Err(err) = client.ack(observed_rv).await {
+                                    tracing::debug!(error = %err, "failed to ACK worker leader stream heartbeat");
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "worker leader control stream disconnected");
+                                break;
+                            }
+                        },
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to connect worker leader control stream");
+            }
+        }
+
+        let old_endpoint = client.current_leader_endpoint();
+        let next_endpoint = client.try_next_endpoint();
+        if next_endpoint != old_endpoint {
+            tracing::info!(
+                old = %old_endpoint,
+                new = %next_endpoint,
+                "worker leader control stream: cycling leader endpoint"
+            );
+        }
+
+        let delay = worker_control_stream_reconnect_delay(attempt);
+        attempt = attempt.saturating_add(1);
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = supervisor.sleep("worker_leader_control_stream_reconnect", delay) => {
+                if let Err(err) = result {
+                    tracing::warn!(error = %err, "worker leader control stream reconnect timer failed");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn worker_control_stream_reconnect_delay(attempt: u32) -> std::time::Duration {
+    let shift = attempt.clamp(0, 5);
+    let millis = 250_u64.saturating_mul(1_u64 << shift).min(5_000);
+    std::time::Duration::from_millis(millis)
+}
+
 #[derive(Debug)]
 struct SkipCaServerCertVerifier {
     provider: Arc<CryptoProvider>,

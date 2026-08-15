@@ -17,6 +17,15 @@ pub trait WallClock: Send + Sync {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemWallClock;
 
+/// Convert a wall-clock observation to the non-negative millisecond stamp
+/// used by runtime boundaries. Keeping this generic conversion beside the
+/// clock avoids each bootstrap caller inventing its own pre-epoch behavior.
+pub fn system_time_epoch_millis(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 impl SystemWallClock {
     pub fn now() -> std::time::SystemTime {
         std::time::SystemTime::now()
@@ -35,7 +44,7 @@ impl WallClock for SystemWallClock {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemWallClock, WallClock};
+    use super::{SystemWallClock, WallClock, system_time_epoch_millis};
 
     struct FixedClock(std::time::SystemTime);
 
@@ -63,5 +72,19 @@ mod tests {
         assert!(observed >= before);
         assert!(observed <= after);
         let _: chrono::DateTime<chrono::Utc> = SystemWallClock::now_utc();
+    }
+
+    #[test]
+    fn system_time_epoch_millis_saturates_pre_epoch_and_large_instants() {
+        assert_eq!(system_time_epoch_millis(std::time::UNIX_EPOCH), 0);
+        assert_eq!(
+            system_time_epoch_millis(std::time::UNIX_EPOCH + std::time::Duration::from_millis(42)),
+            42
+        );
+        assert_eq!(
+            system_time_epoch_millis(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+            0,
+            "wall-clock observations before the epoch must not produce a negative outbox stamp"
+        );
     }
 }

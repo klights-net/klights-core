@@ -27,6 +27,51 @@ pub const DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS);
 pub const DEFAULT_CRI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Result of one bounded best-effort sweep of runtime containers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeContainerCleanup {
+    stopped: usize,
+    removed: usize,
+}
+
+impl RuntimeContainerCleanup {
+    pub fn stopped(self) -> usize {
+        self.stopped
+    }
+
+    pub fn removed(self) -> usize {
+        self.removed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RuntimeContainerCleanupOperation {
+    Stop(String),
+    Remove(String),
+}
+
+/// Build the recovery sweep in canonical order: stop every valid runtime
+/// container before removing any of them. The caller owns CRI transport.
+fn runtime_container_cleanup_plan(
+    container_ids: impl IntoIterator<Item = String>,
+) -> Vec<RuntimeContainerCleanupOperation> {
+    let container_ids = container_ids
+        .into_iter()
+        .filter(|container_id| is_cleanup_container_id(container_id))
+        .collect::<Vec<_>>();
+    container_ids
+        .iter()
+        .cloned()
+        .map(RuntimeContainerCleanupOperation::Stop)
+        .chain(
+            container_ids
+                .iter()
+                .cloned()
+                .map(RuntimeContainerCleanupOperation::Remove),
+        )
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CriRequestTimeout {
     operation: &'static str,
@@ -496,6 +541,40 @@ impl CriClient {
         Ok(response.into_inner())
     }
 
+    /// Stop and remove every concrete runtime container left in this CRI
+    /// namespace. This is runtime recovery behavior; process bootstrap only
+    /// decides when a complete cleanup sequence should invoke it.
+    pub async fn cleanup_all_runtime_containers(
+        &mut self,
+        stop_timeout_seconds: i64,
+    ) -> Result<RuntimeContainerCleanup> {
+        let response = self.list_containers(None).await?;
+        let operations = runtime_container_cleanup_plan(
+            response
+                .containers
+                .into_iter()
+                .map(|container| container.id),
+        );
+        let mut cleanup = RuntimeContainerCleanup {
+            stopped: 0,
+            removed: 0,
+        };
+        for operation in operations {
+            match operation {
+                RuntimeContainerCleanupOperation::Stop(container_id) => {
+                    self.stop_container(&container_id, stop_timeout_seconds)
+                        .await?;
+                    cleanup.stopped += 1;
+                }
+                RuntimeContainerCleanupOperation::Remove(container_id) => {
+                    self.remove_container(&container_id).await?;
+                    cleanup.removed += 1;
+                }
+            }
+        }
+        Ok(cleanup)
+    }
+
     pub async fn list_containers_by_sandbox(
         &mut self,
         sandbox_id: &str,
@@ -625,6 +704,10 @@ impl CriClient {
     }
 }
 
+fn is_cleanup_container_id(container_id: &str) -> bool {
+    !container_id.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,6 +743,72 @@ mod tests {
         assert_eq!(
             DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
             std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn cleanup_container_candidate_rejects_blank_runtime_ids() {
+        assert!(super::is_cleanup_container_id("container-a"));
+        assert!(!super::is_cleanup_container_id("  "));
+        assert!(!super::is_cleanup_container_id(""));
+    }
+
+    #[tokio::test]
+    async fn runtime_container_cleanup_stops_every_valid_id_before_removing_any() {
+        let executed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = executed.clone();
+        let operations = super::runtime_container_cleanup_plan(
+            ["container-a", " ", "container-b", ""]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        for operation in operations {
+            observed.lock().unwrap().push(operation);
+        }
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![
+                super::RuntimeContainerCleanupOperation::Stop("container-a".to_string()),
+                super::RuntimeContainerCleanupOperation::Stop("container-b".to_string()),
+                super::RuntimeContainerCleanupOperation::Remove("container-a".to_string()),
+                super::RuntimeContainerCleanupOperation::Remove("container-b".to_string()),
+            ],
+            "recovery must stop all valid containers before removing any"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_container_cleanup_is_empty_noop_and_fails_closed() {
+        let empty = super::runtime_container_cleanup_plan(std::iter::empty());
+        assert!(empty.is_empty(), "empty CRI list is a no-op");
+
+        let executed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = executed.clone();
+        let operations = super::runtime_container_cleanup_plan(
+            ["container-a", "container-b"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let error = operations
+            .into_iter()
+            .try_for_each(|operation| -> anyhow::Result<()> {
+                let fail = operation
+                    == super::RuntimeContainerCleanupOperation::Stop("container-b".to_string());
+                observed.lock().unwrap().push(operation);
+                if fail {
+                    anyhow::bail!("fake CRI stop failure")
+                }
+                Ok(())
+            })
+            .expect_err("a failed CRI stop must prevent removals");
+        assert!(error.to_string().contains("fake CRI stop failure"));
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![
+                super::RuntimeContainerCleanupOperation::Stop("container-a".to_string()),
+                super::RuntimeContainerCleanupOperation::Stop("container-b".to_string()),
+            ],
+            "a failed stop must not report success or remove containers"
         );
     }
 

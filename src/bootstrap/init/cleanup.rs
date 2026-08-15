@@ -125,7 +125,12 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
 
     // Drain leftover CRI containers first (covers stale pause/infra
     // containers that can survive sandbox cleanup in rare crash windows).
-    cleanup_all_runtime_containers(&mut cri).await?;
+    let runtime_cleanup = cri.cleanup_all_runtime_containers(5).await?;
+    tracing::info!(
+        to_stop = runtime_cleanup.stopped(),
+        removed = runtime_cleanup.removed(),
+        "Cleaned up lingering runtime containers during klights cleanup"
+    );
 
     // Stop all pod sandboxes.
     tracing::info!("Stopping all pod sandboxes");
@@ -173,39 +178,6 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         &file_process,
     )
     .await
-}
-
-async fn cleanup_all_runtime_containers(
-    cri: &mut klights_kubelet::cri::CriClient,
-) -> anyhow::Result<()> {
-    let mut response = cri.list_containers(None).await?;
-    if response.containers.is_empty() {
-        return Ok(());
-    }
-
-    let mut to_stop = 0;
-    for container in &response.containers {
-        if container.id.trim().is_empty() {
-            continue;
-        }
-        to_stop += 1;
-        cri.stop_container(&container.id, 5).await?;
-    }
-
-    let mut removed = 0usize;
-    for container in response.containers.drain(..) {
-        if container.id.trim().is_empty() {
-            continue;
-        }
-        cri.remove_container(&container.id).await?;
-        removed += 1;
-    }
-    tracing::info!(
-        to_stop,
-        removed,
-        "Cleaned up lingering runtime containers during klights cleanup"
-    );
-    Ok(())
 }
 
 struct CleanupCniRpcServer {

@@ -20,7 +20,6 @@ use crate::pidfile;
 
 use super::init::dataplane::*;
 use super::init::host::print_ready_message;
-use super::init::leader_control_stream::start_worker_leader_control_stream;
 use super::runtime::resolve_token_file_if_present;
 use super::worker_store_adapter::start_worker_store_adapter;
 
@@ -392,7 +391,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         )),
         metrics_runtime,
     );
-    let worker_control_stream_handle = start_worker_leader_control_stream(
+    let worker_control_stream_handle = klights_leader_rpc::client::start_worker_control_stream(
         follower_grpc_client.clone(),
         control_runtimes,
         task_supervisor.clone(),

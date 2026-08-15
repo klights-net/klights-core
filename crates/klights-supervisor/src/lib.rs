@@ -10,7 +10,7 @@ mod supervisor;
 mod task;
 
 pub use category::{TaskCategory, TaskCategoryConfig};
-pub use clock::{SystemWallClock, WallClock};
+pub use clock::{SystemWallClock, WallClock, system_time_epoch_millis};
 pub use sqlite::{DbCallResult, DbClosureResult, DbError, DbExecutor};
 pub use sqlite_open::{OpenOpts, OpenPath, PragmaProfile, SqliteOpenError};
 pub use supervisor::{

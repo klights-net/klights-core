@@ -13,7 +13,6 @@ use crate::bootstrap::{CliFlags, NodeRole};
 
 pub use super::init::cleanup::run_cleanup_with_flags;
 use super::init::dataplane::*;
-use super::init::leader_control_stream::start_worker_leader_control_stream;
 use super::init::predicates::*;
 
 fn should_start_controlplane_leader_control_stream(role: &NodeRole, has_client: bool) -> bool {
@@ -152,10 +151,15 @@ async fn start_controlplane_leader_control_stream_if_needed(
         metrics_runtime,
     );
 
-    start_worker_leader_control_stream(client, control_runtimes, task_supervisor, shutdown_token)
-        .await
-        .context("controlplane leader control stream")
-        .map(Some)
+    klights_leader_rpc::client::start_worker_control_stream(
+        client,
+        control_runtimes,
+        task_supervisor,
+        shutdown_token,
+    )
+    .await
+    .context("controlplane leader control stream")
+    .map(Some)
 }
 
 // ── Leader / full-stack boot ─────────────────────────────────────────────
@@ -865,7 +869,7 @@ mod tests {
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
 
-        let published = super::publish_local_dataplane_metadata_self_heal(
+        let published = super::publish_local_dataplane_metadata_self_heal_with_resource_reads(
             db.focused_read_store().as_ref(),
             &command,
             &config,

@@ -16,6 +16,7 @@ use netlink_packet_wireguard::{
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
+use klights_cluster_store::{ClusterResourceRead, ResourceGetRequest};
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 pub const DEFAULT_WIREGUARD_DEVICE: &str = "klights.wg";
@@ -153,6 +154,131 @@ impl DataplaneMode {
             Self::Rootless => "rootless",
         }
     }
+}
+
+/// Local dataplane identity derived from node runtime inputs.
+///
+/// This keeps WireGuard-key materialization and direct-route omission in the
+/// networking owner; callers only map their process mode and serialize the
+/// result for their own boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalDataplaneIdentity {
+    mode: DataplaneMode,
+    encryption: DataplaneEncryption,
+    public_key: Option<String>,
+    port: Option<u16>,
+}
+
+impl LocalDataplaneIdentity {
+    pub async fn load(
+        key_path: &Path,
+        mode: DataplaneMode,
+        encryption: DataplaneEncryption,
+        wireguard_port: u16,
+        supervisor: &TaskSupervisor,
+    ) -> Result<Self> {
+        let (public_key, port) = if encryption == DataplaneEncryption::Enabled {
+            let identity = WireGuardIdentity::load_or_create(key_path, supervisor).await?;
+            (
+                Some(identity.public_key().to_string()),
+                Some(wireguard_port),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            mode,
+            encryption,
+            public_key,
+            port,
+        })
+    }
+
+    pub const fn mode(&self) -> DataplaneMode {
+        self.mode
+    }
+
+    pub const fn encryption(&self) -> DataplaneEncryption {
+        self.encryption
+    }
+
+    pub fn public_key(&self) -> Option<&str> {
+        self.public_key.as_deref()
+    }
+
+    pub const fn port(&self) -> Option<u16> {
+        self.port
+    }
+}
+
+/// Resolve and register this node's dataplane metadata when the process did
+/// not receive an explicit endpoint. The resolution policy is networking
+/// behavior: configured endpoints take precedence, and a persisted Node
+/// `ExternalIP` is the only recovery fallback. Internal node addresses are
+/// deliberately never advertised as cross-node endpoints.
+pub async fn publish_local_dataplane_metadata_self_heal(
+    resource_reads: &dyn ClusterResourceRead,
+    command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
+    node_name: &str,
+    configured_endpoint: Option<&str>,
+    identity: &LocalDataplaneIdentity,
+) -> Result<bool> {
+    let endpoint = if let Some(endpoint) = configured_endpoint
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        endpoint.to_owned()
+    } else {
+        let Some(node) = resource_reads
+            .get_resource(ResourceGetRequest::new("v1", "Node", None, node_name))
+            .await
+            .map_err(anyhow::Error::new)?
+        else {
+            return Ok(false);
+        };
+        let Some(endpoint) = node_status_external_ip(&node.data) else {
+            return Ok(false);
+        };
+        endpoint.to_owned()
+    };
+    let endpoint_address = endpoint
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid local dataplane external endpoint '{endpoint}'"))?;
+    let metadata = klights_leader_api::NetworkDataplane::try_new(
+        node_name,
+        match identity.mode() {
+            DataplaneMode::Root => klights_leader_api::NetworkNodeMode::Root,
+            DataplaneMode::Rootless => klights_leader_api::NetworkNodeMode::Rootless,
+        },
+        match identity.encryption() {
+            DataplaneEncryption::Enabled => klights_leader_api::DataplaneEncryption::WireGuard,
+            DataplaneEncryption::Disabled => klights_leader_api::DataplaneEncryption::Direct,
+        },
+        identity.public_key(),
+        endpoint_address,
+        identity.port(),
+    )
+    .map_err(anyhow::Error::new)?;
+    command
+        .register_node_dataplane(metadata)
+        .await
+        .map_err(anyhow::Error::new)?;
+    tracing::info!(node = %node_name, endpoint = %endpoint, "published local dataplane metadata from resolved external endpoint");
+    Ok(true)
+}
+
+fn node_status_external_ip(node: &serde_json::Value) -> Option<&str> {
+    node.pointer("/status/addresses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|addresses| {
+            addresses.iter().find_map(|address| {
+                (address.get("type").and_then(serde_json::Value::as_str) == Some("ExternalIP"))
+                    .then(|| address.get("address").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|endpoint| !endpoint.is_empty())
+            })
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -774,6 +900,8 @@ fn public_key_from_private(private_key: &WireGuardPrivateKey) -> Result<WireGuar
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
@@ -789,6 +917,66 @@ mod tests {
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio::sync::Mutex as AsyncMutex;
+
+    struct NodeReadFixture {
+        node: Option<klights_cluster_core::Resource>,
+    }
+
+    impl klights_cluster_store::ClusterResourceRead for NodeReadFixture {
+        fn get_resource(
+            &self,
+            _request: klights_cluster_store::ResourceGetRequest,
+        ) -> klights_cluster_store::ResourceReadFuture<'_, Option<klights_cluster_core::Resource>>
+        {
+            Box::pin(async move { Ok(self.node.clone()) })
+        }
+
+        fn list_resources(
+            &self,
+            _request: klights_cluster_store::ResourceListRequest,
+        ) -> klights_cluster_store::ResourceReadFuture<'_, klights_cluster_store::ResourceListRead>
+        {
+            Box::pin(async move { panic!("dataplane recovery does not list resources") })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDataplaneCommand {
+        registrations: Mutex<Vec<klights_leader_api::NetworkDataplane>>,
+    }
+
+    impl klights_leader_api::LeaderNetworkTopologyCommand for RecordingDataplaneCommand {
+        fn register_node_dataplane(
+            &self,
+            metadata: klights_leader_api::NetworkDataplane,
+        ) -> klights_leader_api::NetworkTopologyFuture<'_, ()> {
+            Box::pin(async move {
+                self.registrations.lock().unwrap().push(metadata);
+                Ok(())
+            })
+        }
+    }
+
+    fn node_with_external_ip(endpoint: &str) -> klights_cluster_core::Resource {
+        klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "leader-a".to_string(),
+            uid: "node-a".to_string(),
+            resource_version: 1,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "leader-a"},
+                "status": {"addresses": [
+                    {"type": "InternalIP", "address": "10.0.0.2"},
+                    {"type": "ExternalIP", "address": endpoint}
+                ]}
+            })),
+        }
+    }
 
     fn dataplane_peer_metadata(
         node_name: String,
@@ -839,6 +1027,95 @@ mod tests {
             7_679,
             "default multinode WireGuard dataplane traffic must listen on UDP 7679"
         );
+    }
+
+    #[tokio::test]
+    async fn local_identity_for_direct_mode_does_not_create_a_wireguard_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("wireguard-private.key");
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+
+        let identity = super::LocalDataplaneIdentity::load(
+            &key_path,
+            DataplaneMode::Rootless,
+            DataplaneEncryption::Disabled,
+            7_679,
+            &supervisor,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(identity.mode(), DataplaneMode::Rootless);
+        assert_eq!(identity.encryption(), DataplaneEncryption::Disabled);
+        assert_eq!(identity.public_key(), None);
+        assert_eq!(identity.port(), None);
+        assert!(
+            !key_path.exists(),
+            "direct mode must not materialize WireGuard state"
+        );
+    }
+
+    #[tokio::test]
+    async fn dataplane_self_heal_uses_node_external_ip_and_never_internal_ip() {
+        let directory = tempfile::tempdir().unwrap();
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let identity = super::LocalDataplaneIdentity::load(
+            &directory.path().join("wireguard-private.key"),
+            DataplaneMode::Root,
+            DataplaneEncryption::Disabled,
+            7_679,
+            &supervisor,
+        )
+        .await
+        .unwrap();
+        let reads = NodeReadFixture {
+            node: Some(node_with_external_ip("198.51.100.47")),
+        };
+        let command = RecordingDataplaneCommand::default();
+
+        assert!(
+            super::publish_local_dataplane_metadata_self_heal(
+                &reads, &command, "leader-a", None, &identity,
+            )
+            .await
+            .unwrap()
+        );
+
+        let registrations = command.registrations.lock().unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].endpoint().to_string(), "198.51.100.47");
+        assert_eq!(
+            registrations[0].encryption(),
+            klights_leader_api::DataplaneEncryption::Direct
+        );
+        assert!(registrations[0].public_key().is_none());
+        assert_eq!(registrations[0].port(), None);
+    }
+
+    #[tokio::test]
+    async fn dataplane_self_heal_is_noop_without_a_configured_or_external_ip() {
+        let directory = tempfile::tempdir().unwrap();
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let identity = super::LocalDataplaneIdentity::load(
+            &directory.path().join("wireguard-private.key"),
+            DataplaneMode::Root,
+            DataplaneEncryption::Disabled,
+            7_679,
+            &supervisor,
+        )
+        .await
+        .unwrap();
+        let reads = NodeReadFixture { node: None };
+        let command = RecordingDataplaneCommand::default();
+
+        assert!(
+            !super::publish_local_dataplane_metadata_self_heal(
+                &reads, &command, "leader-a", None, &identity,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(command.registrations.lock().unwrap().is_empty());
     }
 
     #[test]

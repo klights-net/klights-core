@@ -78,6 +78,23 @@ mod cases {
     }
 
     #[test]
+    fn worker_control_stream_reconnect_delay_is_bounded_exponential() {
+        assert_eq!(
+            super::super::worker_control_stream_reconnect_delay(0),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            super::super::worker_control_stream_reconnect_delay(3),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::super::worker_control_stream_reconnect_delay(u32::MAX),
+            Duration::from_secs(5),
+            "control-stream recovery must cap retries instead of growing an unbounded delay"
+        );
+    }
+
+    #[test]
     fn resource_command_already_exists_survives_grpc_decode() {
         let error = super::super::resource_command_rpc_error(super::super::UnaryRpcError::Status(
             tonic::Status::already_exists("duplicate RuntimeClass"),

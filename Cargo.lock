@@ -2418,6 +2418,7 @@ dependencies = [
  "futures",
  "genetlink",
  "klights-cluster-core",
+ "klights-cluster-store",
  "klights-leader-api",
  "klights-network-api",
  "klights-node-store",
