@@ -1222,17 +1222,22 @@ async fn stub_remote_forwarder_refuses_writes_with_retryable() {
 /// dispatch level without standing up the full bootstrap.
 #[tokio::test]
 async fn bootstrap_style_proxy_composition_dispatches_correctly() {
-    let concrete_db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let concrete_db =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let canonical = concrete_db.clone();
     let passive_reads =
-        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&concrete_db);
+        crate::bootstrap::composition::cluster_store::selector::sqlite_passive_read_ports(
+            &concrete_db,
+        );
     let opened =
-        crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&concrete_db);
+        crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+            &concrete_db,
+        );
     let db = Arc::new(concrete_db);
     let (tx, rx) = watch::channel(true); // simulate seed cp1
-    let authority = crate::bootstrap::authority::AuthorityHandle::from(rx.clone());
+    let authority = crate::bootstrap::composition::authority::AuthorityHandle::from(rx.clone());
     let (route_authority, route_publisher) = WatchLeaderAuthority::channel(true, None);
     let local_cache_readiness =
         Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
@@ -1242,7 +1247,8 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
             "cp1".to_string(),
             "klights".to_string(),
             crate::paths::service_account_signing_key_path("klights"),
-            crate::bootstrap::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
+            crate::bootstrap::composition::authority::AuthorityHandle::from(rx.clone())
+                .authority_arc(),
             crate::bootstrap::file_blocking::test_file_process_executor(),
         ),
     );
@@ -1257,7 +1263,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             opened.topology_reads.clone(),
             proposal.clone(),
-            crate::bootstrap::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
+            crate::bootstrap::composition::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
         ),
     );
     let pod_cleanup = Arc::new(
@@ -1270,7 +1276,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
     let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));
     let local_resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         opened.read_ports.resource_reads(),
-        crate::bootstrap::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
+        crate::bootstrap::composition::authority::AuthorityHandle::from(rx.clone()).authority_arc(),
     );
     let local_watch = Arc::new(
         crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(

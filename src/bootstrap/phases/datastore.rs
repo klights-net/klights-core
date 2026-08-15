@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
 use crate::bootstrap::NodeRole;
-use crate::bootstrap::cluster_store::backend_kind::BackendKind;
-use crate::bootstrap::cluster_store::selector::PassiveStoreOpenRequest;
+use crate::bootstrap::composition::cluster_store::backend_kind::BackendKind;
+use crate::bootstrap::composition::cluster_store::selector::PassiveStoreOpenRequest;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use klights_supervisor::TaskSupervisor;
 
@@ -38,7 +38,7 @@ fn validate_raft_backend_capability(
 }
 
 struct LeaderNodeLocalStores {
-    node: crate::bootstrap::node_store::NodeLocalStores,
+    node: crate::bootstrap::composition::node_store::NodeLocalStores,
     raft_log: Arc<dyn klights_node_store::RaftLogDurability>,
     raft_applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
 }
@@ -53,9 +53,13 @@ async fn open_leader_node_local(
         kind == BackendKind::Sqlite,
         "the redb node-local backend does not implement Raft durability"
     );
-    let node =
-        crate::bootstrap::node_store::open_node_local(kind, path, supervisor, connection_key)
-            .await?;
+    let node = crate::bootstrap::composition::node_store::open_node_local(
+        kind,
+        path,
+        supervisor,
+        connection_key,
+    )
+    .await?;
     let raft = Arc::new(
         klights_replication::node_durability::OpenRaftNodeDurabilityAdapter::new(
             node.raft_log_persistence(),
@@ -121,7 +125,7 @@ pub struct DatastorePhase {
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub replication_service: Option<Arc<klights_replication::ReplicationService>>,
-    pub node_local: crate::bootstrap::node_store::NodeLocalStores,
+    pub node_local: crate::bootstrap::composition::node_store::NodeLocalStores,
     pub outbox: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
@@ -204,7 +208,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     validate_raft_backend_capability(config.datastore_backend)?;
 
     let watch_commit_wiring = crate::bootstrap::watch_commit_wiring::new_wiring();
-    let opened_passive = crate::bootstrap::cluster_store::selector::open_with_sink(
+    let opened_passive = crate::bootstrap::composition::cluster_store::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
         #[cfg(test)]
@@ -213,7 +217,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     )
     .await
     .context("Failed to open datastore")?;
-    let crate::bootstrap::cluster_store::selector::OpenedPassiveStore {
+    let crate::bootstrap::composition::cluster_store::selector::OpenedPassiveStore {
         read_ports: passive_read_ports,
         ownership_reads: passive_ownership_reads,
         namespace_content_reads: passive_namespace_content_reads,
@@ -293,7 +297,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let node_local = if let Some(stores) = leader_node_local.as_ref() {
         stores.node.clone()
     } else {
-        crate::bootstrap::node_store::open_node_local(
+        crate::bootstrap::composition::node_store::open_node_local(
             config.node_local_backend,
             node_local_db_path,
             supervisor.clone(),
@@ -548,7 +552,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 ),
             );
             let mut leader_proxy_builder =
-                crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader::new(
+                crate::bootstrap::composition::authority_routed_leader::AuthorityRoutedLeader::new(
                     local_resource_query.clone(),
                     Arc::new(positioned_watch.clone()),
                     local_cache_readiness.clone(),
@@ -1214,7 +1218,7 @@ fn build_remote_forwarder(
     local_dataplane: klights_leader_rpc::client::JoinDataplaneMetadata,
     grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> RemoteForwarderParts {
-    use crate::bootstrap::authority_routed_leader::StubRemoteForwarder;
+    use crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder;
     use klights_leader_rpc::client::RemoteApiClient;
     use klights_leader_rpc::client::{GrpcClientConfig, ReplicationGrpcClient};
 
@@ -1448,8 +1452,8 @@ async fn controlplane_join_client_identity_for_token_from_store(
 
 #[cfg(test)]
 mod tests {
-    use crate::bootstrap::cluster_store::backend_kind::BackendKind;
-    use crate::bootstrap::cluster_store::selector::PassiveStoreOpenRequest;
+    use crate::bootstrap::composition::cluster_store::backend_kind::BackendKind;
+    use crate::bootstrap::composition::cluster_store::selector::PassiveStoreOpenRequest;
     use crate::bootstrap::node_role::{LeaderBootstrap, LeaderPeer, NodeRole};
 
     #[test]

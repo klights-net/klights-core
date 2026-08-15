@@ -14,7 +14,8 @@ pub(crate) fn always_leader_watch() -> tokio::sync::watch::Receiver<bool> {
 
 #[cfg(test)]
 pub(crate) fn always_leader_authority() -> Arc<dyn klights_leader_api::LeaderAuthority> {
-    let authority = crate::bootstrap::authority::AuthorityHandle::from(always_leader_watch());
+    let authority =
+        crate::bootstrap::composition::authority::AuthorityHandle::from(always_leader_watch());
     authority.authority_arc()
 }
 

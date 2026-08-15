@@ -73,10 +73,13 @@ pub(crate) fn port(
 mod adapter_tests {
     #[tokio::test]
     async fn test_resource_quota_recount_name() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let effect = klights_controllers::side_effects::resource_quota::effect(super::port(
             ports.read_ports.resource_reads(),
             std::sync::Arc::new(

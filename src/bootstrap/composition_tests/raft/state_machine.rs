@@ -99,7 +99,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local = Arc::new(SqliteRaftDurability::new(node_executor));
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -147,7 +147,7 @@ mod tests {
     async fn snapshot_round_trip_replays_namespaces_and_resources() {
         // Populate a "leader" backend with one namespace + one Pod.
         let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -214,7 +214,7 @@ mod tests {
 
         // Install on a fresh "follower" backend that starts empty.
         let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn install_snapshot_restores_empty_watch_history_allocator_exactly() {
         let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -326,7 +326,7 @@ mod tests {
         let snapshot = builder.build_snapshot().await.unwrap();
 
         let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -375,9 +375,10 @@ mod tests {
     #[tokio::test]
     async fn snapshot_fence_excludes_post_anchor_resource_and_watch_event() {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
-        let backend = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-            .await
-            .unwrap();
+        let backend =
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+                .await
+                .unwrap();
         seed_snapshot_identity(&backend).await;
         let entries = (1..=IntegrationRaftComposition::SNAPSHOT_CAPTURE_PAGE_SIZE as i64)
             .map(|event_id| {
@@ -481,7 +482,7 @@ mod tests {
         let snapshot = snapshot_task.await.unwrap().unwrap();
         apply_task.await.unwrap().unwrap();
         let destination: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -604,7 +605,7 @@ mod tests {
     async fn snapshot_fence_blocks_concurrent_authoritative_install() {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
         let source_backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -617,9 +618,10 @@ mod tests {
             .await
             .unwrap();
 
-        let destination = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-            .await
-            .unwrap();
+        let destination =
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+                .await
+                .unwrap();
         seed_snapshot_identity(&destination).await;
         let entries = (1..=IntegrationRaftComposition::SNAPSHOT_CAPTURE_PAGE_SIZE as i64)
             .map(|event_id| {
@@ -674,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn install_snapshot_replaces_divergent_watch_replay_floors() {
         let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -724,7 +726,7 @@ mod tests {
         let snapshot = builder.build_snapshot().await.unwrap();
 
         let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -779,7 +781,7 @@ mod tests {
     async fn install_snapshot_replaces_local_state_and_removes_stale_rows() {
         // Leader: namespace snap-ns + ConfigMap `live`.
         let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -821,7 +823,7 @@ mod tests {
         // Follower: same namespace + `live`, PLUS a stale `stale` ConfigMap
         // that the leader has already deleted. This is the divergent member.
         let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -910,7 +912,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_round_trip_preserves_resources_and_rv_counter() {
         let backend_src: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -996,7 +998,7 @@ mod tests {
         let snapshot_bytes = snapshot.snapshot.into_inner();
 
         let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1035,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn build_snapshot_current_rv_not_behind_commits_applied_during_build() {
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1110,7 +1112,7 @@ mod tests {
         // The snapshot must install cleanly on a fresh follower: a follower
         // applying replace_replicated_resource_state must not reject it.
         let backend_dst: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1229,7 +1231,7 @@ mod tests {
         // row produced by the PutResource mutation must be visible to a
         // `get_resource` read on the same backend.
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1302,7 +1304,7 @@ mod tests {
     #[tokio::test]
     async fn apply_empty_live_commit_preserves_public_resource_version() {
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1339,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn apply_normal_entry_stamps_provisional_rv_after_current_store_rv() {
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );
@@ -1409,7 +1411,7 @@ mod tests {
     #[tokio::test]
     async fn follower_selector_list_positive_watch_receives_v1_ready_transition() {
         let backend: Arc<klights_cluster_datastore::sqlite::embedded::Datastore> = Arc::new(
-            crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
                 .await
                 .unwrap(),
         );

@@ -132,9 +132,10 @@ async fn remote_client_and_leader_db_with_node_names(
     SqliteTestStore,
     tokio::task::JoinHandle<()>,
 ) {
-    let concrete_db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let concrete_db =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let passive_reads =
             crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::passive_reads_for(
                 &concrete_db,

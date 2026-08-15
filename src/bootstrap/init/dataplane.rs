@@ -134,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_publishes_node_dataplane_from_registered_external_ip() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_is_noop_without_resolvable_endpoint() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();

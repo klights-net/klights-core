@@ -17,7 +17,7 @@ use klights_leader_api::{
     ResourceCommandRequest, ResourceCommandResult,
 };
 
-use crate::bootstrap::authority::AuthorityHandle;
+use crate::bootstrap::composition::authority::AuthorityHandle;
 
 /// Root-local cache readiness is a concrete bootstrap capability.  The
 /// worker/cache implementation owns real readiness; a root-local leader has

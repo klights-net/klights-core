@@ -134,11 +134,11 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_uses_exact_initial_snapshot_handoff() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let passive_reads =
-            crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db);
+            crate::bootstrap::composition::cluster_store::selector::sqlite_passive_read_ports(&db);
         db.create_resource(
             "batch/v1",
             "CronJob",
@@ -160,7 +160,10 @@ mod tests {
                     "10.43.128.0/17",
                 )),
             );
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let runtime = LeaderCronJobSchedulerRuntime {
             positioned_watch:
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(

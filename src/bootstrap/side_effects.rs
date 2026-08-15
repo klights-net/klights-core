@@ -176,10 +176,13 @@ mod tests {
 
     #[tokio::test]
     async fn node_side_effect_enqueues_daemonset_key_without_inline_reconcile() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -271,10 +274,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_jobs_after_pod_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),
@@ -396,10 +402,13 @@ mod tests {
 
     #[tokio::test]
     async fn service_pod_side_effect_not_registered_for_generic_pod_hook() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),
@@ -490,10 +499,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_endpoint_hooks_do_not_enqueue_service_reconcile() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),
@@ -541,10 +553,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_replicationcontroller_owner_after_pod_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),
@@ -669,10 +684,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_matching_replicaset_for_orphan_pod_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),
@@ -766,10 +784,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_replicaset_parent_deployment_after_pod_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),
@@ -893,10 +914,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_registry_enqueues_job_without_explicit_selector_after_pod_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(
             metrics.clone(),

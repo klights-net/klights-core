@@ -86,7 +86,7 @@ pub(crate) fn port(resource_reads: Arc<dyn ClusterResourceRead>) -> Arc<dyn JobS
 mod tests {
     #[tokio::test]
     async fn test_job_reconcile_name() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let effect = klights_controllers::side_effects::job::effect(

@@ -42,7 +42,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_mirror_delete_hook_removes_mirrored_slice() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         db.create_resource(
@@ -72,7 +72,10 @@ mod tests {
             "kind": "Endpoints",
             "metadata": {"namespace": "default", "name": "manual"}
         });
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
 
         klights_controllers::side_effects::endpoint_mirror::effect(port(
             Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test(

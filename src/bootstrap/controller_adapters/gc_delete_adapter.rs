@@ -280,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_pod_port_rejects_pod_without_touching_datastore() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let pod = db
@@ -302,7 +302,10 @@ mod tests {
             )
             .await
             .expect("create Pod");
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let adapter = GcNonPodFinalizationAdapter::new_for_test(
             ports.applied_outbox,
             std::sync::Arc::new(db.clone()),
@@ -382,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_is_command_routed_end_to_end() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let owner = db
@@ -408,7 +411,10 @@ mod tests {
             .expect("create owner");
         let observed_rv = owner.resource_version;
         let commands = std::sync::Arc::new(RecordingCommands::default());
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let adapter = GcNonPodFinalizationAdapter::new_with_commands(
             ports.read_ports.resource_reads(),
             ports.ownership_reads,
@@ -481,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_rejects_follower_without_local_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let owner = db
@@ -510,7 +516,10 @@ mod tests {
             commands: std::sync::Mutex::new(Vec::new()),
             reject_as_follower: true,
         });
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let adapter = GcNonPodFinalizationAdapter::new_with_commands(
             ports.read_ports.resource_reads(),
             ports.ownership_reads,

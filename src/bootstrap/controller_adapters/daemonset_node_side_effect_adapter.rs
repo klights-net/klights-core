@@ -54,7 +54,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_label_change_enqueues_daemonsets_without_reconciling_inline() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let dispatcher = Arc::new(

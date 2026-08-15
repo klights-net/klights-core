@@ -275,7 +275,7 @@ mod review_regressions {
 
     #[tokio::test]
     async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         db.create_resource(

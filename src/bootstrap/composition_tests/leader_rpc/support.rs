@@ -16,7 +16,7 @@ pub(crate) type GrpcReplicationServer = klights_leader_rpc::server::GrpcReplicat
 /// Root-composed SQLite fixture for leader-RPC tests.
 pub(crate) async fn canonical_sqlite_fixture()
 -> anyhow::Result<klights_cluster_datastore::sqlite::embedded::Datastore> {
-    crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture().await
+    crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture().await
 }
 
 #[derive(Debug, Clone, PartialEq)]

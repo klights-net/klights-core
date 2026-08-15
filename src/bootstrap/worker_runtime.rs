@@ -208,7 +208,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     } else {
         Some(config.node_db_path.as_path())
     };
-    let node_local = crate::bootstrap::node_store::open_node_local(
+    let node_local = crate::bootstrap::composition::node_store::open_node_local(
         config.node_local_backend,
         nldb,
         task_supervisor.clone(),
@@ -480,8 +480,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         _sandbox_gc_dirty_counter,
         mutation_reconcile,
         ..,
-    ) = crate::bootstrap::pod_repository_composition::build_worker_pod_repository_parts(
-        crate::bootstrap::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+    ) = crate::bootstrap::composition::pod_repository::build_worker_pod_repository_parts(
+        crate::bootstrap::composition::pod_repository::WorkerPodRepositoryBuildConfig {
             resource_query: leader_resource_query.clone(),
             pod_workqueue_store: node_local.pod_workqueue(),
             supervisor: task_supervisor.clone(),
@@ -862,8 +862,8 @@ mod tests {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let node_local = crate::bootstrap::node_store::open_node_local(
-            crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
+        let node_local = crate::bootstrap::composition::node_store::open_node_local(
+            crate::bootstrap::composition::cluster_store::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
             "sqlite:worker-runtime-repository-graph",
@@ -887,16 +887,16 @@ mod tests {
             _sandbox_gc_dirty_counter,
             _mutation_reconcile,
             ..,
-        ) = crate::bootstrap::pod_repository_composition::build_worker_pod_repository_parts(
-            crate::bootstrap::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+        ) = crate::bootstrap::composition::pod_repository::build_worker_pod_repository_parts(
+            crate::bootstrap::composition::pod_repository::WorkerPodRepositoryBuildConfig {
                 resource_query: std::sync::Arc::new(UnavailableWorkerQuery),
                 pod_workqueue_store: node_local.pod_workqueue(),
                 supervisor,
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
                 pod_network_cache:
-                    crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
+                    crate::bootstrap::composition::pod_repository::empty_test_pod_network_cache(),
                 assignment_waiter:
-                    crate::bootstrap::pod_repository_composition::test_assignment_bus(),
+                    crate::bootstrap::composition::pod_repository::test_assignment_bus(),
                 outbox,
             },
         );

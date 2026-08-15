@@ -380,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_published_self_heals_when_local_node_has_external_ip() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -426,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_published_keeps_observing_without_external_ip() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();

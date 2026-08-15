@@ -1,10 +1,8 @@
 pub(crate) mod auth_adapters;
-pub(crate) mod authority;
-pub(crate) mod authority_routed_leader;
 pub(crate) mod bootstrap_token;
 pub(crate) mod certificate_bootstrap;
 pub mod cluster_meta;
-pub(crate) mod cluster_store;
+pub(crate) mod composition;
 pub(crate) mod composition_adapters;
 pub mod config;
 pub(crate) mod controller_adapters;
@@ -26,13 +24,11 @@ pub(crate) mod network_adapters;
 pub mod node_mode;
 pub(crate) mod node_registration_adapter;
 pub mod node_role;
-pub(crate) mod node_store;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
 #[cfg(test)]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
-pub(crate) mod pod_repository_composition;
 pub(crate) mod pod_watch_handler_adapter;
 pub mod runtime;
 pub(crate) mod runtime_inputs;
@@ -51,8 +47,6 @@ mod leader_conversion_tests;
 #[cfg(test)]
 #[path = "tests/leader_rpc_remote.rs"]
 mod leader_rpc_remote_tests;
-#[cfg(test)]
-pub(crate) mod native_api_composition;
 #[cfg(test)]
 #[path = "tests/worker_store.rs"]
 mod worker_store_tests;

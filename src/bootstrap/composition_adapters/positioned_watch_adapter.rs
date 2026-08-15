@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::bootstrap::cluster_store::selector::PassiveReadPorts;
+use crate::bootstrap::composition::cluster_store::selector::PassiveReadPorts;
 
 pub(crate) fn datastore_positioned_watch_service(
     passive_reads: &PassiveReadPorts,

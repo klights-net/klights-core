@@ -651,10 +651,13 @@ mod tests {
 
     #[tokio::test]
     async fn root_namespace_termination_reconciler_is_the_controller_effect_port() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
             ports.applied_outbox.clone(), Arc::new(db.clone()), ports.read_ports.resource_reads(),
@@ -671,10 +674,13 @@ mod tests {
 
     #[tokio::test]
     async fn root_namespace_termination_reconciler_shares_metrics_arc() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
             ports.applied_outbox.clone(), Arc::new(db.clone()), ports.read_ports.resource_reads(),
@@ -699,10 +705,13 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_namespace_termination_already_deleted_is_ok() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
             ports.applied_outbox.clone(), Arc::new(db.clone()), ports.read_ports.resource_reads(),
         );
@@ -732,10 +741,13 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_namespace_termination_success_does_not_increment_counter() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &db,
+            );
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
             ports.applied_outbox.clone(), Arc::new(db.clone()), ports.read_ports.resource_reads(),
         );
@@ -781,11 +793,14 @@ mod tests {
 
     #[tokio::test]
     async fn stale_http_authority_scope_rejects_write_after_demote_promote_aba() {
-        let datastore = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-            .await
-            .unwrap();
+        let datastore =
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+                .await
+                .unwrap();
         let ports =
-            crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&datastore);
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                &datastore,
+            );
         let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
             ports.applied_outbox.clone(), Arc::new(datastore.clone()), ports.read_ports.resource_reads(),
         );

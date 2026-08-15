@@ -17,7 +17,7 @@ use klights_leader_api::{
     PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
 };
 
-use crate::bootstrap::authority::AuthorityHandle;
+use crate::bootstrap::composition::authority::AuthorityHandle;
 use crate::bootstrap::leader_conversions::topology::{
     focused_dataplane, focused_node_subnet, node_subnet_allocation_is_exhausted,
 };
@@ -333,7 +333,7 @@ mod tests {
         Arc<RecordingApplyingProposal>,
         ClusterStoreLeaderNetwork,
     ) {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let canonical = db.clone();

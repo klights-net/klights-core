@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use klights_cluster_core::command::StorageCommand;
 use klights_replication::proposal::RaftProposal;
 
-use crate::bootstrap::authority::AuthorityHandle;
+use crate::bootstrap::composition::authority::AuthorityHandle;
 pub(crate) struct ClusterStoreLeaderMaintenance {
     allocator: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
     watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
@@ -264,7 +264,7 @@ mod tests {
         Arc<RecordingApplyingProposal>,
         ClusterStoreLeaderMaintenance,
     ) {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let canonical = db.clone();

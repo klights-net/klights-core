@@ -852,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_local_dataplane_metadata_writes_explicit_disabled_route_metadata() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let mut config = crate::KlightsConfig::test_default();
@@ -902,8 +902,8 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let node_db = crate::bootstrap::node_store::open_node_local(
-            crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
+        let node_db = crate::bootstrap::composition::node_store::open_node_local(
+            crate::bootstrap::composition::cluster_store::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
             "sqlite:worker-dataplane-outbox-test",

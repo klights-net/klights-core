@@ -1405,7 +1405,8 @@ fn runtime_dependencies_for_test(
     db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     node_name: &str,
 ) -> klights_controllers::ControllerRuntimeDependencies {
-    let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
+    let ports =
+        crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(db);
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -1442,8 +1443,8 @@ fn runtime_dependencies_for_test(
         _deferred_runtime,
         test_api,
         test_subresource,
-    ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
-        crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
+    ) = crate::bootstrap::composition::pod_repository::build_pod_repository_parts(
+        crate::bootstrap::composition::pod_repository::PodRepositoryBuildConfig {
             resource_query,
             ownership_reads: ports.ownership_reads.clone(),
             resource_reads: ports.read_ports.resource_reads(),
@@ -1453,9 +1454,9 @@ fn runtime_dependencies_for_test(
             supervisor,
             side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
-            assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
-            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            pod_network_cache: crate::bootstrap::composition::pod_repository::empty_test_pod_network_cache(),
+            assignment_waiter: crate::bootstrap::composition::pod_repository::test_assignment_bus(),
+            scheduling_mode: crate::bootstrap::composition::pod_repository::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
             resource_commands: Some(resource_commands),

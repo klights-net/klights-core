@@ -125,9 +125,10 @@ mod tests {
         klights_cluster_core::Resource,
         klights_cluster_core::Resource,
     ) {
-        let sqlite = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-            .await
-            .unwrap();
+        let sqlite =
+            crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+                .await
+                .unwrap();
         let pv = sqlite
             .create_resource(
                 "v1",
@@ -172,7 +173,10 @@ mod tests {
         sqlite: &klights_cluster_datastore::sqlite::embedded::Datastore,
         authority: tokio::sync::watch::Receiver<bool>,
     ) -> LeaderPersistentVolumeEventHandler {
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(sqlite);
+        let ports =
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+                sqlite,
+            );
         LeaderPersistentVolumeEventHandler::new(
             ports.read_ports.resource_reads(),
             ports.ownership_reads,

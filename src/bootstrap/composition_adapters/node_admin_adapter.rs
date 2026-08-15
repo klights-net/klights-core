@@ -150,9 +150,9 @@ pub(crate) async fn start_node_admin(
 mod tests {
     use super::*;
 
-    use crate::bootstrap::cluster_store::backend_kind::BackendKind;
-    use crate::bootstrap::node_store::NodeLocalStores;
-    use crate::bootstrap::node_store::open_node_local;
+    use crate::bootstrap::composition::cluster_store::backend_kind::BackendKind;
+    use crate::bootstrap::composition::node_store::NodeLocalStores;
+    use crate::bootstrap::composition::node_store::open_node_local;
     use klights_node_datastore::test_support::{DeadLetterTestInsert, NodeDeliveryTestStore};
     use klights_node_store::{
         DeadLetterMoveRequest, DeadLetterStore, OutboxEnqueue, OutboxSubject,

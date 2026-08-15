@@ -320,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalized_effects_route_bound_pod_children_to_actor_sink() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let canonical = db.clone();

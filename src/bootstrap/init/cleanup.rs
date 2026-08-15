@@ -281,13 +281,13 @@ pub async fn stop_namespace_containerd_after_cleanup(
 async fn open_cleanup_node_local(
     config: &KlightsConfig,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-) -> anyhow::Result<crate::bootstrap::node_store::NodeLocalStores> {
+) -> anyhow::Result<crate::bootstrap::composition::node_store::NodeLocalStores> {
     let node_db_path: Option<&std::path::Path> = if config.in_memory {
         None
     } else {
         Some(config.node_db_path.as_path())
     };
-    crate::bootstrap::node_store::open_node_local(
+    crate::bootstrap::composition::node_store::open_node_local(
         config.node_local_backend,
         node_db_path,
         task_supervisor,
@@ -299,7 +299,7 @@ async fn open_cleanup_node_local(
 
 async fn cleanup_directories_and_network(
     network_cleanup: &klights_networking::NetworkCleanup,
-    node_local: Option<&crate::bootstrap::node_store::NodeLocalStores>,
+    node_local: Option<&crate::bootstrap::composition::node_store::NodeLocalStores>,
     containerd_state_dir: &str,
     namespace: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,

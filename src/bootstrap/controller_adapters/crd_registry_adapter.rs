@@ -136,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn datastore_reader_is_registry_source_of_truth() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let registry = CrdRegistry::new();
@@ -154,7 +154,7 @@ mod tests {
             new_runtime(
                 db.focused_read_store(),
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
-                    &crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db),
+                    &crate::bootstrap::composition::cluster_store::selector::sqlite_passive_read_ports(&db),
                     &db,
                 ),
             )
@@ -182,7 +182,7 @@ mod tests {
             new_runtime(
                 db.focused_read_store(),
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
-                    &crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db),
+                    &crate::bootstrap::composition::cluster_store::selector::sqlite_passive_read_ports(&db),
                     &db,
                 ),
             )
@@ -201,11 +201,11 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_runtime_syncs_datastore_applied_crds() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let passive_reads =
-            crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db);
+            crate::bootstrap::composition::cluster_store::selector::sqlite_passive_read_ports(&db);
         let registry = CrdRegistry::new();
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(

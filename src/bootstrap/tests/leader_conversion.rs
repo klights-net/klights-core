@@ -19,10 +19,11 @@ fn test_outbox_delivery(
     Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootCommittedOutboxDelivery>,
     Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState>,
 ){
-    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+    let authority = crate::bootstrap::composition::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
     );
-    let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
+    let ports =
+        crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(db);
     let canonical = db.clone();
     let side_effects = crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
         ports.read_ports.resource_reads(),
@@ -84,7 +85,7 @@ fn test_cleanup_port(
     let canonical = db.clone();
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
-            crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db).pod_cleanup,
+            crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(db).pod_cleanup,
             Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
@@ -101,8 +102,8 @@ fn concrete_leader_clients_implement_focused_pod_effect_ports() {
 
     assert_ports::<LocalProjectedTokenAdapter>();
     assert_ports::<klights_leader_rpc::client::RemoteApiClient>();
-    assert_ports::<crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader>();
-    assert_ports::<crate::bootstrap::authority_routed_leader::StubRemoteForwarder>();
+    assert_ports::<crate::bootstrap::composition::authority_routed_leader::AuthorityRoutedLeader>();
+    assert_ports::<crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder>();
 
     fn assert_network<T>()
     where
@@ -241,9 +242,10 @@ fn cronjob_job() -> serde_json::Value {
 async fn cronjob_job_create_routes_exact_raft_command_without_passive_mutation() {
     use klights_controllers::cronjob::CronJobStore as _;
 
-    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let passive =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let before_rv = passive.get_current_resource_version().await.unwrap();
     let commands = Arc::new(RecordingCronJobCommands {
         commands: Mutex::new(Vec::new()),
@@ -290,9 +292,10 @@ async fn cronjob_job_create_routes_exact_raft_command_without_passive_mutation()
 async fn cronjob_job_create_follower_rejection_preserves_passive_store() {
     use klights_controllers::cronjob::CronJobStore as _;
 
-    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let passive =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let before_rv = passive.get_current_resource_version().await.unwrap();
     let commands = Arc::new(RecordingCronJobCommands {
         commands: Mutex::new(Vec::new()),
@@ -334,9 +337,10 @@ async fn cronjob_job_delete_and_status_preserve_strict_uid_rv_preconditions() {
     use klights_controllers::common::ControllerStatusStore as _;
     use klights_controllers::cronjob::CronJobStore as _;
 
-    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let passive =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let commands = Arc::new(RecordingCronJobCommands {
         commands: Mutex::new(Vec::new()),
         reject_as_follower: false,
@@ -404,9 +408,10 @@ async fn cronjob_job_delete_and_status_preserve_strict_uid_rv_preconditions() {
 async fn seed_bootstrap_mutation_uses_command_port_without_passive_write() {
     use klights_controllers::kube_service::KubernetesBootstrapStore as _;
 
-    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let passive =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let commands = Arc::new(RecordingBootstrapCommands {
         commands: std::sync::Mutex::new(Vec::new()),
     });
@@ -473,9 +478,10 @@ impl klights_leader_api::LeaderResourceCommand for RecordingNodeCleanupCommands 
 
 #[tokio::test]
 async fn node_hard_delete_cleanup_routes_one_raft_command_without_passive_rv_mutation() {
-    let passive = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-        .await
-        .unwrap();
+    let passive =
+        crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+            .await
+            .unwrap();
     let before_rv = passive.get_current_resource_version().await.unwrap();
     let commands = Arc::new(RecordingNodeCleanupCommands {
         commands: Mutex::new(Vec::new()),
@@ -507,8 +513,8 @@ fn node_effect_ports_have_the_frozen_authority_split() {
 
     assert_lease::<LocalNodeLeaseRenewalAdapter>();
     assert_lease::<klights_leader_rpc::client::RemoteApiClient>();
-    assert_lease::<crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader>();
-    assert_lease::<crate::bootstrap::authority_routed_leader::StubRemoteForwarder>();
+    assert_lease::<crate::bootstrap::composition::authority_routed_leader::AuthorityRoutedLeader>();
+    assert_lease::<crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder>();
     assert_local_lifecycle::<LocalNodeLifecycleStatusAdapter>();
 }
 
@@ -558,7 +564,7 @@ async fn node_effect_ports_remote_rejects_cross_node_before_transport() {
 
 #[tokio::test]
 async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
@@ -599,7 +605,7 @@ async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
 
 #[tokio::test]
 async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stale_rv() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let created = db
@@ -627,7 +633,8 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
     let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         canonical.focused_read_store(),
-        crate::bootstrap::authority::AuthorityHandle::from(authority.clone()).authority_arc(),
+        crate::bootstrap::composition::authority::AuthorityHandle::from(authority.clone())
+            .authority_arc(),
     );
     let resource_commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
         Arc::new(canonical.clone()),
@@ -714,7 +721,7 @@ impl klights_leader_api::LeaderResourceCommand for RecordingNodeLifecycleCommand
 
 #[tokio::test]
 async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let created = db
@@ -736,7 +743,8 @@ async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
     let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
         db.focused_read_store(),
-        crate::bootstrap::authority::AuthorityHandle::from(authority.clone()).authority_arc(),
+        crate::bootstrap::composition::authority::AuthorityHandle::from(authority.clone())
+            .authority_arc(),
     );
     let resource_commands = Arc::new(RecordingNodeLifecycleCommands {
         commands: Mutex::new(Vec::new()),
@@ -800,14 +808,16 @@ fn positioned_watch_adapters_implement_focused_ports() {
     }
 
     assert_focused::<klights_leader_rpc::client::RemoteApiClient>();
-    assert_focused::<crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader>();
-    assert_focused::<crate::bootstrap::authority_routed_leader::StubRemoteForwarder>();
+    assert_focused::<crate::bootstrap::composition::authority_routed_leader::AuthorityRoutedLeader>(
+    );
+    assert_focused::<crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder>();
 }
 
 #[tokio::test]
 async fn stub_watch_and_readiness_are_typed_unavailable() {
-    let stub =
-        crate::bootstrap::authority_routed_leader::StubRemoteForwarder::new("cp-stub".to_string());
+    let stub = crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder::new(
+        "cp-stub".to_string(),
+    );
     let watch =
         klights_leader_api::WatchRequest::try_new("v1", "Pod", None, None, None, Some(41), None)
             .expect("valid watch");
@@ -877,7 +887,7 @@ fn pod_delete_payload_for(
 
 #[tokio::test]
 async fn local_client_reads_pods_through_focused_resource_query() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -917,7 +927,7 @@ async fn local_client_reads_pods_through_focused_resource_query() {
 
 #[tokio::test]
 async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let replacement = db
@@ -969,7 +979,7 @@ async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() 
 
 #[tokio::test]
 async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -1092,7 +1102,7 @@ async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
 
 #[tokio::test]
 async fn local_client_apply_outbox_returns_committed_resource_version() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -1144,7 +1154,7 @@ async fn local_client_apply_outbox_returns_committed_resource_version() {
 
 #[tokio::test]
 async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_namespace(
@@ -1288,7 +1298,7 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
 
 #[tokio::test]
 async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     db.create_resource(
@@ -1400,7 +1410,7 @@ async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
 
 #[tokio::test]
 async fn local_client_serves_network_metadata_without_calling_forwarder() {
-    let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+    let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
         .await
         .unwrap();
     let network = test_network_port(&db);

@@ -17,8 +17,12 @@ impl IntegrationRaftComposition {
         Self { db }
     }
 
-    fn passive(&self) -> crate::bootstrap::cluster_store::selector::OpenedPassiveStore {
-        crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(self.db.as_ref())
+    fn passive(
+        &self,
+    ) -> crate::bootstrap::composition::cluster_store::selector::OpenedPassiveStore {
+        crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(
+            self.db.as_ref(),
+        )
     }
 
     pub fn store_ports(&self) -> klights_replication::node::RaftStorePorts {
@@ -100,7 +104,7 @@ impl IntegrationRaftComposition {
         node: Arc<klights_replication::node::RaftNode>,
     ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
         let ports = self.passive();
-        let authority = crate::bootstrap::authority::AuthorityHandle::from(
+        let authority = crate::bootstrap::composition::authority::AuthorityHandle::from(
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
         let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(

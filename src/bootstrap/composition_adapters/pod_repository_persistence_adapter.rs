@@ -752,7 +752,7 @@ pub(crate) fn new_root_parts_from_test_ports(
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> RootPodRepositoryPersistenceParts {
-    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+    let authority = crate::bootstrap::composition::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
     let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
@@ -782,7 +782,7 @@ pub(crate) fn new_store_from_test_ports(
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> PodStore {
-    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+    let authority = crate::bootstrap::composition::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
     let query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
@@ -895,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_root_actor_finalization_submits_uid_bound_delete_without_local_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let created = db
@@ -965,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_root_unscheduled_delete_submits_exact_cas_without_local_mutation() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let created = db
@@ -1037,9 +1037,10 @@ mod tests {
             (CommandDisposition::Conflict, true),
             (CommandDisposition::NotLeader, false),
         ] {
-            let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-                .await
-                .unwrap();
+            let db =
+                crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
+                    .await
+                    .unwrap();
             let created = db
                 .create_resource(
                     "v1",

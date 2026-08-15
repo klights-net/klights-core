@@ -218,7 +218,7 @@ mod tests {
         PodSideEffectPortsSlot,
         Arc<TaskSupervisor>,
     ) {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
+        let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
         let canonical = db.clone();
@@ -269,8 +269,8 @@ mod tests {
             _deferred_runtime,
             _test_api,
             _test_subresource,
-        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
-            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
+        ) = crate::bootstrap::composition::pod_repository::build_pod_repository_parts(
+            crate::bootstrap::composition::pod_repository::PodRepositoryBuildConfig {
                 resource_query,
                 ownership_reads: db.focused_read_store(),
                 resource_reads: db.focused_read_store(),
@@ -280,9 +280,9 @@ mod tests {
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-                pod_network_cache: crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
-                assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
-                scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                pod_network_cache: crate::bootstrap::composition::pod_repository::empty_test_pod_network_cache(),
+                assignment_waiter: crate::bootstrap::composition::pod_repository::test_assignment_bus(),
+                scheduling_mode: crate::bootstrap::composition::pod_repository::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
                 resource_commands: Some(resource_commands),

@@ -226,7 +226,7 @@ impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
 
 #[cfg(test)]
 pub(crate) fn test_resource_command(
-    authority: &crate::bootstrap::authority::AuthorityHandle,
+    authority: &crate::bootstrap::composition::authority::AuthorityHandle,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
     canonical: Arc<klights_cluster_datastore::sqlite::embedded::Datastore>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
@@ -254,7 +254,7 @@ pub(crate) fn test_resource_command(
 
 #[cfg(test)]
 pub(crate) fn test_outbox_delivery(
-    authority: &crate::bootstrap::authority::AuthorityHandle,
+    authority: &crate::bootstrap::composition::authority::AuthorityHandle,
     side_effects: Arc<RootOutboxSideEffectState>,
     local_node: String,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,

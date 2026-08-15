@@ -4,7 +4,7 @@ pub const DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS: i64 = 0;
 pub const DEFAULT_MAX_WATCH_EVENTS: i64 = 100_000;
 pub const DEFAULT_GC_INTERVAL_SECONDS: u64 = 30;
 
-use crate::bootstrap::cluster_store::backend_kind::BackendKind;
+use crate::bootstrap::composition::cluster_store::backend_kind::BackendKind;
 
 #[derive(Clone, Debug)]
 pub struct KlightsConfig {
@@ -501,7 +501,7 @@ pub fn resolve_local_pod_subnet(node_subnet: Option<String>, fallback_pod_subnet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::cluster_store::backend_kind::BackendKind;
+    use crate::bootstrap::composition::cluster_store::backend_kind::BackendKind;
     use std::sync::{Mutex, MutexGuard};
 
     // Global lock to serialize env var tests (env vars are process-global)

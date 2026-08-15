@@ -5,7 +5,7 @@ use std::sync::Arc;
 type IntegrationDatastoreHandle = super::SqliteTestStore;
 
 pub struct IntegrationPassiveReadPorts {
-    ports: crate::bootstrap::cluster_store::selector::PassiveReadPorts,
+    ports: crate::bootstrap::composition::cluster_store::selector::PassiveReadPorts,
 }
 
 struct UnavailableLeaderWatchForTest;
@@ -48,7 +48,7 @@ impl IntegrationLeaderRpcNodePorts {
 }
 
 pub struct IntegrationLeaderRpcNodeLocal {
-    stores: crate::bootstrap::node_store::NodeLocalStores,
+    stores: crate::bootstrap::composition::node_store::NodeLocalStores,
 }
 
 pub struct IntegrationLeaderRpcClaimedOutbox {
@@ -180,7 +180,10 @@ impl IntegrationLeaderRpcComposition {
         db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> IntegrationPassiveReadPorts {
         IntegrationPassiveReadPorts {
-            ports: crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(db),
+            ports:
+                crate::bootstrap::composition::cluster_store::selector::sqlite_passive_read_ports(
+                    db,
+                ),
         }
     }
 
@@ -375,8 +378,8 @@ impl IntegrationLeaderRpcComposition {
         connection_key: &'static str,
     ) -> anyhow::Result<IntegrationLeaderRpcNodeLocal> {
         Ok(IntegrationLeaderRpcNodeLocal {
-            stores: crate::bootstrap::node_store::open_node_local(
-                crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
+            stores: crate::bootstrap::composition::node_store::open_node_local(
+                crate::bootstrap::composition::cluster_store::backend_kind::BackendKind::Sqlite,
                 None,
                 supervisor,
                 connection_key,
@@ -396,7 +399,8 @@ impl IntegrationLeaderRpcComposition {
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let resource_query = klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
             self.resource_reads.clone(),
-            crate::bootstrap::authority::AuthorityHandle::from(authority.clone()).authority_arc(),
+            crate::bootstrap::composition::authority::AuthorityHandle::from(authority.clone())
+                .authority_arc(),
         );
         let lifecycle_status =
             crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
@@ -450,7 +454,7 @@ impl IntegrationLeaderRpcComposition {
         &self,
         request: klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest<'_>,
     ) -> anyhow::Result<()> {
-        let pod_store = crate::bootstrap::pod_repository_composition::new_pod_store(
+        let pod_store = crate::bootstrap::composition::pod_repository::new_pod_store(
             Arc::new(self.db.as_ref().clone()),
             self.db.clone(),
             self.db.focused_read_store(),
@@ -663,19 +667,21 @@ impl IntegrationLeaderRpcComposition {
             Some(passive_reads) => {
                 klights_watch::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
                     passive_reads.ports.resource_reads(),
-                    crate::bootstrap::authority::AuthorityHandle::from(authority.clone())
-                        .authority_arc(),
+                    crate::bootstrap::composition::authority::AuthorityHandle::from(
+                        authority.clone(),
+                    )
+                    .authority_arc(),
                     Arc::new(klights_supervisor::SystemWallClock),
                 )
             }
             None => klights_watch::DatastoreResourceQueryAdapter::new_focused_for_test(
                 self.resource_reads.clone(),
-                crate::bootstrap::authority::AuthorityHandle::from(authority.clone())
+                crate::bootstrap::composition::authority::AuthorityHandle::from(authority.clone())
                     .authority_arc(),
             ),
         };
         let authority_handle =
-            crate::bootstrap::authority::AuthorityHandle::from(authority.clone());
+            crate::bootstrap::composition::authority::AuthorityHandle::from(authority.clone());
         let side_effects =
             crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
                 self.resource_reads.clone(),
