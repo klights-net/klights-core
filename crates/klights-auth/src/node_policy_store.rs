@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 #[cfg(test)]
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// Object-safe trait for node-scoped access decisions.
 ///
@@ -26,6 +27,116 @@ pub trait NodePolicyStore: Send + Sync {
         pod_name: &str,
         resource: &str,
     ) -> Vec<String>;
+}
+
+/// Project the node relationship used by the node authorizer from a Pod.
+pub fn pod_node_name(pod: &serde_json::Value) -> Option<&str> {
+    pod.pointer("/spec/nodeName")
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Project the object relationships used by the node authorizer from a Pod.
+pub fn pod_referenced_objects(pod: &serde_json::Value, resource: &str) -> Vec<String> {
+    let mut names = HashSet::new();
+    match resource {
+        "secrets" => {
+            if let Some(volumes) = pod
+                .pointer("/spec/volumes")
+                .and_then(serde_json::Value::as_array)
+            {
+                for volume in volumes {
+                    if let Some(name) = volume
+                        .get("secret")
+                        .and_then(|secret| secret.get("secretName"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            extract_env_from_refs(pod, "secretRef", &mut names);
+            if let Some(pull_secrets) = pod
+                .pointer("/spec/imagePullSecrets")
+                .and_then(serde_json::Value::as_array)
+            {
+                for pull_secret in pull_secrets {
+                    if let Some(name) = pull_secret.get("name").and_then(serde_json::Value::as_str)
+                    {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        "configmaps" => {
+            if let Some(volumes) = pod
+                .pointer("/spec/volumes")
+                .and_then(serde_json::Value::as_array)
+            {
+                for volume in volumes {
+                    if let Some(name) = volume
+                        .get("configMap")
+                        .and_then(|config_map| config_map.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            extract_env_from_refs(pod, "configMapRef", &mut names);
+        }
+        "persistentvolumeclaims" => {
+            if let Some(volumes) = pod
+                .pointer("/spec/volumes")
+                .and_then(serde_json::Value::as_array)
+            {
+                for volume in volumes {
+                    if let Some(name) = volume
+                        .get("persistentVolumeClaim")
+                        .and_then(|claim| claim.get("claimName"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        "serviceaccounts" => {
+            if let Some(name) = pod
+                .pointer("/spec/serviceAccountName")
+                .and_then(serde_json::Value::as_str)
+            {
+                names.insert(name.to_string());
+            }
+        }
+        _ => {}
+    }
+    names.into_iter().collect()
+}
+
+fn extract_env_from_refs(pod: &serde_json::Value, ref_key: &str, names: &mut HashSet<String>) {
+    for container_path in ["/spec/containers", "/spec/initContainers"] {
+        if let Some(containers) = pod
+            .pointer(container_path)
+            .and_then(serde_json::Value::as_array)
+        {
+            for container in containers {
+                if let Some(env_from) = container
+                    .get("envFrom")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for source in env_from {
+                        if let Some(name) = source
+                            .get(ref_key)
+                            .and_then(|reference| reference.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            names.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// In-memory `NodePolicyStore` for unit tests.
@@ -199,5 +310,54 @@ mod tests {
             .get_pod_referenced_objects("default", "pod-a", "pvc")
             .await;
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn pod_relationship_projection_covers_node_authorizer_resource_families() {
+        let pod = serde_json::json!({
+            "spec": {
+                "nodeName": "tokyo",
+                "serviceAccountName": "default-sa",
+                "containers": [{
+                    "envFrom": [
+                        {"configMapRef": {"name": "env-config"}},
+                        {"secretRef": {"name": "env-secret"}}
+                    ]
+                }],
+                "initContainers": [{
+                    "envFrom": [{"secretRef": {"name": "init-secret"}}]
+                }],
+                "volumes": [
+                    {"configMap": {"name": "volume-config"}},
+                    {"secret": {"secretName": "volume-secret"}},
+                    {"persistentVolumeClaim": {"claimName": "data"}}
+                ],
+                "imagePullSecrets": [
+                    {"name": "registry-secret"},
+                    {"name": "env-secret"}
+                ]
+            }
+        });
+
+        assert_eq!(pod_node_name(&pod), Some("tokyo"));
+        for (resource, expected) in [
+            (
+                "secrets",
+                vec![
+                    "env-secret",
+                    "init-secret",
+                    "registry-secret",
+                    "volume-secret",
+                ],
+            ),
+            ("configmaps", vec!["env-config", "volume-config"]),
+            ("persistentvolumeclaims", vec!["data"]),
+            ("serviceaccounts", vec!["default-sa"]),
+            ("unknown", vec![]),
+        ] {
+            let mut actual = pod_referenced_objects(&pod, resource);
+            actual.sort();
+            assert_eq!(actual, expected, "resource={resource}");
+        }
     }
 }

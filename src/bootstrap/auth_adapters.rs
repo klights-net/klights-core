@@ -1,11 +1,10 @@
 //! Root-owned adapters that connect auth policy ports to concrete stores.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use klights_auth::node_policy_store::NodePolicyStore;
+use klights_auth::node_policy_store::{NodePolicyStore, pod_node_name, pod_referenced_objects};
 use klights_auth::rbac_policy_store::RbacResourceReader;
 use klights_cluster_store::{
     ClusterResourceRead, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
@@ -300,10 +299,7 @@ impl NodePolicyStore for PodRepositoryNodePolicyStore {
             .await
             .ok()
             .flatten()?;
-        pod.data
-            .pointer("/spec/nodeName")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
+        pod_node_name(&pod.data).map(str::to_string)
     }
 
     async fn list_pods_on_node(&self, node_name: &str) -> Vec<(String, String)> {
@@ -316,12 +312,7 @@ impl NodePolicyStore for PodRepositoryNodePolicyStore {
         pods.into_parts()
             .0
             .into_iter()
-            .filter(|pod| {
-                pod.data
-                    .pointer("/spec/nodeName")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(node_name)
-            })
+            .filter(|pod| pod_node_name(&pod.data) == Some(node_name))
             .map(|pod| (pod.namespace.unwrap_or_default(), pod.name))
             .collect()
     }
@@ -338,110 +329,7 @@ impl NodePolicyStore for PodRepositoryNodePolicyStore {
         let Ok(Some(pod)) = self.pods.get_pod(request).await else {
             return Vec::new();
         };
-        extract_referenced_objects(&pod.data, resource)
-    }
-}
-
-fn extract_referenced_objects(pod: &serde_json::Value, resource: &str) -> Vec<String> {
-    let mut names = HashSet::new();
-    match resource {
-        "secrets" => {
-            if let Some(volumes) = pod
-                .pointer("/spec/volumes")
-                .and_then(serde_json::Value::as_array)
-            {
-                for volume in volumes {
-                    if let Some(name) = volume
-                        .get("secret")
-                        .and_then(|secret| secret.get("secretName"))
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-            extract_env_from_refs(pod, "secretRef", &mut names);
-            if let Some(pull_secrets) = pod
-                .pointer("/spec/imagePullSecrets")
-                .and_then(serde_json::Value::as_array)
-            {
-                for pull_secret in pull_secrets {
-                    if let Some(name) = pull_secret.get("name").and_then(serde_json::Value::as_str)
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-        }
-        "configmaps" => {
-            if let Some(volumes) = pod
-                .pointer("/spec/volumes")
-                .and_then(serde_json::Value::as_array)
-            {
-                for volume in volumes {
-                    if let Some(name) = volume
-                        .get("configMap")
-                        .and_then(|config_map| config_map.get("name"))
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-            extract_env_from_refs(pod, "configMapRef", &mut names);
-        }
-        "persistentvolumeclaims" => {
-            if let Some(volumes) = pod
-                .pointer("/spec/volumes")
-                .and_then(serde_json::Value::as_array)
-            {
-                for volume in volumes {
-                    if let Some(name) = volume
-                        .get("persistentVolumeClaim")
-                        .and_then(|claim| claim.get("claimName"))
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-            }
-        }
-        "serviceaccounts" => {
-            if let Some(name) = pod
-                .pointer("/spec/serviceAccountName")
-                .and_then(serde_json::Value::as_str)
-            {
-                names.insert(name.to_string());
-            }
-        }
-        _ => {}
-    }
-    names.into_iter().collect()
-}
-
-fn extract_env_from_refs(pod: &serde_json::Value, ref_key: &str, names: &mut HashSet<String>) {
-    for container_path in ["/spec/containers", "/spec/initContainers"] {
-        if let Some(containers) = pod
-            .pointer(container_path)
-            .and_then(serde_json::Value::as_array)
-        {
-            for container in containers {
-                if let Some(env_from) = container
-                    .get("envFrom")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for source in env_from {
-                        if let Some(name) = source
-                            .get(ref_key)
-                            .and_then(|reference| reference.get("name"))
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            names.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
+        pod_referenced_objects(&pod.data, resource)
     }
 }
 
@@ -449,7 +337,7 @@ fn extract_env_from_refs(pod: &serde_json::Value, ref_key: &str, names: &mut Has
 mod tests {
     use std::sync::Arc;
 
-    use super::{PodRepositoryNodePolicyStore, extract_referenced_objects};
+    use super::PodRepositoryNodePolicyStore;
     use klights_auth::node_policy_store::NodePolicyStore;
     use klights_cluster_core::Resource;
 
@@ -539,50 +427,5 @@ mod tests {
                 .await,
             vec!["volume-secret".to_string()]
         );
-    }
-
-    #[test]
-    fn pod_reference_extraction_covers_node_authorizer_resource_families() {
-        let pod = serde_json::json!({
-            "spec": {
-                "serviceAccountName": "default-sa",
-                "containers": [{
-                    "envFrom": [
-                        {"configMapRef": {"name": "env-config"}},
-                        {"secretRef": {"name": "env-secret"}}
-                    ]
-                }],
-                "initContainers": [{
-                    "envFrom": [{"secretRef": {"name": "init-secret"}}]
-                }],
-                "volumes": [
-                    {"configMap": {"name": "volume-config"}},
-                    {"secret": {"secretName": "volume-secret"}},
-                    {"persistentVolumeClaim": {"claimName": "data"}}
-                ],
-                "imagePullSecrets": [{"name": "registry-secret"}]
-            }
-        });
-        let cases = [
-            (
-                "secrets",
-                vec![
-                    "env-secret",
-                    "init-secret",
-                    "registry-secret",
-                    "volume-secret",
-                ],
-            ),
-            ("configmaps", vec!["env-config", "volume-config"]),
-            ("persistentvolumeclaims", vec!["data"]),
-            ("serviceaccounts", vec!["default-sa"]),
-            ("unknown", vec![]),
-        ];
-
-        for (resource, expected) in cases {
-            let mut actual = extract_referenced_objects(&pod, resource);
-            actual.sort();
-            assert_eq!(actual, expected, "resource={resource}");
-        }
     }
 }
