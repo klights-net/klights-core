@@ -9,7 +9,7 @@ mod cases {
 
     use klights_kubelet::node_api::logs::LocalNodeLogRuntime;
 
-    use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore as DatastoreHandle;
+    use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore;
 
     use klights_replication::ReplicationService;
 
@@ -154,7 +154,7 @@ mod cases {
                     &concrete_db,
                 );
             let canonical = concrete_db.clone();
-            let db: DatastoreHandle = Arc::new(concrete_db);
+            let db: SqliteTestStore = Arc::new(concrete_db);
             crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
                 db.as_ref(),
             )
@@ -367,7 +367,7 @@ mod cases {
         is_leader: bool,
     ) -> (
         String,
-        DatastoreHandle,
+        SqliteTestStore,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -379,7 +379,7 @@ mod cases {
         policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
     ) -> (
         String,
-        DatastoreHandle,
+        SqliteTestStore,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -392,7 +392,7 @@ mod cases {
                 &concrete_db,
             );
         let canonical = concrete_db.clone();
-        let db: DatastoreHandle = Arc::new(concrete_db);
+        let db: SqliteTestStore = Arc::new(concrete_db);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -439,7 +439,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -534,7 +534,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -1135,7 +1135,7 @@ mod cases {
     async fn client_and_service() -> (
         ReplicationGrpcClient,
         Arc<ReplicationService>,
-        DatastoreHandle,
+        SqliteTestStore,
         tokio::task::JoinHandle<()>,
     ) {
         let sqlite =
@@ -1143,7 +1143,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite.clone());
+        let db: SqliteTestStore = Arc::new(sqlite.clone());
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -1414,7 +1414,7 @@ mod cases {
         let rv_after_first = db.get_current_resource_version().await.unwrap();
         assert_eq!(applied_rv, rv_after_first);
 
-        let pod_message = |db: DatastoreHandle| async move {
+        let pod_message = |db: SqliteTestStore| async move {
             db.get_resource("v1", "Pod", Some("default"), "web")
                 .await
                 .expect("read pod")
@@ -1475,7 +1475,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -1575,7 +1575,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -1678,7 +1678,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -1927,7 +1927,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -2060,7 +2060,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -2183,7 +2183,7 @@ mod cases {
             crate::bootstrap::composition_tests::leader_rpc::support::sqlite_passive_read_ports(
                 &concrete_pod_event_db,
             );
-        let pod_event_db: DatastoreHandle = Arc::new(concrete_pod_event_db);
+        let pod_event_db: SqliteTestStore = Arc::new(concrete_pod_event_db);
         let positioned_watch =
             crate::bootstrap::composition_tests::leader_rpc::support::positioned_watch(
                 &passive_reads,
@@ -2328,7 +2328,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -2414,7 +2414,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -2540,7 +2540,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -2749,7 +2749,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -2883,7 +2883,7 @@ mod cases {
                 .await
                 .unwrap();
         let canonical = sqlite.clone();
-        let db: DatastoreHandle = Arc::new(sqlite);
+        let db: SqliteTestStore = Arc::new(sqlite);
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )

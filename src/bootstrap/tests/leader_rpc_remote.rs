@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use serde_json::json;
 
-use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore as DatastoreHandle;
+use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore;
 use crate::bootstrap::composition_tests::support::OutboxPayload;
 use crate::datastore::ResourcePreconditions;
 use klights_cluster_core::Resource;
@@ -117,7 +117,7 @@ fn test_node_cert_der(node_name: &str) -> Vec<u8> {
 
 async fn remote_client_and_leader_db() -> (
     RemoteApiClient,
-    DatastoreHandle,
+    SqliteTestStore,
     tokio::task::JoinHandle<()>,
 ) {
     remote_client_and_leader_db_with_node_names("worker-1".to_string(), "worker-1".to_string())
@@ -129,7 +129,7 @@ async fn remote_client_and_leader_db_with_node_names(
     grpc_node_name: String,
 ) -> (
     RemoteApiClient,
-    DatastoreHandle,
+    SqliteTestStore,
     tokio::task::JoinHandle<()>,
 ) {
     let concrete_db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
@@ -139,7 +139,7 @@ async fn remote_client_and_leader_db_with_node_names(
             crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::passive_reads_for(
                 &concrete_db,
             );
-    let db: DatastoreHandle = Arc::new(concrete_db.clone());
+    let db: SqliteTestStore = Arc::new(concrete_db.clone());
     crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(db.as_ref())
         .await
         .unwrap();

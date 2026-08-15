@@ -1,11 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_store::{
-    ClusterResourceRead, ResourceCollectionScope, ResourceListOptions, ResourceListQuery,
-    ResourceListRead, ResourceListRequest,
+    ClusterResourceRead, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
+    ResourceListRequest,
 };
 
-use crate::datastore::DatastoreBackend;
 use klights_controllers::side_effects::service_pod::{ServiceEndpointState, ServicePodStore};
 
 struct BorrowedServicePodStore<'a> {
@@ -63,35 +62,5 @@ async fn list_resources(
         } => anyhow::bail!(
             "{api_version}/{kind} LIST at resourceVersion {requested} expired before {oldest_available}"
         ),
-    }
-}
-
-#[async_trait]
-impl ServicePodStore for dyn DatastoreBackend + '_ {
-    async fn load_service_endpoint_state(&self, namespace: &str) -> Result<ServiceEndpointState> {
-        let services = self
-            .list_resources("v1", "Service", Some(namespace), ResourceListOptions::all())
-            .await?;
-        let endpoints = self
-            .list_resources(
-                "v1",
-                "Endpoints",
-                Some(namespace),
-                ResourceListOptions::all(),
-            )
-            .await?;
-        let endpoint_slices = self
-            .list_resources(
-                "discovery.k8s.io/v1",
-                "EndpointSlice",
-                Some(namespace),
-                ResourceListOptions::all(),
-            )
-            .await?;
-        Ok(ServiceEndpointState {
-            services: services.items,
-            endpoints: endpoints.items,
-            endpoint_slices: endpoint_slices.items,
-        })
     }
 }

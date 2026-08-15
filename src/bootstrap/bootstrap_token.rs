@@ -7,7 +7,6 @@ use klights_auth::bootstrap_token::{
 };
 
 use crate::datastore::Resource;
-use crate::datastore::backend::DatastoreBackend;
 
 #[async_trait::async_trait]
 pub(crate) trait BootstrapTokenStore: Send + Sync {
@@ -25,100 +24,6 @@ pub(crate) trait BootstrapTokenStore: Send + Sync {
         resource: &Resource,
         data: serde_json::Value,
     ) -> Result<Resource>;
-}
-
-#[async_trait::async_trait]
-impl<T: DatastoreBackend> BootstrapTokenStore for T {
-    async fn get_bootstrap_token_secret(
-        &self,
-        scope: BootstrapTokenScope,
-    ) -> Result<Option<Resource>> {
-        self.get_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            scope.secret_name(),
-        )
-        .await
-    }
-
-    async fn create_bootstrap_token_secret(
-        &self,
-        scope: BootstrapTokenScope,
-        data: serde_json::Value,
-    ) -> Result<Resource> {
-        self.create_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            scope.secret_name(),
-            data,
-        )
-        .await
-    }
-
-    async fn update_bootstrap_token_secret(
-        &self,
-        resource: &Resource,
-        data: serde_json::Value,
-    ) -> Result<Resource> {
-        self.update_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            &resource.name,
-            data,
-            resource.resource_version,
-        )
-        .await
-    }
-}
-
-#[async_trait::async_trait]
-impl BootstrapTokenStore for dyn DatastoreBackend + '_ {
-    async fn get_bootstrap_token_secret(
-        &self,
-        scope: BootstrapTokenScope,
-    ) -> Result<Option<Resource>> {
-        self.get_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            scope.secret_name(),
-        )
-        .await
-    }
-
-    async fn create_bootstrap_token_secret(
-        &self,
-        scope: BootstrapTokenScope,
-        data: serde_json::Value,
-    ) -> Result<Resource> {
-        self.create_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            scope.secret_name(),
-            data,
-        )
-        .await
-    }
-
-    async fn update_bootstrap_token_secret(
-        &self,
-        resource: &Resource,
-        data: serde_json::Value,
-    ) -> Result<Resource> {
-        self.update_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            &resource.name,
-            data,
-            resource.resource_version,
-        )
-        .await
-    }
 }
 
 /// The canonical SQLite store is consumed through this existing narrow auth

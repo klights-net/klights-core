@@ -5,7 +5,7 @@
 //! - `leader_epoch`: starts at 0, increments only on explicit promotion
 //!
 //! These values are stored in the `_klights_meta` table via
-//! `DatastoreBackend` metadata methods. Node bootstrap tokens are Kubernetes
+//! Canonical focused metadata ports. Node bootstrap tokens are Kubernetes
 //! `bootstrap.kubernetes.io/token` Secrets in `kube-system`.
 
 #[cfg(test)]

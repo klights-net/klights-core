@@ -2,13 +2,12 @@ use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_cluster_store::{
     ClusterResourceMutation, ClusterResourceRead, ResourceCollectionScope, ResourceGetRequest,
-    ResourceListOptions, ResourceListQuery, ResourceListRead, ResourceListRequest,
+    ResourceListQuery, ResourceListRead, ResourceListRequest,
 };
 use klights_reconcile_api::ControllerStoreResult as Result;
 use serde_json::Value;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreBackend;
 use klights_controllers::service::ServiceReconcileStore;
 
 pub(crate) struct FocusedServiceReconcileStore {
@@ -87,42 +86,5 @@ impl ServiceReconcileStore for FocusedServiceReconcileStore {
             )
             .await
             .map_err(|error| map_controller_store_error(error.into()))
-    }
-}
-
-#[async_trait]
-impl ServiceReconcileStore for dyn DatastoreBackend + '_ {
-    async fn list_services(&self) -> Result<Vec<Resource>> {
-        Ok(self
-            .list_resources("v1", "Service", None, ResourceListOptions::all())
-            .await
-            .map_err(map_controller_store_error)?
-            .items)
-    }
-
-    async fn get_service(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, "v1", "Service", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn update_service(
-        &self,
-        namespace: &str,
-        name: &str,
-        data: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
-        DatastoreBackend::update_resource_with_preconditions(
-            self,
-            "v1",
-            "Service",
-            Some(namespace),
-            name,
-            data,
-            preconditions,
-        )
-        .await
-        .map_err(map_controller_store_error)
     }
 }

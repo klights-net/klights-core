@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use std::sync::Mutex;
 
-use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore as DatastoreHandle;
+use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore;
 
 use klights_cluster_core::ResourcePreconditions;
 
@@ -81,7 +81,7 @@ async fn create_scoped_token_for_test(
 }
 
 async fn grpc_test_server_with_signing_ca(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     applied_outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
     committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
@@ -123,20 +123,20 @@ async fn grpc_test_server_with_signing_ca(
 }
 
 async fn grpc_test_server(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
     grpc_test_server_with_dispatcher(db, None).await
 }
 
 async fn grpc_test_server_with_dispatcher(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
     grpc_test_server_full(db, controller_dispatcher, None).await
 }
 
 async fn grpc_test_server_full(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
@@ -151,7 +151,7 @@ async fn grpc_test_server_full(
 }
 
 async fn grpc_test_server_with_node_cert(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     node_name: &str,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
     let (endpoint, service, _progress, handle) =
@@ -160,7 +160,7 @@ async fn grpc_test_server_with_node_cert(
 }
 
 async fn grpc_test_server_full_with_node_cert(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
     injected_node_cert: Option<String>,
@@ -181,7 +181,7 @@ async fn grpc_test_server_full_with_node_cert(
 }
 
 async fn grpc_test_server_full_with_node_cert_and_current_rv(
-    db: DatastoreHandle,
+    db: SqliteTestStore,
     controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
     injected_node_cert: Option<String>,
@@ -293,7 +293,7 @@ async fn grpc_test_server_with_policy(
     let passive_reads =
         crate::bootstrap::composition_tests::leader_rpc::support::sqlite_passive_read_ports(&db);
     let canonical = db.clone();
-    let db: DatastoreHandle = Arc::new(db);
+    let db: SqliteTestStore = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -723,7 +723,7 @@ async fn grpc_leader_server_with_db(
     let passive_reads =
         crate::bootstrap::composition_tests::leader_rpc::support::sqlite_passive_read_ports(&db);
     let canonical = db.clone();
-    let db: DatastoreHandle = Arc::new(db);
+    let db: SqliteTestStore = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -1531,7 +1531,7 @@ async fn raft_test_server() -> super::support::GrpcReplicationServer {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -1694,7 +1694,7 @@ async fn raft_append_entries_rejects_bootstrap_token() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -1894,7 +1894,7 @@ async fn renew_node_lease_rejects_mismatched_node() {
         .await
         .unwrap();
     let canonical = db.clone();
-    let db: DatastoreHandle = Arc::new(db);
+    let db: SqliteTestStore = Arc::new(db);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
             .unwrap()
@@ -1943,7 +1943,7 @@ async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutat
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::Utc::now(),
     ));
@@ -1990,7 +1990,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let created = db
         .create_resource(
             "v1",
@@ -2162,7 +2162,7 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let created = db
         .create_resource(
             "v1",
@@ -2249,7 +2249,7 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let created = db
         .create_resource(
             "v1",
@@ -2372,7 +2372,7 @@ async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -2435,7 +2435,7 @@ async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -2494,7 +2494,7 @@ async fn cleanup_intent_ack_requires_current_leader_before_mutation() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -2658,7 +2658,7 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
         .await
         .unwrap();
     let canonical = db.clone();
-    let db: DatastoreHandle = Arc::new(db);
+    let db: SqliteTestStore = Arc::new(db);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         wall_time,
     ));
@@ -2709,7 +2709,7 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
         .await
         .unwrap();
     let canonical = db.clone();
-    let db: DatastoreHandle = Arc::new(db);
+    let db: SqliteTestStore = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -2820,7 +2820,7 @@ async fn observe_peer_endpoint_records_authenticated_node_remote_ip() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -3512,7 +3512,7 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3576,7 +3576,7 @@ async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() 
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3758,7 +3758,7 @@ async fn mounted_router_serves_grpc_get_metadata() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3785,7 +3785,7 @@ async fn mounted_router_serves_grpc_reflection_for_replication_service() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let (endpoint, _service, handle) = grpc_test_server(db).await;
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .unwrap()
@@ -3829,7 +3829,7 @@ async fn connect_rejects_invalid_token_without_persisting_dataplane_metadata() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let (endpoint, _service, handle) = grpc_test_server(db.clone()).await;
     let mut join = valid_join();
     join.token = "wrong-token".to_string();
@@ -3858,7 +3858,7 @@ async fn connect_persists_dataplane_endpoint_from_observed_peer_ip() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let (endpoint, _service, handle) =
         grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     let mut join = valid_join();
@@ -3895,7 +3895,7 @@ async fn connect_refreshes_existing_node_external_ip_from_observed_peer_ip() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     let (endpoint, _service, handle) =
         grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     db.create_resource(
@@ -3947,7 +3947,7 @@ async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3996,7 +3996,7 @@ async fn connect_follower_progress_heartbeats_never_regress_below_initial_rv() {
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -4065,7 +4065,7 @@ async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -4125,7 +4125,7 @@ async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft
         crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
             .await
             .unwrap();
-    let db: DatastoreHandle = Arc::new(sqlite);
+    let db: SqliteTestStore = Arc::new(sqlite);
     crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -4207,7 +4207,7 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
             .await
             .unwrap();
     let canonical = sqlite.clone();
-    let db: DatastoreHandle = Arc::new(sqlite.clone());
+    let db: SqliteTestStore = Arc::new(sqlite.clone());
     let _token = {
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),

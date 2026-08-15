@@ -3,7 +3,6 @@
 pub(crate) mod apiservice_side_effect_adapter;
 pub(crate) mod applied_pod_side_effect_adapter;
 pub(crate) mod controller_runtime_adapter;
-pub(crate) mod controller_store_adapters;
 pub(crate) mod controller_store_error_adapter;
 pub(crate) mod coredns_bootstrap_adapter;
 pub(crate) mod crd_registry_adapter;
@@ -12,7 +11,6 @@ pub(crate) mod daemonset_node_side_effect_adapter;
 pub(crate) mod daemonset_store_adapter;
 pub(crate) mod deployment_store_adapter;
 pub(crate) mod endpoint_mirror_side_effect_adapter;
-pub(crate) mod endpoint_reconcile_adapter;
 pub(crate) mod gc_delete_adapter;
 pub(crate) mod gc_resource_store_adapter;
 pub(crate) mod hpa_controller_adapter;
