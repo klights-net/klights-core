@@ -6,8 +6,8 @@ use serde_json::json;
 
 use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore;
 use crate::bootstrap::composition_tests::support::OutboxPayload;
-use crate::datastore::ResourcePreconditions;
 use klights_cluster_core::Resource;
+use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::command::StorageCommand;
 use klights_leader_api::JoinRole;
 use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
@@ -249,7 +249,7 @@ fn make_pod(ns: &str, name: &str, uid: &str, node_name: &str, phase: &str) -> Re
             "phase": phase
         }
     });
-    crate::datastore::Resource {
+    klights_cluster_core::Resource {
         id: 0,
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
@@ -1170,7 +1170,7 @@ async fn informer_apply_event_gates_cursor_advance() {
     // the driver may advance to.
     let bookmark = ResourceEvent::try_new(
         WatchEventType::Bookmark,
-        crate::datastore::Resource::from_data_lossy(Arc::new(serde_json::json!({
+        klights_cluster_core::Resource::from_data_lossy(Arc::new(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {"resourceVersion": "42"}

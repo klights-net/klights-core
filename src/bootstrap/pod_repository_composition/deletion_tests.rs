@@ -1332,7 +1332,7 @@ mod tests {
     #[tokio::test]
     async fn deletion_finalizer_without_outbox_retries_later() {
         let resource_version = 13;
-        let pod_resource = klights::datastore::Resource {
+        let pod_resource = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -1386,7 +1386,7 @@ mod tests {
     }
     #[tokio::test]
     async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
-        let pod_resource = klights::datastore::Resource {
+        let pod_resource = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),

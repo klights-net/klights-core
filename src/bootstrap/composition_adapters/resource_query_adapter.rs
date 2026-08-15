@@ -24,7 +24,7 @@ use klights_cluster_store::{
 };
 
 use crate::bootstrap::authority::AuthorityHandle;
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 
 const PRIVATE_CONTINUATION_CODEC_VERSION: u8 = 2;
 /// Kubernetes clients must be able to restart a chunked LIST after bounded

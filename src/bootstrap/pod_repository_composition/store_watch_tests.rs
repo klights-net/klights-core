@@ -373,7 +373,7 @@ mod tests {
     }
     #[tokio::test]
     async fn cluster_backed_pod_reader_list_pods_uses_fresh_leader_list() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),

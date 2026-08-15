@@ -83,8 +83,8 @@ fn inventory_resource(
     name: &str,
     resource_version: i64,
     data: serde_json::Value,
-) -> crate::datastore::Resource {
-    crate::datastore::Resource {
+) -> klights_cluster_core::Resource {
+    klights_cluster_core::Resource {
         id: resource_version,
         api_version: api_version.to_string(),
         kind: kind.to_string(),
@@ -215,7 +215,7 @@ impl FreshServiceInventoryClient {
     async fn fresh_get_for_test(
         &self,
         key: klights_types::ResourceKey,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         self.fresh_get_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if key.api_version == "v1"
@@ -256,7 +256,7 @@ impl klights_leader_api::LeaderResourceQuery for FreshServiceInventoryClient {
     fn get_resource(
         &self,
         request: klights_leader_api::ResourceGetRequest,
-    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<crate::datastore::Resource>> {
+    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>> {
         Box::pin(async move {
             if request.consistency() == klights_leader_api::ResourceQueryConsistency::Cached {
                 self.cached_get_calls

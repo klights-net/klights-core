@@ -1,7 +1,6 @@
 mod allocator;
 pub mod cli;
 mod cluster_engine;
-pub mod datastore;
 pub mod paths;
 pub mod pidfile;
 pub mod shutdown;

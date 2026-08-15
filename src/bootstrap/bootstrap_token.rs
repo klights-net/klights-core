@@ -6,7 +6,7 @@ use klights_auth::bootstrap_token::{
     BootstrapTokenReadAction, BootstrapTokenScope, BootstrapTokenScopePolicy, BootstrapTokenSecret,
 };
 
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 
 #[async_trait::async_trait]
 pub(crate) trait BootstrapTokenStore: Send + Sync {

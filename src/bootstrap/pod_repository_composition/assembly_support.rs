@@ -188,7 +188,7 @@ pub(crate) mod support {
             uid: &str,
             update: klights_kubelet::pod_repository::PodStatusUpdate,
             expected_rv: Option<i64>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
                 self.pod_status_writer.as_ref(),
                 namespace,
@@ -207,7 +207,7 @@ pub(crate) mod support {
             uid: &str,
             update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
             expected_rv: Option<i64>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
                 self.pod_status_writer.as_ref(),
                 namespace,
@@ -225,7 +225,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             sandbox_id: &str,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.pod_update
                 .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                     klights_pod_api::PodMutationTarget::try_by_identity(
@@ -244,7 +244,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             owner_references: Vec<serde_json::Value>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .replace_owner_references_for_uid(namespace, name, uid, owner_references)
                 .await
@@ -258,7 +258,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             labels: Vec<(String, String)>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .merge_labels_for_uid(namespace, name, uid, labels)
                 .await
@@ -563,7 +563,7 @@ pub(crate) mod support {
         pub async fn replace_status(
             &self,
             request: klights_pod_api::PodStatusReplaceRequest,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.subresource
                 .replace_status(request)
                 .await
@@ -576,7 +576,7 @@ pub(crate) mod support {
             name: &str,
             status: serde_json::Value,
             expected_resource_version: i64,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.replace_status(klights_pod_api::PodStatusReplaceRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
@@ -594,7 +594,7 @@ pub(crate) mod support {
             uid: &str,
             status: serde_json::Value,
             expected_resource_version: i64,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.replace_status(klights_pod_api::PodStatusReplaceRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
@@ -608,7 +608,7 @@ pub(crate) mod support {
         pub async fn patch_status(
             &self,
             request: klights_pod_api::PodStatusPatchRequest,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.subresource
                 .patch_status(request)
                 .await
@@ -622,7 +622,7 @@ pub(crate) mod support {
             patch: serde_json::Value,
             patch_type: klights_pod_api::PodStatusPatchKind,
             expected_resource_version: i64,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.patch_status(klights_pod_api::PodStatusPatchRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
@@ -636,7 +636,7 @@ pub(crate) mod support {
         pub async fn update_ephemeral_containers(
             &self,
             request: klights_pod_api::PodEphemeralContainersRequest,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.subresource
                 .update_ephemeral_containers(request)
                 .await
@@ -649,7 +649,7 @@ pub(crate) mod support {
             name: &str,
             containers: Vec<serde_json::Value>,
             expected_resource_version: i64,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
@@ -845,9 +845,9 @@ pub(crate) mod support {
     }
 
     pub struct IntegrationApiDeleteStatusRaceOutcome {
-        pub created: crate::datastore::Resource,
-        pub deleted: crate::datastore::Resource,
-        pub persisted: crate::datastore::Resource,
+        pub created: klights_cluster_core::Resource,
+        pub deleted: klights_cluster_core::Resource,
+        pub persisted: klights_cluster_core::Resource,
         pub status_bumps: usize,
     }
 
@@ -954,7 +954,8 @@ pub(crate) mod support {
         fn get_pod(
             &self,
             request: klights_pod_api::PodGetRequest,
-        ) -> klights_pod_api::PodRepositoryFuture<'_, Option<crate::datastore::Resource>> {
+        ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>>
+        {
             Box::pin(async move {
                 self.db
                     .get_resource("v1", "Pod", Some(request.namespace()), request.name())
@@ -979,7 +980,7 @@ pub(crate) mod support {
         fn list_pods_by_owner_uid(
             &self,
             _request: klights_pod_api::PodOwnerListRequest,
-        ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<crate::datastore::Resource>> {
+        ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
             Box::pin(async {
                 Err(klights_pod_api::PodRepositoryError::unavailable(
                     "delete-observation query does not support list_pods_by_owner_uid",
@@ -1126,7 +1127,7 @@ pub(crate) mod support {
         fn write_pod_status(
             &self,
             request: klights_pod_api::PodStatusWriteRequest,
-        ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
+        ) -> klights_pod_api::PodRepositoryFuture<'_, klights_cluster_core::Resource> {
             Box::pin(async move {
                 self.store
                     .update_pod_status(
@@ -1312,7 +1313,7 @@ pub(crate) mod support {
     ) -> (
         klights_kubelet::pod_repository::status::PodStatusService,
         Arc<klights_kubelet::test_support::pod_status::StatusRacePersistence>,
-        crate::datastore::Resource,
+        klights_cluster_core::Resource,
     ) {
         let store = Arc::new(IntegrationPodStoreFixture::new().await);
         let created = store
@@ -1572,7 +1573,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             deletion_body: &serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.store
                 .integration_mark_deleting_latest(namespace, name, uid, deletion_body)
                 .await
@@ -1584,7 +1585,7 @@ pub(crate) mod support {
             name: &str,
             status: serde_json::Value,
             expected_resource_version: Option<i64>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.store
                 .integration_update_status(namespace, name, status, expected_resource_version)
                 .await
@@ -1595,7 +1596,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             replacement: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.db
                 .delete_resource("v1", "Pod", Some(namespace), name)
                 .await?;
@@ -1668,7 +1669,7 @@ pub(crate) mod support {
                             Some("default"),
                             &self.pod_name,
                             body,
-                            crate::datastore::ResourcePreconditions {
+                            klights_cluster_core::ResourcePreconditions {
                                 uid: Some(current.uid),
                                 resource_version: Some(current.resource_version),
                             },
@@ -1687,7 +1688,7 @@ pub(crate) mod support {
                                 "podIP": "10.42.0.77",
                                 "raceBump": true
                             }),
-                            crate::datastore::ResourcePreconditions::uid(current.uid),
+                            klights_cluster_core::ResourcePreconditions::uid(current.uid),
                         )
                         .await?;
                 }
@@ -2402,7 +2403,7 @@ pub(crate) mod support {
                 name: name.to_string(),
                 status,
                 expected_rv: None,
-                preconditions: crate::datastore::ResourcePreconditions::uid(uid),
+                preconditions: klights_cluster_core::ResourcePreconditions::uid(uid),
                 observed_status_stamp: None,
             };
             let codec =
@@ -2431,7 +2432,7 @@ pub(crate) mod support {
             &self,
             name: &str,
             configuration: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.db
                 .create_resource(
                     "admissionregistration.k8s.io/v1",
@@ -2486,7 +2487,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             anyhow::ensure!(kind != "Pod", "Pod fixtures must use seed_pod");
             self.db
                 .create_resource(api_version, kind, Some(namespace), name, value)
@@ -2500,7 +2501,7 @@ pub(crate) mod support {
             namespace: Option<&str>,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             anyhow::ensure!(kind != "Pod", "Pod fixtures must use seed_pod");
             self.db
                 .create_resource(api_version, kind, namespace, name, value)
@@ -2530,7 +2531,7 @@ pub(crate) mod support {
             kind: &str,
             namespace: &str,
             name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
             anyhow::ensure!(kind != "Pod", "Pod fixtures must use read_pod");
             self.db
                 .get_resource(api_version, kind, Some(namespace), name)
@@ -2541,14 +2542,14 @@ pub(crate) mod support {
             &self,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.db.create_namespace(name, value).await
         }
 
         pub async fn read_namespace(
             &self,
             name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
             self.db.get_namespace(name).await
         }
 
@@ -2557,7 +2558,7 @@ pub(crate) mod support {
             name: &str,
             value: serde_json::Value,
             expected_resource_version: i64,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.db
                 .update_namespace(name, value, expected_resource_version)
                 .await
@@ -2661,7 +2662,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             owner_references: Vec<serde_json::Value>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .update_ports
                 .replace_owner_references_for_uid(namespace, name, uid, owner_references)
@@ -2675,7 +2676,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             labels: Vec<(String, String)>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .update_ports
                 .merge_labels_for_uid(namespace, name, uid, labels)
@@ -2769,7 +2770,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .seed_non_pod_resource(api_version, kind, namespace, name, value)
                 .await
@@ -2781,7 +2782,7 @@ pub(crate) mod support {
             kind: &str,
             namespace: &str,
             name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
             self.owner
                 .read_non_pod_resource(api_version, kind, namespace, name)
                 .await
@@ -2791,14 +2792,14 @@ pub(crate) mod support {
             &self,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner.seed_namespace(name, value).await
         }
 
         pub async fn read_namespace(
             &self,
             name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
             self.owner.read_namespace(name).await
         }
 
@@ -2807,7 +2808,7 @@ pub(crate) mod support {
             name: &str,
             value: serde_json::Value,
             expected_resource_version: i64,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .update_namespace(name, value, expected_resource_version)
                 .await
@@ -2862,7 +2863,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             sandbox_id: &str,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                     klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
@@ -2878,7 +2879,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             sandbox_id: &str,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                     klights_pod_api::PodMutationTarget::try_by_identity(
@@ -3034,7 +3035,7 @@ pub(crate) mod support {
             namespace: Option<&str>,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .seed_scheduling_resource(api_version, kind, namespace, name, value)
                 .await
@@ -3088,7 +3089,7 @@ pub(crate) mod support {
             name: &str,
             _node_name: &str,
             pod: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.api_mutations
                 .create_or_require_resource(namespace, name, pod)
                 .await
@@ -3142,7 +3143,7 @@ pub(crate) mod support {
             uid: &str,
             update: klights_kubelet::pod_repository::PodStatusUpdate,
             expected_rv: Option<i64>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.status_ports()
                 .set_pod_status_for_uid(namespace, name, uid, update, expected_rv)
                 .await
@@ -3156,7 +3157,7 @@ pub(crate) mod support {
             uid: &str,
             update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
             expected_rv: Option<i64>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.status_ports()
                 .apply_runtime_reconcile_status_for_uid(namespace, name, uid, update, expected_rv)
                 .await
@@ -3168,7 +3169,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             sandbox_id: &str,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                     klights_pod_api::PodMutationTarget::try_by_identity(
@@ -3185,7 +3186,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             refs: Vec<serde_json::Value>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .replace_owner_references_by_name(namespace, name, refs)
                 .await
@@ -3198,7 +3199,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             refs: Vec<serde_json::Value>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .replace_owner_references_for_uid(namespace, name, uid, refs)
                 .await
@@ -3211,7 +3212,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             labels: Vec<(String, String)>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .merge_labels_for_uid(namespace, name, uid, labels)
                 .await
@@ -3339,7 +3340,7 @@ pub(crate) mod support {
             namespace: Option<&str>,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .seed_scheduling_resource(api_version, kind, namespace, name, value)
                 .await
@@ -3349,7 +3350,7 @@ pub(crate) mod support {
             &self,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner.seed_namespace(name, value).await
         }
 
@@ -3361,7 +3362,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             value: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .seed_non_pod_resource(api_version, kind, namespace, name, value)
                 .await
@@ -3373,7 +3374,7 @@ pub(crate) mod support {
             kind: &str,
             namespace: &str,
             name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
             self.owner
                 .read_non_pod_resource(api_version, kind, namespace, name)
                 .await
@@ -3447,7 +3448,7 @@ pub(crate) mod support {
             &self,
             name: &str,
             configuration: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.owner
                 .seed_mutating_webhook_configuration(name, configuration)
                 .await
@@ -3457,7 +3458,7 @@ pub(crate) mod support {
         pub async fn read_namespace(
             &self,
             name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
             self.owner.read_namespace(name).await
         }
 
@@ -3466,7 +3467,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             refs: Vec<serde_json::Value>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .replace_owner_references_by_name(namespace, name, refs)
                 .await
@@ -3478,7 +3479,7 @@ pub(crate) mod support {
             namespace: &str,
             name: &str,
             labels: Vec<(String, String)>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .merge_labels_by_name(namespace, name, labels)
                 .await
@@ -3491,7 +3492,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             labels: Vec<(String, String)>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .merge_labels_for_uid(namespace, name, uid, labels)
                 .await
@@ -3504,7 +3505,7 @@ pub(crate) mod support {
             name: &str,
             uid: &str,
             refs: Vec<serde_json::Value>,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.update
                 .replace_owner_references_for_uid(namespace, name, uid, refs)
                 .await
@@ -3517,7 +3518,7 @@ pub(crate) mod support {
             name: &str,
             _node_name: &str,
             pod: serde_json::Value,
-        ) -> anyhow::Result<crate::datastore::Resource> {
+        ) -> anyhow::Result<klights_cluster_core::Resource> {
             self.api_mutations
                 .create_or_require_resource(namespace, name, pod)
                 .await
@@ -3545,14 +3546,14 @@ pub(crate) mod support {
     }
 
     struct BoundFinalizationHostileLeaderQuery {
-        pod: crate::datastore::Resource,
+        pod: klights_cluster_core::Resource,
     }
 
     impl klights_leader_api::LeaderResourceQuery for BoundFinalizationHostileLeaderQuery {
         fn get_resource(
             &self,
             request: klights_leader_api::ResourceGetRequest,
-        ) -> klights_leader_api::ResourceQueryFuture<'_, Option<crate::datastore::Resource>>
+        ) -> klights_leader_api::ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>>
         {
             Box::pin(async move {
                 let key = request.into_key();
@@ -3590,7 +3591,7 @@ pub(crate) mod support {
     /// Runs the PR-BOUND real-composition regression without extending the frozen historical harness.
     pub async fn run_local_bound_finalization_with_incidental_delivery_handles()
     -> anyhow::Result<()> {
-        let incidental_remote = crate::datastore::Resource {
+        let incidental_remote = klights_cluster_core::Resource {
             id: 99,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -3795,14 +3796,14 @@ pub(crate) mod support {
 
     #[derive(Clone)]
     pub(crate) struct FakeLeaderApiClient {
-        pod: klights::datastore::Resource,
-        fresh_pod: Option<klights::datastore::Resource>,
-        cached_list_items: Option<Vec<klights::datastore::Resource>>,
-        fresh_list_items: Option<Vec<klights::datastore::Resource>>,
+        pod: klights_cluster_core::Resource,
+        fresh_pod: Option<klights_cluster_core::Resource>,
+        cached_list_items: Option<Vec<klights_cluster_core::Resource>>,
+        fresh_list_items: Option<Vec<klights_cluster_core::Resource>>,
     }
 
     impl FakeLeaderApiClient {
-        pub(crate) fn new(pod: klights::datastore::Resource) -> Self {
+        pub(crate) fn new(pod: klights_cluster_core::Resource) -> Self {
             Self {
                 pod,
                 fresh_pod: None,
@@ -3811,14 +3812,14 @@ pub(crate) mod support {
             }
         }
 
-        pub(crate) fn with_fresh_pod(mut self, pod: klights::datastore::Resource) -> Self {
+        pub(crate) fn with_fresh_pod(mut self, pod: klights_cluster_core::Resource) -> Self {
             self.fresh_pod = Some(pod);
             self
         }
 
         pub(crate) fn with_cached_list_items(
             mut self,
-            items: Vec<klights::datastore::Resource>,
+            items: Vec<klights_cluster_core::Resource>,
         ) -> Self {
             self.cached_list_items = Some(items);
             self
@@ -3826,7 +3827,7 @@ pub(crate) mod support {
 
         pub(crate) fn with_fresh_list_items(
             mut self,
-            items: Vec<klights::datastore::Resource>,
+            items: Vec<klights_cluster_core::Resource>,
         ) -> Self {
             self.fresh_list_items = Some(items);
             self
@@ -3835,7 +3836,7 @@ pub(crate) mod support {
         fn pod_list_response(
             &self,
             req: &ResourceListRequest,
-            items: &[klights::datastore::Resource],
+            items: &[klights_cluster_core::Resource],
         ) -> ResourceListResult {
             let selected = if req.api_version() == "v1"
                 && req.kind() == "Pod"
@@ -3854,7 +3855,7 @@ pub(crate) mod support {
         fn get_resource(
             &self,
             request: ResourceGetRequest,
-        ) -> ResourceQueryFuture<'_, Option<klights::datastore::Resource>> {
+        ) -> ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>> {
             Box::pin(async move {
                 let consistency = request.consistency();
                 let key = request.into_key();
@@ -4178,7 +4179,7 @@ pub(crate) mod support {
     pub(crate) async fn create_basic_pod_via_api(
         repo: &IntegrationPodDeletionFixture,
         name: &str,
-    ) -> klights::datastore::Resource {
+    ) -> klights_cluster_core::Resource {
         repo.api_mutations
             .create(api_create_request(
                 json!({
@@ -4200,7 +4201,7 @@ pub(crate) mod support {
     pub(crate) async fn create_scheduling_pod_via_api(
         repo: &IntegrationPodSchedulingFixture,
         name: &str,
-    ) -> klights::datastore::Resource {
+    ) -> klights_cluster_core::Resource {
         repo.api_mutations
             .create(api_create_request(
                 json!({
@@ -4376,7 +4377,7 @@ pub(crate) mod support {
         repo: &IntegrationPodDeletionFixture,
         ns: &str,
         name: &str,
-    ) -> klights::datastore::Resource {
+    ) -> klights_cluster_core::Resource {
         let pod = json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -4405,8 +4406,8 @@ pub(crate) mod support {
     /// Assert a replacement Pod survived a stale-UID operation unchanged:
     /// same UID, same resource_version, same ownerReferences, same labels.
     pub(crate) fn assert_replacement_unchanged(
-        live: &klights::datastore::Resource,
-        before: &klights::datastore::Resource,
+        live: &klights_cluster_core::Resource,
+        before: &klights_cluster_core::Resource,
     ) {
         assert_eq!(
             live.uid, before.uid,

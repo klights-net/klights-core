@@ -182,7 +182,7 @@ impl OpenedPassiveStore {
 pub(crate) async fn open_with_sink(
     request: PassiveStoreOpenRequest<'_>,
     supervisor: Arc<TaskSupervisor>,
-    #[cfg(test)] commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
+    #[cfg(test)] commit_sink: Arc<dyn klights_cluster_store::CommitObservationSink>,
     outbox_codec: Arc<dyn klights_cluster_store::OutboxResponseCodec>,
 ) -> Result<OpenedPassiveStore> {
     match request {

@@ -76,7 +76,7 @@ mod tests {
     }
     #[tokio::test]
     async fn kubelet_pod_reader_uses_leader_api_when_configured() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -108,7 +108,7 @@ mod tests {
     }
     #[tokio::test]
     async fn kubelet_pod_reader_uses_fresh_leader_api_for_single_pod_reads() {
-        let stale_pod = klights::datastore::Resource {
+        let stale_pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -132,7 +132,7 @@ mod tests {
                 "status": {"phase": "Pending"}
             })),
         };
-        let fresh_pod = klights::datastore::Resource {
+        let fresh_pod = klights_cluster_core::Resource {
             resource_version: 12,
             data: Arc::new(json!({
                 "apiVersion": "v1",
@@ -197,7 +197,7 @@ mod tests {
     }
     #[tokio::test]
     async fn runtime_reconcile_reads_pending_status_checkpoint_from_node_db() {
-        let stale_pod = klights::datastore::Resource {
+        let stale_pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -278,7 +278,7 @@ mod tests {
     }
     #[tokio::test]
     async fn get_pod_for_uid_overlays_local_status_checkpoint_for_read_your_own_write() {
-        let stale_pod = klights::datastore::Resource {
+        let stale_pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -364,7 +364,7 @@ mod tests {
     }
     #[tokio::test]
     async fn outbox_status_reads_current_pod_through_leader_api() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -421,7 +421,7 @@ mod tests {
     }
     #[tokio::test]
     async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -542,7 +542,7 @@ mod tests {
     }
     #[tokio::test]
     async fn non_leader_pod_object_writer_without_outbox_retries_later() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -648,7 +648,7 @@ mod tests {
     }
     #[tokio::test]
     async fn non_leader_pod_status_writer_without_outbox_retries_later() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -714,7 +714,7 @@ mod tests {
     }
     #[tokio::test]
     async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -791,7 +791,7 @@ mod tests {
     }
     #[tokio::test]
     async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal() {
-        let pod = klights::datastore::Resource {
+        let pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -849,7 +849,7 @@ mod tests {
     }
     #[tokio::test]
     async fn worker_actor_finalization_uses_fresh_leader_read_before_emitting_finalize() {
-        let stale_pod = klights::datastore::Resource {
+        let stale_pod = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),

@@ -21,7 +21,7 @@ use crate::bootstrap::authority::AuthorityHandle;
 use crate::bootstrap::leader_conversions::topology::{
     focused_dataplane, focused_node_subnet, node_subnet_allocation_is_exhausted,
 };
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 use klights_replication::proposal::RaftProposal;
 
 pub(crate) struct ClusterStoreLeaderNetwork {

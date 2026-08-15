@@ -1,5 +1,5 @@
-use crate::datastore::Resource;
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use klights_cluster_core::WatchReplayPosition;
 use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use klights_kubelet::pod_lifecycle_router::{

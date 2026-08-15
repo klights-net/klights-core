@@ -13,7 +13,7 @@ use klights_leader_api::{
 };
 use tokio::sync::OnceCell;
 
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 use klights_cluster_core::command::StorageCommand;
 use klights_cluster_store::{ClusterOwnershipRead, ClusterResourceMutation, ClusterResourceRead};
 use klights_controllers::ControllerDispatcher;

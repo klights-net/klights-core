@@ -702,7 +702,7 @@ mod tests {
             "ConfigMap",
             "floor-ns",
         )];
-        let leader_cursor = klights::datastore::WatchReplayPosition {
+        let leader_cursor = klights_cluster_core::WatchReplayPosition {
             resource_version: 4,
             event_id: 4,
             resource_version_filter_through_event_id: 0,

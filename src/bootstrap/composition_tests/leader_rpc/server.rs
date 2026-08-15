@@ -1634,7 +1634,7 @@ async fn submit_resource_command_rejects_generic_pod_hard_delete() {
         kind: "Pod".to_string(),
         namespace: Some("default".to_string()),
         name: "web".to_string(),
-        preconditions: klights::datastore::ResourcePreconditions::uid("pod-uid"),
+        preconditions: klights_cluster_core::ResourcePreconditions::uid("pod-uid"),
     };
     let status = grpc
         .submit_resource_command(request_with_controlplane_client_cert(

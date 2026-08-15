@@ -450,8 +450,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{PodRepositoryNodePolicyStore, extract_referenced_objects};
-    use crate::datastore::Resource;
     use klights_auth::node_policy_store::NodePolicyStore;
+    use klights_cluster_core::Resource;
 
     struct FakePodReader {
         pods: Vec<Resource>,

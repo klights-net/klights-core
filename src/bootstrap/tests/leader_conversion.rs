@@ -784,7 +784,7 @@ async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
     );
 }
 use crate::bootstrap::composition_tests::support::OutboxPayload;
-use crate::datastore::ResourcePreconditions;
+use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::command::StorageCommand;
 use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use klights_kubelet::node_outbox::payload::OutboxOperation;

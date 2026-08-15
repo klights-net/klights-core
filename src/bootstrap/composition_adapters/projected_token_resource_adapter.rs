@@ -1,7 +1,7 @@
-use crate::datastore::Resource;
 use klights_auth::projected_service_account_token::{
     ProjectedTokenResourceReader, ProjectedTokenStoredResource,
 };
+use klights_cluster_core::Resource;
 
 /// Root-private adapter for the resources consumed by auth's projected-token policy.
 pub(crate) struct ProjectedTokenResourceAdapter<'a> {

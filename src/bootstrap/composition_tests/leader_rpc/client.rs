@@ -1354,7 +1354,7 @@ mod cases {
         // as AlreadyApplied from the watermark — mutation applied exactly once,
         // never a second mutation.
         use crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload;
-        use klights::datastore::ResourcePreconditions;
+        use klights_cluster_core::ResourcePreconditions;
         use klights_leader_api::OutboxDeliveryResult as OutboxApplyResult;
 
         let (client, _service, db, handle) = client_and_service().await;

@@ -6,7 +6,7 @@
 //! logic is pure and unit-testable.
 
 use super::*;
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 use klights_cluster_core::StorageCommand;
 use klights_kubelet::node_outbox::payload::OutboxOperation;
 use klights_leader_api::node_get_request;
@@ -1369,7 +1369,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
 
 fn pod_status_minimal_payload() -> Bytes {
     use crate::bootstrap::composition_tests::support::OutboxPayload;
-    use crate::datastore::ResourcePreconditions;
+    use klights_cluster_core::ResourcePreconditions;
     use klights_cluster_core::command::StorageCommand;
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),

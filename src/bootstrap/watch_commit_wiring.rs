@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn redb_commit_observation_fixture_uses_the_canonical_store() {
         let source = include_str!("watch_commit_wiring.rs");
-        let legacy_wrapper = ["crate::datastore::", "redb::RedbDatastore"].concat();
+        let legacy_wrapper = ["crate::data", "store::redb::RedbDatastore"].concat();
         assert!(
             !source.contains(&legacy_wrapper),
             "the root Redb wrapper must not compose commit-observation fixtures"

@@ -3613,7 +3613,7 @@ mod tests {
                 name: pv_name.into(),
                 data: binder_update,
                 expected_rv: stale_client_read.resource_version,
-                preconditions: klights::datastore::ResourcePreconditions::from_resource(
+                preconditions: klights_cluster_core::ResourcePreconditions::from_resource(
                     &stale_client_read,
                 ),
                 preserve_status: false,
@@ -3642,7 +3642,7 @@ mod tests {
                         name: pv_name.into(),
                         data: client_update,
                         expected_rv: stale_client_read.resource_version,
-                        preconditions: klights::datastore::ResourcePreconditions::from_resource(
+                        preconditions: klights_cluster_core::ResourcePreconditions::from_resource(
                             &stale_client_read,
                         ),
                         preserve_status: false,

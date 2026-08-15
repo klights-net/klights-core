@@ -302,7 +302,7 @@ mod tests {
     async fn create_node(
         db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         taints: Vec<Value>,
-    ) -> crate::datastore::Resource {
+    ) -> klights_cluster_core::Resource {
         create_node_with_status(
             db,
             taints,
@@ -324,7 +324,7 @@ mod tests {
         db: &klights_cluster_datastore::sqlite::embedded::Datastore,
         taints: Vec<Value>,
         status: Value,
-    ) -> crate::datastore::Resource {
+    ) -> klights_cluster_core::Resource {
         db.create_resource(
             "v1",
             "Node",
