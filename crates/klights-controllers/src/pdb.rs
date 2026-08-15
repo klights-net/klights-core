@@ -275,6 +275,28 @@ pub async fn reconcile_pdbs_for_namespace_checked<
     Ok(())
 }
 
+/// Preserve eviction admission's required ordering: refresh every PDB in the
+/// Pod namespace before evaluating and, for a live request, reserving its
+/// disruption. The ordering is controller policy, so concrete composition
+/// adapters delegate this operation as one bounded call.
+pub async fn reconcile_and_admit_pod_eviction_at<
+    Store: PdbStore + ?Sized,
+    Pods: PodQuery + ?Sized,
+>(
+    store: &Store,
+    pod_reader: &Pods,
+    pod: &Resource,
+    dry_run: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PodEvictionAdmissionOutcome> {
+    let namespace = pod
+        .namespace
+        .as_deref()
+        .context("stored Pod is missing metadata.namespace")?;
+    reconcile_pdbs_for_namespace_checked(store, pod_reader, namespace, now).await?;
+    admit_pod_eviction_at(store, pod, dry_run, now).await
+}
+
 pub async fn admit_pod_eviction_at<Store: PdbStore + ?Sized>(
     store: &Store,
     pod: &Resource,

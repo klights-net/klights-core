@@ -1129,6 +1129,46 @@ async fn eviction_admission_atomically_records_live_disruption_but_not_dry_run()
 }
 
 #[tokio::test]
+async fn combined_eviction_admission_reconciles_namespace_before_reserving_disruption() {
+    let db = MemoryPdbRuntime::default();
+    create_pdb(
+        &db,
+        "combined-admission-pdb",
+        "default",
+        json!({
+            "minAvailable": 0,
+            "selector": {"matchLabels": {"app": "combined-admission"}}
+        }),
+    )
+    .await;
+    create_pod(
+        &db,
+        "victim",
+        "default",
+        json!({"app": "combined-admission"}),
+        "Running",
+        true,
+    )
+    .await;
+    let pod = db
+        .get_resource("v1", "Pod", Some("default"), "victim")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        reconcile_and_admit_pod_eviction_at(&db, &db, &pod, false, chrono::Utc::now())
+            .await
+            .unwrap(),
+        PodEvictionAdmissionOutcome::Allowed,
+        "the controller-owned combined operation must reconcile current PDB status before live admission"
+    );
+    let status = get_pdb_status(&db, "default", "combined-admission-pdb").await;
+    assert_eq!(status["disruptionsAllowed"], 0);
+    assert!(status.pointer("/disruptedPods/victim").is_some());
+}
+
+#[tokio::test]
 async fn unhealthy_pod_policy_allows_only_spec_permitted_budget_safe_evictions() {
     for (name, policy, healthy_count, expected) in [
         ("if-healthy", None, 2, true),

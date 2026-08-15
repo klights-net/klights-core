@@ -435,23 +435,12 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
         request: PodEvictionAdmissionRequest,
     ) -> PodEvictionAdmissionFuture<'_> {
         Box::pin(async move {
-            let now = chrono::Utc::now();
-            let namespace = request.pod.namespace.as_deref().ok_or_else(|| {
-                ReconcileSinkError::unavailable("stored Pod is missing metadata.namespace")
-            })?;
-            klights_controllers::pdb::reconcile_pdbs_for_namespace_checked(
+            klights_controllers::pdb::reconcile_and_admit_pod_eviction_at(
                 self.controller_store.as_ref(),
                 self.pod_reader.as_ref(),
-                namespace,
-                now,
-            )
-            .await
-            .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
-            klights_controllers::pdb::admit_pod_eviction_at(
-                self.controller_store.as_ref(),
                 &request.pod,
                 request.dry_run,
-                now,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
