@@ -229,7 +229,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::datastore::DatastoreBackend;
     use klights_cluster_store::ClusterResourceMutation;
 
     #[derive(Default)]
@@ -299,7 +298,7 @@ mod tests {
         assert!(!progress.has_changed().unwrap());
     }
 
-    async fn assert_success_only(store: &dyn DatastoreBackend, sink: &RecordingSink) {
+    async fn assert_success_only(store: &dyn ClusterResourceMutation, sink: &RecordingSink) {
         store
             .create_resource("v1", "ConfigMap", Some("default"), "observed", config_map())
             .await
@@ -360,7 +359,7 @@ mod tests {
     async fn redb_emits_commit_observations_only_after_successful_commit() {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         let sink = Arc::new(RecordingSink::default());
-        let store = crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor_and_sink(
+        let store = klights_cluster_datastore::redb::embedded::RedbDatastore::new_in_memory_with_supervisor_and_sink(
             supervisor,
             sink.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
@@ -368,5 +367,15 @@ mod tests {
         .await
         .unwrap();
         assert_success_only(&store, sink.as_ref()).await;
+    }
+
+    #[test]
+    fn redb_commit_observation_fixture_uses_the_canonical_store() {
+        let source = include_str!("watch_commit_wiring.rs");
+        let legacy_wrapper = ["crate::datastore::", "redb::RedbDatastore"].concat();
+        assert!(
+            !source.contains(&legacy_wrapper),
+            "the root Redb wrapper must not compose commit-observation fixtures"
+        );
     }
 }

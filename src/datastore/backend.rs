@@ -1630,6 +1630,7 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     }
 }
 
+#[cfg(test)]
 pub(crate) fn root_cluster_store_error(
     error: anyhow::Error,
 ) -> klights_cluster_store::ClusterStoreError {

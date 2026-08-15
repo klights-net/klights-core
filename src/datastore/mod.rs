@@ -6,7 +6,6 @@
 //! with the same internal shape.
 
 pub mod backend;
-pub mod redb;
 
 #[cfg(test)]
 pub use backend::CommitObservationSink;
