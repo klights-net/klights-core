@@ -140,7 +140,7 @@ async fn remote_client_and_leader_db_with_node_names(
                 &concrete_db,
             );
     let db: SqliteTestStore = Arc::new(concrete_db.clone());
-    crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(db.as_ref())
+    crate::bootstrap::composition_tests::cluster_meta::ensure_cluster_metadata_sqlite(db.as_ref())
         .await
         .unwrap();
     let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())

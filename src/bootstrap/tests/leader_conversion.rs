@@ -72,7 +72,7 @@ fn test_network_port(
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
+            Arc::new(crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
     )
@@ -86,7 +86,7 @@ fn test_cleanup_port(
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
             crate::bootstrap::composition::cluster_store::selector::sqlite_opened_passive_store(db).pod_cleanup,
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
+            Arc::new(crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(Arc::new(canonical.clone()), Arc::new(canonical.clone()), canonical.focused_read_store())),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
     )

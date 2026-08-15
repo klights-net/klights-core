@@ -3,8 +3,8 @@
 //!
 //! `pod_network` and `sandbox` table access is intentionally NOT routed
 //! through this hub — those are network-runtime / GC concerns owned by
-//! `src/networking/cni.rs`, `crates/klights-kubelet/src/sandbox_gc.rs`, `src/shutdown.rs`,
-//! `src/kubelet/pod_sandbox.rs`, and `src/datastore/sqlite/crud/sandbox_network.rs`.
+//! `crates/klights-networking`, kubelet sandbox GC/runtime ownership, and the
+//! root shutdown composition.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -90,10 +90,7 @@ impl PodStore {
         self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
     }
 
-    /// Borrow the underlying datastore handle. Reserved for the limited
-    /// set of repository services that legitimately need a non-Pod DB
-    /// surface (see `mod.rs` doc comment). Outside `pod_repository/`,
-    /// callers must always go through the typed methods.
+    /// Read one Pod through the focused repository persistence port.
     pub async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
         self.reads
             .get_persisted_pod(PodRepositoryGetRequest {

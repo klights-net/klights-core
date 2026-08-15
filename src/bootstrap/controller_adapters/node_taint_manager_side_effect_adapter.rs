@@ -232,7 +232,7 @@ mod tests {
         let resource_commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 Arc::new(
-                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                    crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                         Arc::new(canonical.clone()),
                         Arc::new(canonical.clone()),
                         canonical.focused_read_store(),

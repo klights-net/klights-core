@@ -100,7 +100,7 @@ mod tests {
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
             db.focused_read_store(),
             {
-                std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(std::sync::Arc::new(canonical.clone()), std::sync::Arc::new(canonical.clone()), canonical.focused_read_store()))
+                std::sync::Arc::new(crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(std::sync::Arc::new(canonical.clone()), std::sync::Arc::new(canonical.clone()), canonical.focused_read_store()))
             },
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         )

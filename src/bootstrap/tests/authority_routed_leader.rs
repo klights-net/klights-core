@@ -1249,11 +1249,11 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
             crate::paths::service_account_signing_key_path("klights"),
             crate::bootstrap::composition::authority::AuthorityHandle::from(rx.clone())
                 .authority_arc(),
-            crate::bootstrap::file_blocking::test_file_process_executor(),
+            klights_supervisor::test_support::file_process_executor(),
         ),
     );
     let proposal = Arc::new(
-        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+        crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
             Arc::new(canonical.clone()),
             Arc::new(canonical.clone()),
             canonical.focused_read_store(),

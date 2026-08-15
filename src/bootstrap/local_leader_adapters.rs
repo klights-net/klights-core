@@ -179,88 +179,6 @@ fn node_lifecycle_status_command_error(error: ResourceCommandError) -> NodeLifec
     }
 }
 
-#[cfg(test)]
-pub(crate) type ProjectedTokenAsyncBoundary = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-#[derive(Clone)]
-struct ProjectedTokenIssueTestProbe {
-    async_boundary: ProjectedTokenAsyncBoundary,
-    sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) struct ProjectedTokenIssueTestRegistration {
-    namespace: String,
-    sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[cfg(test)]
-impl ProjectedTokenIssueTestRegistration {
-    #[allow(dead_code)]
-    pub(crate) fn sign_attempts(&self) -> usize {
-        self.sign_attempts
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-impl Drop for ProjectedTokenIssueTestRegistration {
-    fn drop(&mut self) {
-        projected_token_issue_test_probes()
-            .lock()
-            .expect("projected-token test probe lock")
-            .remove(&self.namespace);
-    }
-}
-
-#[cfg(test)]
-fn projected_token_issue_test_probes()
--> &'static std::sync::Mutex<std::collections::HashMap<String, ProjectedTokenIssueTestProbe>> {
-    static PROBES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, ProjectedTokenIssueTestProbe>>,
-    > = std::sync::OnceLock::new();
-    PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn install_projected_token_issue_test_probe(
-    namespace: String,
-    async_boundary: ProjectedTokenAsyncBoundary,
-) -> ProjectedTokenIssueTestRegistration {
-    let sign_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let replaced = projected_token_issue_test_probes()
-        .lock()
-        .expect("projected-token test probe lock")
-        .insert(
-            namespace.clone(),
-            ProjectedTokenIssueTestProbe {
-                async_boundary,
-                sign_attempts: sign_attempts.clone(),
-            },
-        );
-    assert!(replaced.is_none(), "projected-token test namespace reused");
-    ProjectedTokenIssueTestRegistration {
-        namespace,
-        sign_attempts,
-    }
-}
-
-#[cfg(test)]
-fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIssueTestProbe> {
-    projected_token_issue_test_probes()
-        .lock()
-        .expect("projected-token test probe lock")
-        .get(namespace)
-        .cloned()
-}
-
 /// Leadership and signing-fence checks shared by both token entry points.
 pub(crate) struct LeadershipGenerationFence {
     authority: AuthorityHandle,
@@ -295,25 +213,6 @@ impl LeadershipGenerationFence {
         self.authority
             .validate(&self.permit)
             .map_err(|_| ProjectedServiceAccountTokenError::NotLeader)
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn sign_if_unchanged<T>(
-        &self,
-        sign: impl FnOnce() -> T,
-    ) -> Result<T, ProjectedServiceAccountTokenError> {
-        #[cfg(test)]
-        let legacy_watch = self.authority.legacy_watch_for_test();
-        #[cfg(test)]
-        let _legacy_current = legacy_watch.as_ref().map(|receiver| receiver.borrow());
-        #[cfg(test)]
-        let _authority_read = self
-            .signing_fence
-            .as_ref()
-            .map(klights_replication::authority::AuthoritySigningFence::blocking_read);
-        self.ensure_unchanged()?;
-        Ok(sign())
     }
 }
 
@@ -367,10 +266,6 @@ impl LocalProjectedToken {
         Box::pin(async move {
             let leadership = LeadershipGenerationFence::sample(self.authority.clone())?
                 .with_signing_fence(self.signing_fence.clone());
-            #[cfg(test)]
-            if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
-                (probe.async_boundary)().await;
-            }
             let signing_key_pem = klights_cluster_datastore::signing_key_state::read_with_executor(
                 &self.signing_key_path,
                 &self.file_process,
@@ -393,12 +288,6 @@ impl LocalProjectedToken {
                 .await;
             leadership.ensure_unchanged()?;
             let claims = claims?;
-            #[cfg(test)]
-            if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
-                probe
-                    .sign_attempts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             let crypto: &klights_supervisor::CryptoExecutor = &self.crypto;
             leadership.ensure_unchanged()?;
             let signing_fence = leadership.signing_fence.clone();

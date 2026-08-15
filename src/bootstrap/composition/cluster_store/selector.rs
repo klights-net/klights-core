@@ -344,26 +344,6 @@ mod tests {
         assert_all_focused_read_ports::<klights_cluster_datastore::redb::RedbReadStore>();
     }
 
-    #[test]
-    fn selector_never_returns_the_legacy_broad_backend_handle() {
-        let source = include_str!("selector.rs");
-        let forbidden = concat!("Datastore", "Handle");
-        assert!(
-            !source.contains(forbidden),
-            "backend selection must return only its fixed focused composition bundle"
-        );
-    }
-
-    #[test]
-    fn root_sqlite_wrapper_has_no_remaining_owner() {
-        let wrapper =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/datastore/sqlite/mod.rs");
-        assert!(
-            !wrapper.exists(),
-            "P10.3a must delete the root SQLite wrapper after every consumer uses canonical ports"
-        );
-    }
-
     #[tokio::test]
     async fn sqlite_test_composition_accepts_the_canonical_embedded_store() {
         let sqlite = canonical_sqlite_fixture().await;

@@ -662,7 +662,7 @@ mod tests {
                 .await
                 .unwrap();
         let db = std::sync::Arc::new(sqlite.clone());
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(&sqlite)
+        crate::bootstrap::composition_tests::cluster_meta::ensure_cluster_metadata_sqlite(&sqlite)
             .await
             .unwrap();
         let bootstrap_store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(

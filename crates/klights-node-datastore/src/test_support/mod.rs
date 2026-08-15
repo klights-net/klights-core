@@ -1,10 +1,8 @@
 //! Focused SQLite fixtures for cross-crate node-delivery tests.
 
-mod legacy_delivery;
 mod runtime_work;
 mod types;
 
-pub use legacy_delivery::LegacyDeliveryTestStore;
 pub use runtime_work::RuntimeWorkTestStore;
 pub use types::{
     DeadLetterRow, DeadLetterTestInsert, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint,
@@ -171,13 +169,5 @@ impl NodeDeliveryTestStore {
             })
             .await
             .map_err(anyhow::Error::from)
-    }
-}
-
-impl std::ops::Deref for NodeDeliveryTestStore {
-    type Target = crate::delivery::SqliteDeliveryStore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.delivery
     }
 }

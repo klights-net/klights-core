@@ -762,7 +762,7 @@ pub(crate) fn new_root_parts_from_test_ports(
     let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
             Arc::new(
-                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                     applied_outbox,
                     canonical,
                     resource_reads,
@@ -792,7 +792,7 @@ pub(crate) fn new_store_from_test_ports(
     let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
             Arc::new(
-                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                     applied_outbox,
                     canonical,
                     resource_reads,

@@ -561,8 +561,8 @@ impl PodStatusService {
     ///   `update_pod_status` which always reads-then-writes against the
     ///   read's RV.
     ///
-    /// LEGACY no-UID variant. Kept for test scaffolding only — production
-    /// must use `set_pod_status_for_uid`.
+    /// Name-scoped entry point for callers whose live Pod identity is already
+    /// established. Actor-owned lifecycle writes use `set_pod_status_for_uid`.
     pub async fn set_pod_status(
         &self,
         ns: &str,
@@ -1724,8 +1724,8 @@ impl PodStatusService {
     /// Mark a pod Failed because its `activeDeadlineSeconds` elapsed.
     /// Sets `phase=Failed`, `reason=DeadlineExceeded`, the supplied
     /// message, and replaces conditions with
-    /// `[Ready=False/PodFailed, ContainersReady=False/PodFailed]` (matching
-    /// today's behavior at `src/kubelet/pod_manager.rs:685-718`). Every
+    /// `[Ready=False/PodFailed, ContainersReady=False/PodFailed]`, matching
+    /// the kubelet pod-lifecycle deadline policy. Every
     /// other status field — `podIP`, `podIPs`, `hostIP`, `hostIPs`,
     /// `containerStatuses`, `qosClass` — is preserved.
     pub async fn set_deadline_exceeded(

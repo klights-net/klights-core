@@ -22,5 +22,8 @@ pub use task::{
     TaskJoinError, TaskOutcome, TaskOutcomeStatus,
 };
 
+#[doc(hidden)]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests;

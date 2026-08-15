@@ -11,8 +11,6 @@ use tokio::sync::watch;
 #[derive(Clone)]
 pub(crate) struct AuthorityHandle {
     authority: Arc<dyn klights_leader_api::LeaderAuthority>,
-    #[cfg(test)]
-    legacy_watch: Option<watch::Receiver<bool>>,
 }
 
 impl AuthorityHandle {
@@ -61,19 +59,13 @@ where
     fn from(authority: Arc<T>) -> Self {
         Self {
             authority: authority as Arc<dyn klights_leader_api::LeaderAuthority>,
-            #[cfg(test)]
-            legacy_watch: None,
         }
     }
 }
 
 impl From<Arc<dyn klights_leader_api::LeaderAuthority>> for AuthorityHandle {
     fn from(authority: Arc<dyn klights_leader_api::LeaderAuthority>) -> Self {
-        Self {
-            authority,
-            #[cfg(test)]
-            legacy_watch: None,
-        }
+        Self { authority }
     }
 }
 
@@ -87,18 +79,7 @@ impl From<AuthorityHandle> for Arc<dyn klights_leader_api::LeaderAuthority> {
 impl From<watch::Receiver<bool>> for AuthorityHandle {
     fn from(receiver: watch::Receiver<bool>) -> Self {
         let authority = Arc::new(WatchReceiverAuthority::new(receiver.clone()));
-        Self {
-            authority,
-            #[cfg(test)]
-            legacy_watch: Some(receiver),
-        }
-    }
-}
-
-#[cfg(test)]
-impl AuthorityHandle {
-    pub(crate) fn legacy_watch_for_test(&self) -> Option<watch::Receiver<bool>> {
-        self.legacy_watch.clone()
+        Self { authority }
     }
 }
 

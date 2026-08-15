@@ -399,11 +399,12 @@ pub(crate) mod support {
                 && *observed_resource_version > 0
         );
         use klights_replication::proposal::RaftProposal as _;
-        let proposal = crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-            Arc::new(canonical.clone()),
-            Arc::new(canonical.clone()),
-            canonical.focused_read_store(),
-        );
+        let proposal =
+            crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
+                Arc::new(canonical.clone()),
+                Arc::new(canonical.clone()),
+                canonical.focused_read_store(),
+            );
         let applied = proposal
             .propose_outbox_command_effect(
                 row.idempotency_key(),
@@ -1549,7 +1550,7 @@ pub(crate) mod support {
             let commands = Arc::new(
                 klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                     Arc::new(
-                        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                        crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                             Arc::new(canonical.clone()),
                             Arc::new(canonical.clone()),
                             canonical.focused_read_store(),

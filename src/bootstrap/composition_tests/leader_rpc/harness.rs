@@ -175,7 +175,7 @@ impl IntegrationLeaderRpcComposition {
     pub async fn ensure_cluster_metadata_for(
         db: &klights_cluster_datastore::sqlite::embedded::Datastore,
     ) -> anyhow::Result<()> {
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(db).await
+        crate::bootstrap::composition_tests::cluster_meta::ensure_cluster_metadata_sqlite(db).await
     }
 
     pub async fn ensure_worker_bootstrap_token_for(
@@ -332,7 +332,7 @@ impl IntegrationLeaderRpcComposition {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+            crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                 self.applied_outbox.clone(),
                 self.db.clone(),
                 self.resource_reads.clone(),
@@ -628,7 +628,7 @@ impl IntegrationLeaderRpcComposition {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+            crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                 self.applied_outbox.clone(),
                 self.db.clone(),
                 self.resource_reads.clone(),

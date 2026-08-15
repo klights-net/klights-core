@@ -476,7 +476,7 @@ pub(crate) mod support {
                     list_cursor_clock,
                 );
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                     Arc::new(canonical.clone()),
                     Arc::new(canonical.clone()),
                     canonical.focused_read_store(),
@@ -1053,8 +1053,10 @@ pub(crate) mod support {
         }
 
         pub(crate) async fn ensure_operational_cluster_metadata(&self) -> anyhow::Result<()> {
-            crate::bootstrap::cluster_meta::ensure_cluster_metadata_sqlite(self.datastore.as_ref())
-                .await?;
+            crate::bootstrap::composition_tests::cluster_meta::ensure_cluster_metadata_sqlite(
+                self.datastore.as_ref(),
+            )
+            .await?;
             Ok(())
         }
 

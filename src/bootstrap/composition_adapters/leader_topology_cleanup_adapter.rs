@@ -296,7 +296,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct RecordingApplyingProposal {
-        inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture,
+        inner: crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture,
         commands: Mutex<Vec<StorageCommand>>,
     }
 
@@ -338,7 +338,7 @@ mod tests {
             .unwrap();
         let canonical = db.clone();
         let proposal = Arc::new(RecordingApplyingProposal {
-            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+            inner: crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                 Arc::new(canonical.clone()),
                 Arc::new(canonical.clone()),
                 canonical.focused_read_store(),

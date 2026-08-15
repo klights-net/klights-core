@@ -56,7 +56,7 @@ impl RootControllerLeaderPort {
         Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 Arc::new(
-                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                    crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
                         applied_outbox,
                         canonical,
                         resource_reads,
@@ -1523,7 +1523,7 @@ fn runtime_dependencies_for_test(
         reconcile: Arc::new(RootControllerReconcilePort::new(non_pod_finalization)),
         network: Arc::new(RootControllerNetworkPort::new(services)),
         effects: Arc::new(RootControllerEffectPort::new(
-            crate::bootstrap::file_blocking::test_file_process_executor(),
+            klights_supervisor::test_support::file_process_executor(),
             crate::KlightsConfig::test_default()
                 .data_root
                 .join("local-path-provisioner"),

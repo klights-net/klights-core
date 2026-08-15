@@ -1,7 +1,6 @@
 pub(crate) mod auth_adapters;
 pub(crate) mod bootstrap_token;
 pub(crate) mod certificate_bootstrap;
-pub mod cluster_meta;
 pub(crate) mod composition;
 pub(crate) mod composition_adapters;
 pub mod config;
@@ -24,8 +23,6 @@ pub(crate) mod node_registration_adapter;
 pub mod node_role;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
-#[cfg(test)]
-pub(crate) mod outbox_apply_adapter;
 pub mod phases;
 pub(crate) mod pod_watch_handler_adapter;
 pub mod runtime;

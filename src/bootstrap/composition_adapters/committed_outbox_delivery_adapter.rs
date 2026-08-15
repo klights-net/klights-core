@@ -232,7 +232,7 @@ pub(crate) fn test_resource_command(
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
     let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+        crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
             applied_outbox,
             canonical,
             resource_reads.clone(),
@@ -262,7 +262,7 @@ pub(crate) fn test_outbox_delivery(
     resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
 ) -> Arc<RootCommittedOutboxDelivery> {
     let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
-        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+        crate::bootstrap::composition_tests::outbox_apply::BackendProposalFixture::new(
             applied_outbox,
             canonical,
             resource_reads.clone(),

@@ -290,7 +290,10 @@ impl IntegrationRaftComposition {
     pub async fn read_cluster_membership(
         &self,
     ) -> anyhow::Result<klights_cluster_core::ClusterMembership> {
-        crate::bootstrap::cluster_meta::read_cluster_membership_sqlite(self.db.as_ref()).await
+        crate::bootstrap::composition_tests::cluster_meta::read_cluster_membership_sqlite(
+            self.db.as_ref(),
+        )
+        .await
     }
 
     pub fn inject_resource_version(

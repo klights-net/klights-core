@@ -186,7 +186,7 @@ mod tests {
                 ports.read_ports.resource_reads(),
             ),
             authority,
-            crate::bootstrap::file_blocking::test_file_process_executor(),
+            klights_supervisor::test_support::file_process_executor(),
             crate::KlightsConfig::test_default()
                 .data_root
                 .join("local-path-provisioner"),

@@ -14,8 +14,8 @@ pub enum TaskCategory {
     /// Networking-owned long-running work (rtnetlink connection drivers,
     /// service-routing coalescer worker, future rootless sidecars).
     /// Distinct from `Background` so operators can tune networking
-    /// concurrency independently and the spawn guard can enforce that
-    /// `src/networking/` only spawns through this category.
+    /// concurrency independently and the execution-boundary guard can enforce
+    /// that the canonical `klights-networking` owner uses this category.
     Network,
     /// Bounded slot for deferred Pod-delete / cascade retry work. Other
     /// retry kinds (namespace termination etc.) run on Background; this
@@ -71,9 +71,9 @@ impl Default for TaskCategoryConfig {
             background: 0,
             file: 3,
             db: 1,
-            // The datastore connection actor already serializes each SQLite
-            // read lane. A second single-permit queue here can starve the
-            // actor handoff during concurrent watch-replay startup bursts.
+            // The supervised SQLite connection already serializes each read
+            // lane. A second single-permit queue here can starve its handoff
+            // during concurrent watch-replay startup bursts.
             db_read: 0,
             timer: 0,
             network: 256,

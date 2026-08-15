@@ -1,13 +1,5 @@
 use anyhow::{Context, Result};
 
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn test_file_process_executor() -> klights_supervisor::FileProcessExecutor {
-    klights_supervisor::FileProcessExecutor::new(std::sync::Arc::new(
-        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default()),
-    ))
-}
-
 /// Narrow seam for process-backed maintenance operations. Production always
 /// uses the app-owned supervisor; tests can inject scripted outputs without
 /// executing a host command.

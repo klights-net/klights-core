@@ -1,0 +1,11 @@
+error[E0432]: unresolved import `klights_node_datastore::test_support::LegacyDeliveryTestStore`
+ --> tests/ui/legacy_delivery_facade.rs:1:5
+  |
+1 | use klights_node_datastore::test_support::LegacyDeliveryTestStore;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `LegacyDeliveryTestStore` in `test_support`
+  |
+help: a similar name exists in the module
+  |
+1 - use klights_node_datastore::test_support::LegacyDeliveryTestStore;
+1 + use klights_node_datastore::test_support::NodeDeliveryTestStore;
+  |

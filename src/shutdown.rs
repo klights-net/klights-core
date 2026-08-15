@@ -602,7 +602,7 @@ mod tests {
         let result = cleanup_volume_root_with_runner(
             &volume_root,
             &runner,
-            &crate::bootstrap::file_blocking::test_file_process_executor(),
+            &klights_supervisor::test_support::file_process_executor(),
         )
         .await;
 
@@ -1021,7 +1021,7 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         let executable = std::env::current_exe().expect("test executable");
         let executable = executable.to_string_lossy();
         let output = run_shutdown_command(
-            &crate::bootstrap::file_blocking::test_file_process_executor(),
+            &klights_supervisor::test_support::file_process_executor(),
             "shutdown_test_process_output",
             &executable,
             &[
