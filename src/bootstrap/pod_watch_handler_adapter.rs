@@ -52,13 +52,10 @@ impl LeaderPersistentVolumeEventHandler {
 #[async_trait::async_trait]
 impl PersistentVolumeEventHandler for LeaderPersistentVolumeEventHandler {
     async fn handle_pvc_event(&self, event: &PodWatchEvent, event_name: &str) {
-        if !*self.is_leader_rx.borrow()
-            || !matches!(
-                event.event_type,
-                klights_leader_api::WatchEventType::Added
-                    | klights_leader_api::WatchEventType::Modified
-            )
-        {
+        if !klights_controllers::pvc::pvc_watch_event_requires_reconcile(
+            *self.is_leader_rx.borrow(),
+            event.event_type,
+        ) {
             return;
         }
         let namespace = event
@@ -80,9 +77,10 @@ impl PersistentVolumeEventHandler for LeaderPersistentVolumeEventHandler {
     }
 
     async fn handle_pv_event(&self, event: &PodWatchEvent, _event_name: &str) {
-        if !*self.is_leader_rx.borrow()
-            || event.event_type != klights_leader_api::WatchEventType::Added
-        {
+        if !klights_controllers::pvc::pv_watch_event_requires_pending_claim_reconcile(
+            *self.is_leader_rx.borrow(),
+            event.event_type,
+        ) {
             return;
         }
         let listing = self
@@ -110,12 +108,7 @@ impl PersistentVolumeEventHandler for LeaderPersistentVolumeEventHandler {
             return;
         };
         for pvc in pvcs {
-            if pvc
-                .data
-                .pointer("/status/phase")
-                .and_then(serde_json::Value::as_str)
-                != Some("Bound")
-            {
+            if klights_controllers::pvc::pvc_needs_reconcile_after_pv_added(&pvc) {
                 let name = pvc.name.clone();
                 self.reconcile_pvc(pvc, &name).await;
             }

@@ -6,6 +6,38 @@ use klights_reconcile_api::ControllerStoreResult;
 use klights_types::LabelSelector;
 use serde_json::{Value, json};
 
+/// Decide whether a PVC watch event should invoke the PVC reconciler.
+///
+/// The root watch adapter supplies the current process authority state; the
+/// controller owns which Kubernetes events are reconciliation triggers.
+pub fn pvc_watch_event_requires_reconcile(
+    has_local_authority: bool,
+    event_type: klights_leader_api::WatchEventType,
+) -> bool {
+    has_local_authority
+        && matches!(
+            event_type,
+            klights_leader_api::WatchEventType::Added
+                | klights_leader_api::WatchEventType::Modified
+        )
+}
+
+/// Decide whether an added PV should trigger a scan of unbound PVCs.
+pub fn pv_watch_event_requires_pending_claim_reconcile(
+    has_local_authority: bool,
+    event_type: klights_leader_api::WatchEventType,
+) -> bool {
+    has_local_authority && event_type == klights_leader_api::WatchEventType::Added
+}
+
+/// Return whether a PVC from the added-PV scan still needs reconciliation.
+pub fn pvc_needs_reconcile_after_pv_added(pvc: &klights_cluster_core::Resource) -> bool {
+    pvc.data
+        .pointer("/status/phase")
+        .and_then(serde_json::Value::as_str)
+        != Some("Bound")
+}
+
 /// Inject resourceVersion into resource metadata
 fn inject_resource_version(data: &mut Value, rv: i64) {
     if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) {

@@ -12,6 +12,68 @@ use serde_json::{Value, json};
 use super::PvcStore;
 use crate::common::ControllerStatusStore;
 
+#[test]
+fn persistent_volume_watch_policy_is_leader_scoped_and_event_specific() {
+    use klights_leader_api::WatchEventType;
+
+    for (event_type, pvc_expected, pv_expected) in [
+        (WatchEventType::Added, true, true),
+        (WatchEventType::Modified, true, false),
+        (WatchEventType::Deleted, false, false),
+        (WatchEventType::Bookmark, false, false),
+        (WatchEventType::Error, false, false),
+    ] {
+        assert_eq!(
+            super::pvc_watch_event_requires_reconcile(true, event_type),
+            pvc_expected,
+            "PVC event {event_type:?}"
+        );
+        assert_eq!(
+            super::pv_watch_event_requires_pending_claim_reconcile(true, event_type),
+            pv_expected,
+            "PV event {event_type:?}"
+        );
+        assert!(!super::pvc_watch_event_requires_reconcile(
+            false, event_type
+        ));
+        assert!(!super::pv_watch_event_requires_pending_claim_reconcile(
+            false, event_type
+        ));
+    }
+}
+
+#[test]
+fn added_pv_reconcile_policy_selects_only_unbound_claims() {
+    for (phase, expected) in [
+        (None, true),
+        (Some("Pending"), true),
+        (Some("Bound"), false),
+        (Some("Lost"), true),
+    ] {
+        let status = phase
+            .map(|phase| json!({"phase": phase}))
+            .unwrap_or_else(|| json!({}));
+        let claim = Resource::try_from_data(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "namespace": "default",
+                "name": "claim",
+                "uid": "claim-uid",
+                "resourceVersion": "1"
+            },
+            "status": status
+        })))
+        .expect("claim fixture");
+
+        assert_eq!(
+            super::pvc_needs_reconcile_after_pv_added(&claim),
+            expected,
+            "phase {phase:?}"
+        );
+    }
+}
+
 type ResourceKey = (String, String, Option<String>, String);
 
 static NEXT_DATA_ROOT: AtomicU64 = AtomicU64::new(0);
