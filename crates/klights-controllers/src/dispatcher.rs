@@ -29,6 +29,10 @@ pub struct ControllerDispatcher {
 }
 
 impl ControllerDispatcher {
+    /// Default event-driven concurrency for the controller reconciliation
+    /// workqueue. Bootstrap selects the process lifetime only.
+    pub const DEFAULT_WORKQUEUE_WORKERS: usize = 8;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_complete(
         service_ipam: Arc<crate::service::ServiceIpam>,
@@ -394,5 +398,10 @@ mod tests {
             .to_string(),
             "apps/v1/Deployment default/web"
         );
+    }
+
+    #[test]
+    fn default_worker_pool_concurrency_is_controller_owned() {
+        assert_eq!(ControllerDispatcher::DEFAULT_WORKQUEUE_WORKERS, 8);
     }
 }

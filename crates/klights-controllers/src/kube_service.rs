@@ -79,6 +79,25 @@ pub async fn bootstrap_default_service_cidr<S: KubernetesBootstrapStore + ?Sized
     Ok(())
 }
 
+/// Reconcile the API ServiceCIDR and `kubernetes` Service after a controller
+/// lease has been acquired. Lease validation stays adjacent to the controller
+/// mutations so every caller gets the same authority fence.
+pub async fn bootstrap_leader_kubernetes_service<S: KubernetesBootstrapStore + ?Sized>(
+    store: &S,
+    service_cidr: &str,
+    tls_port: u16,
+    datapath: &dyn klights_network_api::Datapath,
+) -> Result<()> {
+    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+        anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
+    })?;
+    bootstrap_default_service_cidr(store, service_cidr).await?;
+    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+        anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
+    })?;
+    bootstrap_kubernetes_service(store, service_cidr, tls_port, datapath).await
+}
+
 /// Bootstrap kubernetes Service and Endpoints on startup.
 /// Creates the "kubernetes" service with ClusterIP derived from service_cidr,
 /// and Endpoints pointing to the API listener host IP for in-pod API access.
@@ -577,6 +596,50 @@ mod tests {
         assert_eq!(
             store.count("networking.k8s.io/v1", "ServiceCIDR", "kubernetes"),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_bootstrap_reconciles_service_cidr_and_gateway_on_leader_change() {
+        let store = MemoryBootstrapStore::default();
+        let first = FixedDatapath {
+            host_ip: Ipv4Addr::new(192, 0, 2, 10).into(),
+            pod_gateway_ip: Ipv4Addr::new(10, 50, 0, 1).into(),
+        };
+        let second = FixedDatapath {
+            host_ip: Ipv4Addr::new(192, 0, 2, 11).into(),
+            pod_gateway_ip: Ipv4Addr::new(10, 50, 4, 1).into(),
+        };
+
+        super::bootstrap_leader_kubernetes_service(&store, "10.51.0.0/24", 7679, &first)
+            .await
+            .expect("first leader bootstrap");
+        super::bootstrap_leader_kubernetes_service(&store, "10.51.0.0/24", 7679, &second)
+            .await
+            .expect("new leader bootstrap");
+
+        let service_cidr = store
+            .resource("networking.k8s.io/v1", "ServiceCIDR", None, "kubernetes")
+            .expect("ServiceCIDR");
+        assert_eq!(service_cidr.data["spec"]["cidrs"][0], "10.51.0.0/24");
+        let endpoints = store
+            .resource("v1", "Endpoints", Some("default"), "kubernetes")
+            .expect("Endpoints");
+        assert_eq!(
+            endpoints.data["subsets"][0]["addresses"][0]["ip"],
+            "10.50.4.1"
+        );
+        let endpoint_slice = store
+            .resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some("default"),
+                "kubernetes",
+            )
+            .expect("EndpointSlice");
+        assert_eq!(
+            endpoint_slice.data["endpoints"][0]["addresses"][0],
+            "10.50.4.1"
         );
     }
 }

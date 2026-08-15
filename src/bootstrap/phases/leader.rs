@@ -14,8 +14,6 @@ use klights_leader_api::{ControllerCoordination, ControllerScope};
 use klights_supervisor::TaskSupervisor;
 use tokio_util::sync::CancellationToken;
 
-const CONTROLLER_WORKQUEUE_WORKERS: usize = 8;
-
 pub struct LeaderStart<'a> {
     pub config: &'a Arc<KlightsConfig>,
     /// T2 step 2: runtime leader lease instead of a compile-time bool.
@@ -148,86 +146,6 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-    use klights_networking::test_support::MockNetworkProvider;
-    use serde_json::Value;
-    use std::net::Ipv4Addr;
-
-    fn endpoint_address(resource: &Value) -> &str {
-        resource["subsets"][0]["addresses"][0]["ip"]
-            .as_str()
-            .expect("endpoint address should be a string")
-    }
-
-    fn endpointslice_address(resource: &Value) -> &str {
-        resource["endpoints"][0]["addresses"][0]
-            .as_str()
-            .expect("endpointslice address should be a string")
-    }
-
-    #[tokio::test]
-    async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
-        let db = crate::bootstrap::cluster_store::selector::canonical_sqlite_fixture()
-            .await
-            .unwrap();
-        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
-        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
-            ports.applied_outbox.clone(), std::sync::Arc::new(db.clone()), ports.read_ports.resource_reads(),
-        );
-        let bootstrap_store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-            ports.read_ports.resource_reads(), ports.topology_reads, commands,
-        );
-        klights_controllers::namespace::init_default_namespaces_with_ca_path(
-            &crate::bootstrap::file_blocking::test_file_process_executor(),
-            &bootstrap_store,
-            &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
-            chrono::DateTime::UNIX_EPOCH,
-            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
-        )
-        .await
-        .expect("default namespaces");
-        let mut config = KlightsConfig::test_default();
-        config.service_cidr = "10.51.0.0/24".to_string();
-        config.tls_port = 7679;
-
-        let first_leader_datapath = MockNetworkProvider::new();
-        first_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 0, 1));
-        reconcile_kubernetes_service_for_leader(&config, &bootstrap_store, &first_leader_datapath)
-            .await
-            .expect("first leader should seed kubernetes service endpoints");
-
-        let next_leader_datapath = MockNetworkProvider::new();
-        next_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 4, 1));
-        reconcile_kubernetes_service_for_leader(&config, &bootstrap_store, &next_leader_datapath)
-            .await
-            .expect("new leader should reconcile kubernetes service endpoints");
-
-        let endpoints = db
-            .get_resource("v1", "Endpoints", Some("default"), "kubernetes")
-            .await
-            .expect("get endpoints")
-            .expect("kubernetes endpoints should exist")
-            .data;
-        assert_eq!(endpoint_address(&endpoints), "10.50.4.1");
-
-        let endpointslice = db
-            .get_resource(
-                "discovery.k8s.io/v1",
-                "EndpointSlice",
-                Some("default"),
-                "kubernetes",
-            )
-            .await
-            .expect("get endpointslice")
-            .expect("kubernetes endpointslice should exist")
-            .data;
-        assert_eq!(endpointslice_address(&endpointslice), "10.50.4.1");
-    }
-}
-
 async fn start_leader_scoped_tasks(
     context: LeaderScopedTaskContext,
     coordination: Arc<dyn ControllerCoordination>,
@@ -255,9 +173,10 @@ async fn start_leader_scoped_tasks(
 
     tracing::info!("Acquired leader lease");
 
-    reconcile_kubernetes_service_for_leader(
-        config.as_ref(),
+    klights_controllers::kube_service::bootstrap_leader_kubernetes_service(
         leader_bootstrap_store.as_ref(),
+        &config.service_cidr,
+        config.tls_port,
         datapath.as_ref(),
     )
     .await
@@ -303,7 +222,11 @@ async fn start_leader_scoped_tasks(
                 worker_coordination,
                 worker_lease,
                 async move {
-                    d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, c).await;
+                    d.run_worker_pool(
+                        klights_controllers::ControllerDispatcher::DEFAULT_WORKQUEUE_WORKERS,
+                        c,
+                    )
+                    .await;
                 },
             ),
         )
@@ -312,7 +235,7 @@ async fn start_leader_scoped_tasks(
         tracing::warn!("Failed to spawn workqueue worker: {}", e);
     }
     tracing::info!(
-        workers = CONTROLLER_WORKQUEUE_WORKERS,
+        workers = klights_controllers::ControllerDispatcher::DEFAULT_WORKQUEUE_WORKERS,
         "Controller workqueue worker pool started"
     );
 
@@ -387,28 +310,4 @@ async fn start_leader_scoped_tasks(
     }
 
     Ok(())
-}
-
-async fn reconcile_kubernetes_service_for_leader<
-    S: klights_controllers::kube_service::KubernetesBootstrapStore + ?Sized,
->(
-    config: &KlightsConfig,
-    store: &S,
-    datapath: &dyn klights_network_api::Datapath,
-) -> Result<()> {
-    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
-        anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
-    })?;
-    klights_controllers::kube_service::bootstrap_default_service_cidr(store, &config.service_cidr)
-        .await?;
-    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
-        anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
-    })?;
-    klights_controllers::kube_service::bootstrap_kubernetes_service(
-        store,
-        &config.service_cidr,
-        config.tls_port,
-        datapath,
-    )
-    .await
 }

@@ -20,6 +20,13 @@ use crate::types::{RaftMemberLogId, RaftMemberNode, StorageCommandPayload, TypeC
 
 const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
 
+/// Return the supervised retry delay for a rejected or unavailable
+/// control-plane membership join. The caller owns the timer and cancellation;
+/// this membership policy only determines the bounded delay.
+pub fn controlplane_join_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(attempt.saturating_mul(5).min(60)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct RaftMemberAdmission {
     storage_incarnation: String,
@@ -824,5 +831,32 @@ mod tests {
             Some(&truncated_boundary),
             Some(&admitted),
         ));
+    }
+
+    #[test]
+    fn controlplane_join_retry_delay_is_linear_and_capped() {
+        let cases = [
+            (1, 5),
+            (2, 10),
+            (3, 15),
+            (4, 20),
+            (5, 25),
+            (6, 30),
+            (7, 35),
+            (8, 40),
+            (9, 45),
+            (10, 50),
+            (11, 55),
+            (12, 60),
+            (13, 60),
+        ];
+
+        for (attempt, expected_secs) in cases {
+            assert_eq!(
+                controlplane_join_retry_delay(attempt),
+                std::time::Duration::from_secs(expected_secs),
+                "attempt {attempt} should back off for {expected_secs}s"
+            );
+        }
     }
 }

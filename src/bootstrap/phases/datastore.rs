@@ -1006,7 +1006,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                 // Supervised timer backoff: timeout against a
                                 // never-resolving future parks this task until
                                 // the Tokio timer fires; it does not poll.
-                                let retry_delay = controlplane_join_retry_delay(attempt);
+                                let retry_delay =
+                                    klights_replication::membership::controlplane_join_retry_delay(
+                                        attempt,
+                                    );
                                 let _ = join_supervisor_for_loop
                                     .timeout(
                                         "controlplane_join_retry_wait",
@@ -1389,11 +1392,6 @@ fn initial_voters_for_role(role: &NodeRole, local_node_name: &str) -> Vec<String
     voters
 }
 
-fn controlplane_join_retry_delay(attempt: u32) -> std::time::Duration {
-    let secs = attempt.saturating_mul(5).min(60);
-    std::time::Duration::from_secs(u64::from(secs))
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ControlplaneJoinClientIdentity {
     client_cert_pem: Option<String>,
@@ -1589,33 +1587,6 @@ mod tests {
         let skip = matches!(&role, NodeRole::Controlplane { leader_endpoints, .. } if !leader_endpoints.is_empty())
             && raft_node_present;
         assert!(!skip, "worker should never skip bootstrap");
-    }
-
-    #[test]
-    fn controlplane_join_retry_delay_increases_linearly_and_caps_at_sixty_seconds() {
-        let cases = [
-            (1, 5),
-            (2, 10),
-            (3, 15),
-            (4, 20),
-            (5, 25),
-            (6, 30),
-            (7, 35),
-            (8, 40),
-            (9, 45),
-            (10, 50),
-            (11, 55),
-            (12, 60),
-            (13, 60),
-        ];
-
-        for (attempt, expected_secs) in cases {
-            assert_eq!(
-                super::controlplane_join_retry_delay(attempt),
-                std::time::Duration::from_secs(expected_secs),
-                "attempt {attempt} should back off for {expected_secs}s"
-            );
-        }
     }
 
     #[tokio::test]
