@@ -1,4 +1,6 @@
 use anyhow::Result;
+use futures::StreamExt as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +19,122 @@ pub trait NodeHeartbeatEventSource: Send + Sync {
 
 pub trait NodeHeartbeatClock: Send + Sync {
     fn now_microtime(&self) -> String;
+}
+
+pub struct SystemNodeHeartbeatClock {
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
+}
+
+impl SystemNodeHeartbeatClock {
+    pub fn new(wall_clock: Arc<dyn klights_supervisor::WallClock>) -> Self {
+        Self { wall_clock }
+    }
+}
+
+impl NodeHeartbeatClock for SystemNodeHeartbeatClock {
+    fn now_microtime(&self) -> String {
+        klights_cluster_core::k8s_time::format_microtime(self.wall_clock.now_utc())
+    }
+}
+
+/// Kubelet-owned positioned Node-watch acceleration source.
+pub struct LeaderNodeHeartbeatEventSource {
+    leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    watch: tokio::sync::Mutex<LeaderNodeHeartbeatWatchState>,
+}
+
+#[derive(Default)]
+struct LeaderNodeHeartbeatWatchState {
+    stream: Option<klights_leader_api::WatchStream>,
+    cursor: Option<klights_leader_api::WatchResumeCursor>,
+}
+
+impl LeaderNodeHeartbeatEventSource {
+    pub fn new(leader_watch: Arc<dyn klights_leader_api::LeaderWatch>) -> Self {
+        Self {
+            leader_watch,
+            watch: tokio::sync::Mutex::new(LeaderNodeHeartbeatWatchState::default()),
+        }
+    }
+}
+
+impl NodeHeartbeatEventSource for LeaderNodeHeartbeatEventSource {
+    fn next_node_event(&self) -> NodeHeartbeatEventFuture<'_> {
+        Box::pin(async move {
+            let mut state = self.watch.lock().await;
+            if state.stream.is_none() {
+                let request = klights_leader_api::WatchRequest::try_new_with_scope(
+                    "v1",
+                    "Node",
+                    None,
+                    klights_leader_api::ResourceListScope::Cluster,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("Node heartbeat watch identity is valid");
+                let request = if let Some(cursor) = state.cursor {
+                    request.with_resume_cursor(cursor)?
+                } else {
+                    request
+                };
+                match self.leader_watch.watch_resources(request).await {
+                    Ok(stream) => {
+                        if let Some(cursor) = stream.accepted_cursor() {
+                            state.cursor = Some(cursor);
+                        }
+                        state.stream = Some(stream);
+                    }
+                    Err(klights_leader_api::LeaderWatchError::ReplayExpired { .. }) => {
+                        state.cursor = None;
+                        return Ok(NodeHeartbeatEvent::ReplayExpired);
+                    }
+                    Err(error) => return Err(anyhow::Error::from(error)),
+                }
+            }
+            let event = state
+                .stream
+                .as_mut()
+                .expect("heartbeat stream initialized")
+                .next()
+                .await;
+            match event {
+                Some(Ok(event)) => {
+                    let cursor = state.cursor.get_or_insert_default();
+                    cursor.advance_after_apply(&event)?;
+                    if matches!(
+                        event.event_type(),
+                        klights_leader_api::WatchEventType::Bookmark
+                            | klights_leader_api::WatchEventType::Deleted
+                    ) || event.resource().kind != "Node"
+                    {
+                        return Ok(NodeHeartbeatEvent::Other);
+                    }
+                    let node_name = event.resource().name.as_str();
+                    if node_name.is_empty() {
+                        return Ok(NodeHeartbeatEvent::Other);
+                    }
+                    Ok(NodeHeartbeatEvent::NodeChanged {
+                        node_name: node_name.to_string(),
+                    })
+                }
+                Some(Err(klights_leader_api::LeaderWatchError::ReplayExpired { .. })) => {
+                    state.stream = None;
+                    state.cursor = None;
+                    Ok(NodeHeartbeatEvent::ReplayExpired)
+                }
+                Some(Err(error)) => {
+                    state.stream = None;
+                    Err(anyhow::Error::from(error))
+                }
+                None => {
+                    state.stream = None;
+                    anyhow::bail!("Node heartbeat positioned watch stream closed")
+                }
+            }
+        })
+    }
 }
 
 // Derived from the canonical node-lease cadence so the renewal timer and the
@@ -200,6 +318,100 @@ async fn renew_lease_with_client(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    struct RecordingLeaderWatch {
+        requests: Mutex<Vec<klights_leader_api::WatchRequest>>,
+        events: Mutex<Option<Vec<klights_leader_api::ResourceEvent>>>,
+    }
+
+    impl RecordingLeaderWatch {
+        fn with_events(events: Vec<klights_leader_api::ResourceEvent>) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                events: Mutex::new(Some(events)),
+            })
+        }
+    }
+
+    impl klights_leader_api::LeaderWatch for RecordingLeaderWatch {
+        fn watch_resources(
+            &self,
+            request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            self.requests
+                .lock()
+                .expect("watch request mutex")
+                .push(request);
+            let events = self
+                .events
+                .lock()
+                .expect("watch event mutex")
+                .take()
+                .expect("heartbeat must establish only one stream");
+            Box::pin(async move {
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::iter(events.into_iter().map(Ok)),
+                ))
+            })
+        }
+    }
+
+    fn node_event(name: &str, resource_version: i64) -> klights_leader_api::ResourceEvent {
+        let resource = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": name,
+                "resourceVersion": resource_version.to_string(),
+            }
+        })))
+        .expect("valid Node resource");
+        klights_leader_api::ResourceEvent::try_new(
+            klights_leader_api::WatchEventType::Modified,
+            resource,
+            None,
+        )
+        .expect("valid Node watch event")
+    }
+
+    #[test]
+    fn leader_node_event_source_and_clock_are_owned_by_kubelet() {
+        fn assert_source(_: &LeaderNodeHeartbeatEventSource) {}
+        fn assert_clock(_: &SystemNodeHeartbeatClock) {}
+        let _ = (assert_source, assert_clock);
+    }
+
+    #[tokio::test]
+    async fn leader_node_event_source_retains_one_positioned_watch_stream() {
+        let leader = RecordingLeaderWatch::with_events(vec![
+            node_event("node-a", 11),
+            node_event("node-b", 12),
+        ]);
+        let source = LeaderNodeHeartbeatEventSource::new(leader.clone());
+
+        assert_eq!(
+            source.next_node_event().await.expect("first Node event"),
+            NodeHeartbeatEvent::NodeChanged {
+                node_name: "node-a".to_string()
+            }
+        );
+        assert_eq!(
+            source.next_node_event().await.expect("second Node event"),
+            NodeHeartbeatEvent::NodeChanged {
+                node_name: "node-b".to_string()
+            }
+        );
+
+        let requests = leader.requests.lock().expect("watch request mutex");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].kind(), "Node");
+        assert_eq!(
+            requests[0].scope(),
+            &klights_leader_api::ResourceListScope::Cluster
+        );
+        assert_eq!(requests[0].start_resource_version(), None);
+        assert_eq!(requests[0].start_watch_replay_position(), None);
+    }
 
     struct FixedClock;
 

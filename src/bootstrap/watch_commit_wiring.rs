@@ -187,18 +187,6 @@ impl klights_leader_api::PostCommitWakeup for ActivePostCommitWakeup {
 }
 
 #[cfg(test)]
-pub(crate) fn publish_test_events(
-    sink: &dyn CommitObservationSink,
-    events: Vec<klights_watch::WatchEvent>,
-) {
-    if let Some(sink) = sink.as_any().downcast_ref::<WatchCommitObservationSink>() {
-        for event in events {
-            sink.bus.publish(event);
-        }
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn subscribe_test_events(
     sink: &dyn CommitObservationSink,
     topic: klights_watch::WatchTopic,
@@ -208,18 +196,6 @@ pub(crate) fn subscribe_test_events(
         .expect("test datastore watch sink")
         .bus
         .subscribe(topic)
-}
-
-#[cfg(test)]
-pub(crate) fn subscribe_test_events_many(
-    sink: &dyn CommitObservationSink,
-    topics: Vec<klights_watch::WatchTopic>,
-) -> klights_watch::WatchReceiver {
-    sink.as_any()
-        .downcast_ref::<WatchCommitObservationSink>()
-        .expect("test datastore watch sink")
-        .bus
-        .subscribe_many(topics)
 }
 
 #[cfg(test)]

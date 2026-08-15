@@ -58,6 +58,76 @@ pub trait PodLogFollowWatchPort: Send + Sync {
     fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_>;
 }
 
+/// Focused kubelet adapter for following Pod changes through the leader watch.
+pub struct LeaderPodLogFollowWatchPort {
+    leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+}
+
+impl LeaderPodLogFollowWatchPort {
+    pub fn new(leader_watch: Arc<dyn klights_leader_api::LeaderWatch>) -> Self {
+        Self { leader_watch }
+    }
+}
+
+impl PodLogFollowWatchPort for LeaderPodLogFollowWatchPort {
+    fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
+        let request = klights_leader_api::WatchRequest::try_new_with_scope(
+            "v1",
+            "Pod",
+            None,
+            klights_leader_api::ResourceListScope::AllNamespaces,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Pod log follow watch identity is valid");
+        self.leader_watch.watch_resources(request)
+    }
+}
+
+#[cfg(test)]
+mod leader_watch_owner_contract_tests {
+    use super::{LeaderPodLogFollowWatchPort, PodLogFollowWatchPort};
+
+    struct RecordingLeaderWatch(std::sync::Mutex<Vec<klights_leader_api::WatchRequest>>);
+
+    impl klights_leader_api::LeaderWatch for RecordingLeaderWatch {
+        fn watch_resources(
+            &self,
+            request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            self.0.lock().expect("watch request mutex").push(request);
+            Box::pin(async {
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::empty(),
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn leader_pod_log_follow_watch_port_is_owned_by_kubelet() {
+        fn assert_port(_: &LeaderPodLogFollowWatchPort) {}
+        let _ = assert_port;
+    }
+
+    #[tokio::test]
+    async fn leader_pod_log_follow_watch_is_all_namespaces() {
+        let leader = std::sync::Arc::new(RecordingLeaderWatch(std::sync::Mutex::new(Vec::new())));
+        let port = LeaderPodLogFollowWatchPort::new(leader.clone());
+        port.open_pod_watch().await.expect("open Pod watch");
+
+        let requests = leader.0.lock().expect("watch request mutex");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].kind(), "Pod");
+        assert_eq!(
+            requests[0].scope(),
+            &klights_leader_api::ResourceListScope::AllNamespaces
+        );
+    }
+}
+
 pub async fn build_pod_log_follow_event_cursor(
     pod_event_store: &PodLogFollowWatchSource,
 ) -> Result<klights_leader_api::WatchStream, klights_leader_api::LeaderWatchError> {

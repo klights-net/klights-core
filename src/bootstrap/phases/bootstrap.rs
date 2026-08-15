@@ -1483,13 +1483,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let watch_source: Arc<dyn klights_kubelet::pod_watch_source::PodWatchSource> =
             if let Some(worker_store) = worker_store_adapter.as_ref() {
                 Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                    klights_kubelet::pod_watch_source::LeaderPodWatchSource::new(
                         worker_store.clone(),
                     ),
                 )
             } else {
                 Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                    klights_kubelet::pod_watch_source::LeaderPodWatchSource::new(
                         leader_watch.clone(),
                     ),
                 )
@@ -1533,7 +1533,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // Heartbeat
     let heartbeat_handle = {
         let watch_source = Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(leader_watch.clone()),
+            klights_kubelet::node_heartbeat::LeaderNodeHeartbeatEventSource::new(
+                leader_watch.clone(),
+            ),
         );
         let cfg = Arc::clone(config);
         let cancel = shutdown_token.clone();
@@ -1548,7 +1550,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         watch_source,
                         lease_client,
                         Arc::new(
-                            crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock::new(
+                            klights_kubelet::node_heartbeat::SystemNodeHeartbeatClock::new(
                                 Arc::new(klights_supervisor::SystemWallClock),
                             ),
                         ),
@@ -1707,7 +1709,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 supervisor.clone(),
                 clock.clone(),
                 klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                    klights_kubelet::node_api::logs::LeaderPodLogFollowWatchPort::new(
                         leader_watch.clone(),
                     ),
                 )),

@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use futures::Stream;
 use klights_cluster_core::WatchReplayPosition;
-use klights_leader_api::{LeaderWatchError, WatchEventType, WatchResumeCursor};
+use klights_leader_api::{
+    LeaderWatch, LeaderWatchError, ResourceListScope, WatchEventType, WatchRequest,
+    WatchResumeCursor,
+};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,10 +240,203 @@ pub trait PodWatchSource: Send + Sync {
     ) -> PodWatchFuture<'_>;
 }
 
+/// Leader-backed positioned watch source for the kubelet Pod manager.
+///
+/// The kubelet owns the exact resource scopes and per-scope recovery policy;
+/// root bootstrap supplies only the concrete leader-watch implementation.
+pub struct LeaderPodWatchSource {
+    leader_watch: Arc<dyn LeaderWatch>,
+}
+
+impl LeaderPodWatchSource {
+    pub fn new(leader_watch: Arc<dyn LeaderWatch>) -> Self {
+        Self { leader_watch }
+    }
+}
+
+impl PodWatchSource for LeaderPodWatchSource {
+    fn open_pod_manager_watch(
+        &self,
+        node_name: String,
+        recovery: PodWatchRecoveryPlan,
+    ) -> PodWatchFuture<'_> {
+        Box::pin(async move {
+            let requests = [
+                (
+                    PodWatchScope::Pod,
+                    WatchRequest::try_new_with_scope(
+                        "v1",
+                        "Pod",
+                        None,
+                        ResourceListScope::AllNamespaces,
+                        None,
+                        Some(format!("spec.nodeName={node_name}")),
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::PersistentVolumeClaim,
+                    WatchRequest::try_new_with_scope(
+                        "v1",
+                        "PersistentVolumeClaim",
+                        None,
+                        ResourceListScope::AllNamespaces,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::PersistentVolume,
+                    WatchRequest::try_new_with_scope(
+                        "v1",
+                        "PersistentVolume",
+                        None,
+                        ResourceListScope::Cluster,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::Secret,
+                    WatchRequest::try_new_with_scope(
+                        "v1",
+                        "Secret",
+                        None,
+                        ResourceListScope::AllNamespaces,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::ConfigMap,
+                    WatchRequest::try_new_with_scope(
+                        "v1",
+                        "ConfigMap",
+                        None,
+                        ResourceListScope::AllNamespaces,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::Namespace,
+                    WatchRequest::try_new_with_scope(
+                        "v1",
+                        "Namespace",
+                        None,
+                        ResourceListScope::Cluster,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+            ];
+            let mut streams = Vec::with_capacity(requests.len());
+            let mut checkpoint = PodWatchCheckpoint::default();
+            for (scope, request) in requests {
+                // A typed replay expiry deliberately omits only that scope's
+                // cursor. The focused LeaderWatch implementation then invokes
+                // its authoritative fresh establishment/relist kernel.
+                let request = if recovery.must_relist(scope) {
+                    request
+                } else if let Some(cursor) = recovery.cursor_for(scope) {
+                    request.with_resume_cursor(cursor)?
+                } else {
+                    request
+                };
+                let stream = self.leader_watch.watch_resources(request).await?;
+                if let Some(cursor) = stream.accepted_cursor() {
+                    checkpoint.accept_open_cursor(scope, cursor);
+                } else if let Some(cursor) = recovery.cursor_for(scope) {
+                    checkpoint.accept_open_cursor(scope, cursor);
+                }
+                streams.push(scope_watch_stream(scope, stream));
+            }
+            Ok(PodWatchSession {
+                stream: Box::pin(futures::stream::select_all(streams)) as PodWatchStream,
+                checkpoint,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod reconnect_contract_tests {
     use super::*;
     use klights_cluster_core::WatchReplayPosition;
+
+    struct RecordingLeaderWatch(std::sync::Mutex<Vec<WatchRequest>>);
+
+    impl LeaderWatch for RecordingLeaderWatch {
+        fn watch_resources(
+            &self,
+            request: WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            self.0.lock().expect("watch request mutex").push(request);
+            Box::pin(async {
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::empty(),
+                ))
+            })
+        }
+    }
+
+    #[test]
+    fn leader_pod_watch_source_is_owned_by_kubelet() {
+        fn assert_source(_: &LeaderPodWatchSource) {}
+        let _ = assert_source;
+    }
+
+    #[tokio::test]
+    async fn leader_pod_watch_source_opens_the_exact_kubelet_scope_set() {
+        let leader = Arc::new(RecordingLeaderWatch(std::sync::Mutex::new(Vec::new())));
+        let source = LeaderPodWatchSource::new(leader.clone());
+        source
+            .open_pod_manager_watch("node-a".to_string(), PodWatchRecoveryPlan::initial())
+            .await
+            .expect("open kubelet watch scopes");
+
+        let requests = leader.0.lock().expect("watch request mutex");
+        let actual = requests
+            .iter()
+            .map(|request| {
+                (
+                    request.kind(),
+                    request.scope().clone(),
+                    request.field_selector(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    "Pod",
+                    ResourceListScope::AllNamespaces,
+                    Some("spec.nodeName=node-a")
+                ),
+                (
+                    "PersistentVolumeClaim",
+                    ResourceListScope::AllNamespaces,
+                    None
+                ),
+                ("PersistentVolume", ResourceListScope::Cluster, None),
+                ("Secret", ResourceListScope::AllNamespaces, None),
+                ("ConfigMap", ResourceListScope::AllNamespaces, None),
+                ("Namespace", ResourceListScope::Cluster, None),
+            ]
+        );
+    }
 
     #[test]
     fn bootstrap_eof_reconnects_from_each_scopes_last_durable_position() {

@@ -385,7 +385,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 task_supervisor.clone(),
                 std::sync::Arc::new(klights_supervisor::SystemWallClock),
                 klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(db.clone()),
+                    klights_kubelet::node_api::logs::LeaderPodLogFollowWatchPort::new(db.clone()),
                 )),
             ),
         )),
@@ -627,7 +627,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     kctx.runtime_network().services.request_services_sync()?;
 
     let pod_watch_source = std::sync::Arc::new(
-        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(worker_store.clone()),
+        klights_kubelet::pod_watch_source::LeaderPodWatchSource::new(worker_store.clone()),
     );
     let persistent_volume_event_handler = std::sync::Arc::new(());
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
@@ -661,7 +661,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     };
     let heartbeat_handle = {
         let watch_source = std::sync::Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(worker_store.clone()),
+            klights_kubelet::node_heartbeat::LeaderNodeHeartbeatEventSource::new(
+                worker_store.clone(),
+            ),
         );
         let cfc = std::sync::Arc::clone(&config);
         let c = shutdown_token.clone();
@@ -677,7 +679,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                         watch_source,
                         lease_client,
                         std::sync::Arc::new(
-                            crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock::new(
+                            klights_kubelet::node_heartbeat::SystemNodeHeartbeatClock::new(
                                 std::sync::Arc::new(klights_supervisor::SystemWallClock),
                             ),
                         ),

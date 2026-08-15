@@ -751,7 +751,7 @@ pub(crate) mod support {
                     supervisor.clone(),
                     wall_clock.clone(),
                     klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                        klights_kubelet::node_api::logs::LeaderPodLogFollowWatchPort::new(Arc::new(
                             positioned_watch.clone(),
                         )),
                     )),

@@ -380,7 +380,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                 .as_ref()
                 .map(|store| {
                     std::sync::Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                        klights_kubelet::node_api::logs::LeaderPodLogFollowWatchPort::new(
                             store.clone(),
                         ),
                     )
@@ -390,7 +390,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                 })
                 .unwrap_or_else(|| {
                     std::sync::Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                        klights_kubelet::node_api::logs::LeaderPodLogFollowWatchPort::new(
                             leader_watch.clone(),
                         ),
                     )
