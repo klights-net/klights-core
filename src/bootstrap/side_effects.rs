@@ -186,10 +186,8 @@ mod tests {
         let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         let registry = default_registry(
             SideEffectMetrics::new(),
             None,
@@ -294,10 +292,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -422,10 +418,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -519,10 +513,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         let endpoints = json!({
@@ -573,10 +565,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -704,10 +694,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -804,10 +792,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -934,10 +920,8 @@ mod tests {
             ports.topology_reads,
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(

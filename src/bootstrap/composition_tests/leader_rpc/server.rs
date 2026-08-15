@@ -29,6 +29,18 @@ use tonic_reflection::pb::v1::{
     server_reflection_request, server_reflection_response,
 };
 
+fn encode_outbox_payload(command: StorageCommand) -> anyhow::Result<Vec<u8>> {
+    Ok(
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(command),
+        )?,
+    )
+}
+
+fn decode_outbox_payload(bytes: &[u8]) -> anyhow::Result<klights_cluster_core::OutboxPayload> {
+    Ok(klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(bytes)?)
+}
+
 #[derive(Default)]
 
 struct RecordingNodeLifecycleStatus {
@@ -2042,12 +2054,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
         preconditions: ResourcePreconditions::uid("node-uid-1"),
         strict_resource_version: false,
     };
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            command,
-        )
-        .encode_protobuf()
-        .expect("encode payload");
+    let payload = encode_outbox_payload(command).expect("encode payload");
 
     let rejected = grpc
         .apply_outbox(request_with_node_client_cert(
@@ -2086,19 +2093,16 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
     assert!(stored.data.pointer("/metadata/labels/smuggled").is_none());
 
     let valid_status_payload = || {
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            StorageCommand::UpdateStatus {
-                api_version: "v1".to_string(),
-                kind: "Node".to_string(),
-                namespace: None,
-                name: "worker-1".to_string(),
-                status: serde_json::json!({"conditions": []}),
-                expected_rv: None,
-                preconditions: ResourcePreconditions::uid("node-uid-1"),
-                observed_status_stamp: None,
-            },
-        )
-        .encode_protobuf()
+        encode_outbox_payload(StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-1".to_string(),
+            status: serde_json::json!({"conditions": []}),
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid("node-uid-1"),
+            observed_status_stamp: None,
+        })
         .expect("encode valid RPC Node status")
     };
     grpc.apply_outbox(request_with_node_client_cert(
@@ -2215,12 +2219,7 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
         preconditions: ResourcePreconditions::uid("wrong-node-uid"),
         observed_status_stamp: None,
     };
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            command,
-        )
-        .encode_protobuf()
-        .expect("encode payload");
+    let payload = encode_outbox_payload(command).expect("encode payload");
 
     let response = grpc
         .apply_outbox(request_with_node_client_cert(
@@ -2307,33 +2306,29 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
         canonical.clone().focused_committed_apply(),
         canonical.clone().focused_read_store(),
     );
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            StorageCommand::UpdateStatus {
-                api_version: "v1".to_string(),
-                kind: "Node".to_string(),
-                namespace: None,
-                name: "mn-controlplane2".to_string(),
-                status: serde_json::json!({
-                    "conditions": [{
-                        "type": "Ready",
-                        "status": "True",
-                        "reason": "Ready",
-                        "lastTransitionTime": "2026-07-19T02:12:14Z"
-                    }, {
-                        "type": "NetworkUnavailable",
-                        "status": "False",
-                        "reason": "Ready",
-                        "lastTransitionTime": "2026-07-19T02:12:14Z"
-                    }]
-                }),
-                expected_rv: None,
-                preconditions: ResourcePreconditions::uid(created.uid.clone()),
-                observed_status_stamp: None,
-            },
-        )
-        .encode_protobuf()
-        .expect("encode controlplane Node status payload");
+    let payload = encode_outbox_payload(StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: None,
+        name: "mn-controlplane2".to_string(),
+        status: serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": "Ready",
+                "lastTransitionTime": "2026-07-19T02:12:14Z"
+            }, {
+                "type": "NetworkUnavailable",
+                "status": "False",
+                "reason": "Ready",
+                "lastTransitionTime": "2026-07-19T02:12:14Z"
+            }]
+        }),
+        expected_rv: None,
+        preconditions: ResourcePreconditions::uid(created.uid.clone()),
+        observed_status_stamp: None,
+    })
+    .expect("encode controlplane Node status payload");
 
     let response = grpc
         .apply_outbox(request_with_controlplane_client_cert(
@@ -2408,12 +2403,7 @@ async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
         endpoint: "192.0.2.10".to_string(),
         port: Some(7679),
     };
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            command,
-        )
-        .encode_protobuf()
-        .expect("encode dataplane payload");
+    let payload = encode_outbox_payload(command).expect("encode dataplane payload");
 
     let status = grpc
         .apply_outbox(request_with_node_client_cert(
@@ -2745,12 +2735,7 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
         endpoint: "192.0.2.20".to_string(),
         port: Some(7679),
     };
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            command,
-        )
-        .encode_protobuf()
-        .unwrap();
+    let payload = encode_outbox_payload(command).unwrap();
 
     let response = grpc
         .apply_outbox(request_with_node_client_cert(
@@ -2949,11 +2934,7 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
         row.operation,
         klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus.as_str()
     );
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::decode_protobuf(
-            &row.payload_proto,
-        )
-        .expect("decode status payload");
+    let payload = decode_outbox_payload(&row.payload_proto).expect("decode status payload");
     let StorageCommand::UpdateStatus { status, .. } = payload.command else {
         panic!("external IP publication must be status-only")
     };
@@ -4308,12 +4289,7 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         },
         observed_status_stamp: None,
     };
-    let payload =
-        crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload::from_command(
-            command,
-        )
-        .encode_protobuf()
-        .unwrap();
+    let payload = encode_outbox_payload(command).unwrap();
     let response = grpc
         .apply_outbox(request_with_node_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {

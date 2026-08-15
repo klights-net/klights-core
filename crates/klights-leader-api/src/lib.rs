@@ -5,6 +5,8 @@ pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
 mod controlplane_join;
 mod peer_endpoint;
 pub mod replication;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub use controlplane_join::{
     ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
     ControlplaneJoinAuthority, ControlplaneJoinError, ControlplaneJoinFuture,

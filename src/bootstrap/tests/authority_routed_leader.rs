@@ -1373,7 +1373,6 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
 }
 
 fn pod_status_minimal_payload() -> Bytes {
-    use crate::bootstrap::composition_tests::support::OutboxPayload;
     use klights_cluster_core::ResourcePreconditions;
     use klights_cluster_core::command::StorageCommand;
     let command = StorageCommand::UpdateStatus {
@@ -1390,9 +1389,10 @@ fn pod_status_minimal_payload() -> Bytes {
         observed_status_stamp: None,
     };
     Bytes::from(
-        OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .expect("encode"),
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(command),
+        )
+        .expect("encode"),
     )
 }
 

@@ -58,6 +58,7 @@ tracing = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+klights-auth = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

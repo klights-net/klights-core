@@ -7,16 +7,6 @@
 //! Native API implementation modules remain private to `k8s-native-service`.
 
 pub(crate) use super::assembly_support::support::*;
-pub use k8s_native_service::test_support::streaming::RemoteExecSyncWebSocketFixture;
-pub use klights_auth::test_support::IntegrationCsrSignerObservation;
-pub use klights_cluster_datastore;
-pub use klights_cluster_datastore::test_support::{
-    ResourceMutationPause as IntegrationResourceMutationPause,
-    ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation,
-    WatchHistoryFailureControl as IntegrationWatchHistoryFailureControl,
-};
-
-pub type IntegrationWatchEvent = klights_watch::WatchEvent;
 
 use klights_auth::bootstrap_token::BootstrapTokenScopePolicy as _;
 use std::sync::Arc;
@@ -144,74 +134,6 @@ impl klights_leader_api::LeaderBoundTokenSubjectLookup for ResourceBoundTokenSub
     }
 }
 
-pub struct AllowAllAuthorizer;
-
-#[async_trait::async_trait]
-impl klights_auth::authorizer::Authorizer for AllowAllAuthorizer {
-    async fn authorize(
-        &self,
-        _identity: &klights_auth::AuthenticatedIdentity,
-        _request: &klights_auth::request_attributes::AuthorizationRequest,
-    ) -> klights_auth::authorizer::AuthorizationDecision {
-        klights_auth::authorizer::AuthorizationDecision::allow("parent integration allow-all")
-    }
-}
-
-pub struct RecordingAuthorizer {
-    requests: tokio::sync::Mutex<
-        Vec<(
-            klights_auth::AuthenticatedIdentity,
-            klights_auth::request_attributes::AuthorizationRequest,
-        )>,
-    >,
-    decision: klights_auth::authorizer::AuthorizationDecision,
-}
-
-impl RecordingAuthorizer {
-    pub fn allow() -> Self {
-        Self::new(klights_auth::authorizer::AuthorizationDecision::allow(
-            "parent integration recording allow",
-        ))
-    }
-
-    pub fn deny(reason: &str) -> Self {
-        Self::new(klights_auth::authorizer::AuthorizationDecision::deny(
-            reason,
-        ))
-    }
-
-    fn new(decision: klights_auth::authorizer::AuthorizationDecision) -> Self {
-        Self {
-            requests: tokio::sync::Mutex::new(Vec::new()),
-            decision,
-        }
-    }
-
-    pub async fn take_requests(
-        &self,
-    ) -> Vec<(
-        klights_auth::AuthenticatedIdentity,
-        klights_auth::request_attributes::AuthorizationRequest,
-    )> {
-        std::mem::take(&mut *self.requests.lock().await)
-    }
-}
-
-#[async_trait::async_trait]
-impl klights_auth::authorizer::Authorizer for RecordingAuthorizer {
-    async fn authorize(
-        &self,
-        identity: &klights_auth::AuthenticatedIdentity,
-        request: &klights_auth::request_attributes::AuthorizationRequest,
-    ) -> klights_auth::authorizer::AuthorizationDecision {
-        self.requests
-            .lock()
-            .await
-            .push((identity.clone(), request.clone()));
-        self.decision.clone()
-    }
-}
-
 pub struct TestAppState {
     harness: NativeApiTestHarness,
 }
@@ -249,14 +171,12 @@ impl TestAppState {
 
     pub fn install_resource_mutation_pause(
         &self,
-        operation: IntegrationResourceMutationPauseOperation,
+        operation: klights_cluster_datastore::test_support::ResourceMutationPauseOperation,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Arc<
-        crate::bootstrap::composition_tests::native_api::support::IntegrationResourceMutationPause,
-    > {
+    ) -> Arc<klights_cluster_datastore::test_support::ResourceMutationPause> {
         self.resource_store().install_resource_mutation_pause(
             operation,
             api_version,
@@ -576,7 +496,10 @@ impl TestAppState {
         self.harness.register_integration_follower(dataplane).await
     }
 
-    pub fn integration_remote_exec_sync(&self) -> anyhow::Result<RemoteExecSyncWebSocketFixture> {
+    pub fn integration_remote_exec_sync(
+        &self,
+    ) -> anyhow::Result<k8s_native_service::test_support::streaming::RemoteExecSyncWebSocketFixture>
+    {
         self.harness.integration_remote_exec_sync()
     }
 
@@ -584,9 +507,7 @@ impl TestAppState {
         &self,
         api_version: &str,
         kind: &str,
-    ) -> tokio::sync::broadcast::Receiver<
-        crate::bootstrap::composition_tests::native_api::support::IntegrationWatchEvent,
-    > {
+    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
         self.commit_watch_fixture()
             .subscribe(klights_watch::WatchTopic::new(api_version, kind))
     }
@@ -598,28 +519,6 @@ impl TestAppState {
 
 pub struct TestResourceMutation {
     pub store: klights_cluster_datastore::test_support::ResourceTestStore,
-}
-
-#[derive(Default)]
-pub struct DeterministicControllerIdentity {
-    next: std::sync::atomic::AtomicU64,
-}
-
-impl klights_controllers::ControllerIdentityGenerator for DeterministicControllerIdentity {
-    fn generate_name(&self, prefix: &str) -> String {
-        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{prefix}{value:05}")
-    }
-
-    fn new_uid(&self) -> String {
-        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("00000000-0000-4000-8000-{value:012}")
-    }
-}
-
-pub fn deterministic_controller_identity()
--> Arc<dyn klights_controllers::ControllerIdentityGenerator> {
-    Arc::new(DeterministicControllerIdentity::default())
 }
 
 pub fn file_process_executor() -> klights_supervisor::FileProcessExecutor {
@@ -824,8 +723,6 @@ pub struct GeneratedDeleteCompletionRequest<'a> {
     pub uid_mismatch_is_conflict: bool,
 }
 
-pub use k8s_native_service::generic_command::DeleteCompletion;
-
 pub async fn mark_foreground_deletion_with_retry(
     db: &klights_cluster_datastore::test_support::ResourceTestStore,
     api_version: &str,
@@ -852,7 +749,7 @@ pub async fn mark_foreground_deletion_with_retry(
 pub async fn complete_non_foreground_delete_with_live_recheck(
     db: &klights_cluster_datastore::test_support::ResourceTestStore,
     request: GeneratedDeleteCompletionRequest<'_>,
-) -> Result<DeleteCompletion, k8s_native_service::AppError> {
+) -> Result<k8s_native_service::generic_command::DeleteCompletion, k8s_native_service::AppError> {
     let lifecycle = IntegrationFinalizerLifecycleStore(db.clone());
     k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
         &lifecycle,
@@ -925,7 +822,7 @@ pub async fn build_test_app_state_with_authorizer(
 pub async fn build_test_app_state_with_operational_endpoints() -> TestAppState {
     TestAppState {
         harness: NativeApiTestHarness::with_authorizer_and_operational_endpoints(Arc::new(
-            AllowAllAuthorizer,
+            klights_auth::test_support::AllowAllAuthorizer,
         ))
         .await
         .expect("assemble native API integration harness with operational endpoints"),
@@ -1020,7 +917,7 @@ pub async fn build_test_app_state_with_bootstrap_token_authenticator(
 
 pub async fn build_test_app_state_with_toggle_failing_watch_history() -> (
     TestAppState,
-    crate::bootstrap::composition_tests::native_api::support::IntegrationWatchHistoryFailureControl,
+    klights_cluster_datastore::test_support::WatchHistoryFailureControl,
 ) {
     let (harness, control) = NativeApiTestHarness::with_toggle_failing_watch_history()
         .await
@@ -1065,7 +962,7 @@ pub async fn build_test_app_state_with_priority_fairness() -> (
 
 pub async fn build_test_app_state_with_csr_signer_observation() -> (
     TestAppState,
-    crate::bootstrap::composition_tests::native_api::support::IntegrationCsrSignerObservation,
+    klights_auth::test_support::IntegrationCsrSignerObservation,
 ) {
     let (harness, observation) = NativeApiTestHarness::with_csr_signer_observation()
         .await

@@ -1830,7 +1830,7 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     use tower::ServiceExt;
 
     async fn fetch_resource_with_rv(
-        db: &crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+        db: &klights_cluster_datastore::test_support::ResourceTestStore,
         api: &str,
         kind: &str,
         namespace: Option<&str>,

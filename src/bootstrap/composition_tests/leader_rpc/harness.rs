@@ -8,21 +8,6 @@ pub struct IntegrationPassiveReadPorts {
     ports: crate::bootstrap::composition::cluster_store::selector::PassiveReadPorts,
 }
 
-struct UnavailableLeaderWatchForTest;
-
-impl klights_leader_api::LeaderWatch for UnavailableLeaderWatchForTest {
-    fn watch_resources(
-        &self,
-        _request: klights_leader_api::WatchRequest,
-    ) -> klights_leader_api::LeaderWatchFuture<'_> {
-        Box::pin(async {
-            Err(klights_leader_api::LeaderWatchError::Unavailable {
-                message: "positioned watch was not configured for this test server".to_string(),
-            })
-        })
-    }
-}
-
 pub struct IntegrationLeaderRpcRuntime {
     runtime: Arc<crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter>,
 }
@@ -740,7 +725,11 @@ impl IntegrationLeaderRpcComposition {
             Some(passive_reads) => {
                 Arc::new(Self::positioned_watch(&passive_reads, self.db.clone()))
             }
-            None => Arc::new(UnavailableLeaderWatchForTest),
+            None => Arc::new(
+                klights_leader_api::test_support::UnavailableLeaderWatch::new(
+                    "positioned watch was not configured for this test server",
+                ),
+            ),
         };
         let ports = klights_leader_rpc::server::ReplicationServerPorts::from_focused(
             resource_query,

@@ -120,7 +120,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
 
 async fn remote_exec_fixture() -> (
     crate::bootstrap::composition_tests::native_api::support::IntegrationFollowerSession,
-    crate::bootstrap::composition_tests::native_api::support::RemoteExecSyncWebSocketFixture,
+    k8s_native_service::test_support::streaming::RemoteExecSyncWebSocketFixture,
 ) {
     let state = support::build_test_app_state_with_operational_endpoints().await;
     let follower = state
@@ -369,7 +369,7 @@ async fn pod_create_denied_does_not_persist() {
 }
 
 async fn seed_service_endpoints(
-    db: &crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+    db: &klights_cluster_datastore::test_support::ResourceTestStore,
     subsets: serde_json::Value,
 ) {
     db.create_resource(

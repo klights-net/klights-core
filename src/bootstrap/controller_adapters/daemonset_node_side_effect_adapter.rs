@@ -57,10 +57,8 @@ mod tests {
         let db = crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture()
             .await
             .unwrap();
-        let dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
-            ),
-        );
+        let dispatcher =
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
         let slot = klights_controllers::side_effects::ControllerDispatcherSlot::new();
         slot.set(dispatcher.clone());
 

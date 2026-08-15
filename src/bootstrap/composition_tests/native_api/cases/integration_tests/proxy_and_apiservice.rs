@@ -10663,9 +10663,8 @@ async fn custom_resource_allowed_identity_gets_normal_response() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> = std::sync::Arc::new(
-        crate::bootstrap::composition_tests::native_api::support::AllowAllAuthorizer,
-    );
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::test_support::AllowAllAuthorizer);
     let state = build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD

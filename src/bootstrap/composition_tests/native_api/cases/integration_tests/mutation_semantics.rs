@@ -989,7 +989,7 @@ struct WidgetHookRecord {
 }
 
 struct RecordingWidgetSideEffect {
-    db: crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+    db: klights_cluster_datastore::test_support::ResourceTestStore,
     records: std::sync::Arc<std::sync::Mutex<Vec<WidgetHookRecord>>>,
 }
 
@@ -1015,7 +1015,7 @@ impl RecordingWidgetSideEffect {
         &self,
         hook: &'static str,
         resource: &serde_json::Value,
-        db: &crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+        db: &klights_cluster_datastore::test_support::ResourceTestStore,
     ) -> anyhow::Result<()> {
         let api_version = resource
             .get("apiVersion")

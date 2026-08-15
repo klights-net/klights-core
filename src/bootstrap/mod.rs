@@ -15,8 +15,6 @@ pub(crate) mod grpc_runtime_adapter;
 pub mod init;
 pub(crate) mod kubelet_ports;
 pub(crate) mod leader_conversions;
-#[cfg(test)]
-pub(crate) mod leader_test_support;
 pub(crate) mod local_leader_adapters;
 pub mod logging;
 pub(crate) mod maintenance;

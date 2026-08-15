@@ -165,9 +165,7 @@ async fn test_api_rejects_invalid_bootstrap_bearer_token() {
 
 #[tokio::test]
 async fn test_trusted_api_proxy_identity_is_authorized_as_delegated_user() {
-    let recording = std::sync::Arc::new(
-        crate::bootstrap::composition_tests::native_api::support::RecordingAuthorizer::allow(),
-    );
+    let recording = std::sync::Arc::new(klights_auth::test_support::RecordingAuthorizer::allow());
     let app =
         crate::bootstrap::composition_tests::native_api::support::build_test_app_state_with_authorizer(
             recording.clone(),
@@ -196,7 +194,7 @@ async fn test_trusted_api_proxy_identity_is_authorized_as_delegated_user() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let recorded = recording.take_requests().await;
+    let recorded = recording.take_calls().await;
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].0.username, "delegated-user");
     assert!(
@@ -210,9 +208,7 @@ async fn test_trusted_api_proxy_identity_is_authorized_as_delegated_user() {
 
 #[tokio::test]
 async fn test_server_cert_identity_cannot_delegate_requestheaders() {
-    let recording = std::sync::Arc::new(
-        crate::bootstrap::composition_tests::native_api::support::RecordingAuthorizer::allow(),
-    );
+    let recording = std::sync::Arc::new(klights_auth::test_support::RecordingAuthorizer::allow());
     let app =
         crate::bootstrap::composition_tests::native_api::support::build_test_app_state_with_authorizer(
             recording.clone(),
@@ -237,7 +233,7 @@ async fn test_server_cert_identity_cannot_delegate_requestheaders() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let recorded = recording.take_requests().await;
+    let recorded = recording.take_calls().await;
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].0.username, "klights-server");
     assert!(

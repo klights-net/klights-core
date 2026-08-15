@@ -406,8 +406,7 @@ async fn test_create_namespace_auto_creates_default_service_account() {
         &store,
         namespace_name,
         chrono::DateTime::UNIX_EPOCH,
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -440,8 +439,7 @@ async fn test_create_kube_root_ca_configmap_contains_ca_cert() {
         namespace_name,
         ca_cert_pem,
         chrono::DateTime::UNIX_EPOCH,
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -530,8 +528,7 @@ async fn test_dynamic_namespace_creates_kube_root_ca_configmap() {
         &store,
         namespace_name,
         chrono::DateTime::UNIX_EPOCH,
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -540,8 +537,7 @@ async fn test_dynamic_namespace_creates_kube_root_ca_configmap() {
         namespace_name,
         ca_cert_pem,
         chrono::DateTime::UNIX_EPOCH,
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -585,8 +581,7 @@ async fn test_kube_root_ca_configmap_idempotent() {
         "default",
         ca_pem,
         chrono::DateTime::UNIX_EPOCH,
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -597,8 +592,7 @@ async fn test_kube_root_ca_configmap_idempotent() {
         "default",
         ca_pem,
         chrono::DateTime::UNIX_EPOCH,
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await;
     assert!(

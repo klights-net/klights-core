@@ -40,7 +40,7 @@ async fn patch_statefulset_scale_does_not_conflict_with_concurrent_status_update
     .unwrap();
 
     let pause = state.install_resource_mutation_pause(
-        crate::bootstrap::composition_tests::native_api::support::IntegrationResourceMutationPauseOperation::BuildPatchCommand,
+        klights_cluster_datastore::test_support::ResourceMutationPauseOperation::BuildPatchCommand,
         "apps/v1",
         "StatefulSet",
         Some("default"),
@@ -115,7 +115,7 @@ async fn patch_replicaset_scale_does_not_conflict_with_concurrent_status_updates
     .unwrap();
 
     let pause = state.install_resource_mutation_pause(
-        crate::bootstrap::composition_tests::native_api::support::IntegrationResourceMutationPauseOperation::BuildPatchCommand,
+        klights_cluster_datastore::test_support::ResourceMutationPauseOperation::BuildPatchCommand,
         "apps/v1",
         "ReplicaSet",
         Some("default"),
@@ -190,7 +190,7 @@ async fn update_replicaset_scale_with_empty_resource_version_is_unconditional() 
     .unwrap();
 
     let pause = state.install_resource_mutation_pause(
-        crate::bootstrap::composition_tests::native_api::support::IntegrationResourceMutationPauseOperation::BuildPatchCommand,
+        klights_cluster_datastore::test_support::ResourceMutationPauseOperation::BuildPatchCommand,
         "apps/v1",
         "ReplicaSet",
         Some("default"),
@@ -368,7 +368,7 @@ async fn patch_replicationcontroller_scale_does_not_conflict_with_concurrent_sta
     .unwrap();
 
     let pause = state.install_resource_mutation_pause(
-        crate::bootstrap::composition_tests::native_api::support::IntegrationResourceMutationPauseOperation::BuildPatchCommand,
+        klights_cluster_datastore::test_support::ResourceMutationPauseOperation::BuildPatchCommand,
         "v1",
         "ReplicationController",
         Some("default"),

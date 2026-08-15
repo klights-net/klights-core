@@ -590,7 +590,7 @@ impl LeaderCacheReadiness for HandoffLeaderApi {
     }
 }
 
-crate::bootstrap::leader_test_support::impl_unavailable_leader_pod_effects!(HandoffLeaderApi);
+klights_leader_api::test_support::impl_unavailable_leader_pod_effects!(HandoffLeaderApi);
 
 #[tokio::test]
 async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
@@ -802,7 +802,7 @@ impl LeaderCacheReadiness for OpenExpiredThenRelistLeaderApi {
     }
 }
 
-crate::bootstrap::leader_test_support::impl_unavailable_leader_pod_effects!(
+klights_leader_api::test_support::impl_unavailable_leader_pod_effects!(
     OpenExpiredThenRelistLeaderApi
 );
 
@@ -1979,7 +1979,7 @@ async fn worker_store_routes_local_pod_watch_to_lifecycle_actor() {
         }
     }
 
-    crate::bootstrap::leader_test_support::impl_unavailable_leader_pod_effects!(LocalPodLeaderApi);
+    klights_leader_api::test_support::impl_unavailable_leader_pod_effects!(LocalPodLeaderApi);
 
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::composition::node_store::open_node_local(

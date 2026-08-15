@@ -693,6 +693,34 @@ mod cases {
     }
 
     #[test]
+    fn observed_leader_endpoint_is_none_until_transport_observes_peer() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: "https://10.99.0.10:7679".to_string(),
+                token: "abcdef.0123456789abcdef".to_string(),
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: JoinDataplaneMetadata {
+                    public_key: None,
+                    endpoint: "127.0.0.1".to_string(),
+                    port: None,
+                    mode: klights_leader_api::NetworkNodeMode::Root,
+                    encryption: klights_leader_api::DataplaneEncryption::Direct,
+                },
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            crate::transport_policy::GrpcTransportPolicy::shared_default(),
+        );
+
+        assert_eq!(client.observed_leader_endpoint(), None);
+    }
+
+    #[test]
     fn steady_state_join_payload_omits_bootstrap_token() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let client = ReplicationGrpcClient::new(

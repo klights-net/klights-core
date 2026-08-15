@@ -4094,9 +4094,9 @@ async fn test_finalizer_delete_mark_retries_internal_rv_conflict_preserving_conc
     .await
     .expect("finalizer delete marking must retry internal rv conflicts");
     let updated = match outcome {
-        crate::bootstrap::composition_tests::native_api::support::DeleteCompletion::MarkedTerminating(
-            resource,
-        ) => resource,
+        k8s_native_service::generic_command::DeleteCompletion::MarkedTerminating(resource) => {
+            resource
+        }
         other => panic!("expected MarkedTerminating, got {other:?}"),
     };
 
@@ -4201,9 +4201,9 @@ async fn test_delete_collection_finalizer_mark_retries_internal_rv_conflict_pres
     .await
     .expect("collection finalizer mark should handle internal rv conflicts");
     let updated = match outcome {
-        crate::bootstrap::composition_tests::native_api::support::DeleteCompletion::MarkedTerminating(
-            resource,
-        ) => resource,
+        k8s_native_service::generic_command::DeleteCompletion::MarkedTerminating(resource) => {
+            resource
+        }
         other => panic!("expected MarkedTerminating, got {other:?}"),
     };
 
@@ -4307,9 +4307,9 @@ async fn test_single_delete_live_recheck_marks_when_same_uid_gains_finalizer() {
     .expect("live recheck should mark same-UID finalizer add as terminating");
 
     let updated = match outcome {
-        crate::bootstrap::composition_tests::native_api::support::DeleteCompletion::MarkedTerminating(
-            resource,
-        ) => resource,
+        k8s_native_service::generic_command::DeleteCompletion::MarkedTerminating(resource) => {
+            resource
+        }
         other => panic!("expected MarkedTerminating, got {other:?}"),
     };
     assert!(

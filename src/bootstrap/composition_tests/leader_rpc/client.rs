@@ -1083,28 +1083,6 @@ mod cases {
         leader_handle.abort();
     }
 
-    #[test]
-    fn observed_leader_endpoint_is_none_until_transport_observes_peer() {
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let client = ReplicationGrpcClient::new(
-            GrpcClientConfig {
-                leader_endpoint: "https://10.99.0.10:7679".to_string(),
-                token: "abcdef.0123456789abcdef".to_string(),
-                node_name: "worker-1".to_string(),
-                role: JoinRole::Worker,
-                dataplane: dataplane(),
-                ca_cert_path: None,
-                skip_ca: false,
-                client_cert_pem: None,
-                client_key_pem: None,
-            },
-            supervisor,
-            klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
-        );
-
-        assert_eq!(client.observed_leader_endpoint(), None);
-    }
-
     #[tokio::test]
     async fn https_join_with_node_cert_succeeds_without_bootstrap_token() {
         let fixture = TlsGrpcLeaderFixture::start().await;
@@ -1353,7 +1331,6 @@ mod cases {
         // dispatcher retries the SAME stream entry. The leader must replay it
         // as AlreadyApplied from the watermark — mutation applied exactly once,
         // never a second mutation.
-        use crate::bootstrap::composition_tests::leader_rpc::support::OutboxPayload;
         use klights_cluster_core::ResourcePreconditions;
         use klights_leader_api::OutboxDeliveryResult as OutboxApplyResult;
 
@@ -1394,9 +1371,10 @@ mod cases {
                 observed_status_stamp: None,
             };
             bytes::Bytes::from(
-                OutboxPayload::from_command(command)
-                    .encode_protobuf()
-                    .expect("encode pod status payload"),
+                klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+                    &klights_cluster_core::OutboxPayload::new(command),
+                )
+                .expect("encode pod status payload"),
             )
         };
 

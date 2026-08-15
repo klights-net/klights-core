@@ -33,14 +33,14 @@ enum ConflictInjection {
 }
 
 struct RealResourceQuotaRuntime {
-    db: crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+    db: klights_cluster_datastore::test_support::ResourceTestStore,
     injection: ConflictInjection,
     injected: AtomicBool,
 }
 
 impl RealResourceQuotaRuntime {
     fn new(
-        db: crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+        db: klights_cluster_datastore::test_support::ResourceTestStore,
         injection: ConflictInjection,
     ) -> Self {
         Self {
@@ -222,7 +222,7 @@ fn pod(namespace: &str, name: &str) -> Value {
 }
 
 async fn read_rq_status(
-    db: &crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore,
+    db: &klights_cluster_datastore::test_support::ResourceTestStore,
     namespace: &str,
     name: &str,
 ) -> Value {

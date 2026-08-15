@@ -8,9 +8,7 @@ pub(crate) mod support {
     use std::sync::Arc;
 
     use k8s_native_service::test_support::admission::DeterministicApiIdentity;
-    use klights_auth::test_support::{
-        AllowAllAuthorizer, IntegrationCsrSignerObservation, recording_csr_signer,
-    };
+    use klights_auth::test_support::{IntegrationCsrSignerObservation, recording_csr_signer};
 
     pub(crate) struct IntegrationHeldSupervisorTask {
         handle: klights_supervisor::SupervisedJoinHandle<()>,
@@ -104,7 +102,7 @@ pub(crate) mod support {
     impl IntegrationHarnessAssembly {
         fn standard() -> Self {
             Self {
-                authorizer: Arc::new(AllowAllAuthorizer),
+                authorizer: Arc::new(klights_auth::test_support::AllowAllAuthorizer),
                 pod_lifecycle_diagnostics: None,
                 signing_keys: crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
                 oidc: None,
@@ -143,7 +141,7 @@ pub(crate) mod support {
 
     impl NativeApiTestHarness {
         pub(crate) async fn new() -> anyhow::Result<Self> {
-            Self::with_authorizer(Arc::new(AllowAllAuthorizer)).await
+            Self::with_authorizer(Arc::new(klights_auth::test_support::AllowAllAuthorizer)).await
         }
 
         pub(crate) async fn with_authorizer(

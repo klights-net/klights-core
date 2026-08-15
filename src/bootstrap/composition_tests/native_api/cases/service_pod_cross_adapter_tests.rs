@@ -2,34 +2,17 @@
 
 use std::sync::Arc;
 
-use crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore;
 use klights_cluster_core::Resource;
+use klights_cluster_datastore::test_support::ResourceTestStore;
 use klights_cluster_store::ResourceListOptions;
 use klights_controllers::side_effects::{ControllerDispatcherSlot, service_pod};
 use klights_pod_api::{
     PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodQuery,
     PodRepositoryError, PodRepositoryFuture,
 };
-use klights_reconcile_api::{ReconcileSinkFuture, ServiceReconcileKey, ServiceReconcileSink};
+use klights_reconcile_api::ServiceReconcileKey;
 use klights_types::PodIdentity;
 use serde_json::json;
-
-#[derive(Default)]
-struct RecordingServiceSink {
-    keys: tokio::sync::Mutex<Vec<ServiceReconcileKey>>,
-}
-
-impl ServiceReconcileSink for RecordingServiceSink {
-    fn enqueue_service_reconcile_batch(
-        &self,
-        keys: Vec<ServiceReconcileKey>,
-    ) -> ReconcileSinkFuture<'_> {
-        Box::pin(async move {
-            self.keys.lock().await.extend(keys);
-            Ok(())
-        })
-    }
-}
 
 #[derive(Clone)]
 struct DatastorePodQuery {
@@ -496,7 +479,7 @@ async fn service_sink_gates_irrelevant_updates_and_stale_targetref_self_extingui
     let db = crate::bootstrap::composition_tests::native_api::support::in_memory().await;
     let db_handle = db.clone();
     let store = ServicePodResourceFixtureStore(db.clone());
-    let sink = Arc::new(RecordingServiceSink::default());
+    let sink = Arc::new(klights_controllers::test_support::RecordingReconcileSink::default());
     let slot = ControllerDispatcherSlot::with_service_reconcile_sink(sink.clone());
 
     let service = db
@@ -580,14 +563,14 @@ async fn service_sink_gates_irrelevant_updates_and_stale_targetref_self_extingui
     service_pod::enqueue_services_after_pod_update(&pod, &annotation_only, &store, &slot)
         .await
         .unwrap();
-    assert!(sink.keys.lock().await.is_empty());
+    assert!(sink.pending_keys().await.is_empty());
 
     service_pod::enqueue_services_after_pod_delete(&pod, &store, &slot)
         .await
         .unwrap();
     assert_eq!(
-        *sink.keys.lock().await,
-        vec![ServiceReconcileKey::new("default", "stale")]
+        sink.pending_keys().await,
+        vec![ServiceReconcileKey::new("default", "stale").into_reconcile_key()]
     );
 
     let pod_query = DatastorePodQuery {
@@ -612,7 +595,7 @@ async fn service_sink_gates_irrelevant_updates_and_stale_targetref_self_extingui
         .await
         .unwrap();
     assert_eq!(
-        sink.keys.lock().await.len(),
+        sink.pending_keys().await.len(),
         1,
         "after stale targetRef cleanup the same Pod fact must produce no further Service work"
     );

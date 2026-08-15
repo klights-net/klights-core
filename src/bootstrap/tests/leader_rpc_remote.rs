@@ -5,7 +5,6 @@ use futures::StreamExt as _;
 use serde_json::json;
 
 use crate::bootstrap::composition_tests::leader_rpc::support::SqliteTestStore;
-use crate::bootstrap::composition_tests::support::OutboxPayload;
 use klights_cluster_core::Resource;
 use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::command::StorageCommand;
@@ -277,9 +276,10 @@ fn pod_status_payload(uid: &str) -> Bytes {
         observed_status_stamp: None,
     };
     Bytes::from(
-        OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .expect("encode outbox payload"),
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(command),
+        )
+        .expect("encode outbox payload"),
     )
 }
 

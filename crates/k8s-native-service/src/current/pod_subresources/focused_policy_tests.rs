@@ -11,52 +11,10 @@ use axum::{
     middleware::{self, Next},
     routing::post,
 };
-use klights_auth::{
-    AuthenticatedIdentity,
-    authorizer::{AuthorizationDecision, Authorizer},
-    request_attributes::AuthorizationRequest,
-};
+use klights_auth::{authorizer::Authorizer, test_support::RecordingAuthorizer};
 use tower::ServiceExt;
 
 use crate::policy_inputs::AuthorizationHttpInputs;
-
-struct RecordingAuthorizer {
-    requests: tokio::sync::Mutex<Vec<AuthorizationRequest>>,
-    decision: AuthorizationDecision,
-}
-
-impl RecordingAuthorizer {
-    fn allow() -> Self {
-        Self::new(AuthorizationDecision::allow("focused policy test allow"))
-    }
-
-    fn deny() -> Self {
-        Self::new(AuthorizationDecision::deny("focused policy test denial"))
-    }
-
-    fn new(decision: AuthorizationDecision) -> Self {
-        Self {
-            requests: tokio::sync::Mutex::new(Vec::new()),
-            decision,
-        }
-    }
-
-    async fn take_requests(&self) -> Vec<AuthorizationRequest> {
-        std::mem::take(&mut *self.requests.lock().await)
-    }
-}
-
-#[async_trait::async_trait]
-impl Authorizer for RecordingAuthorizer {
-    async fn authorize(
-        &self,
-        _identity: &AuthenticatedIdentity,
-        request: &AuthorizationRequest,
-    ) -> AuthorizationDecision {
-        self.requests.lock().await.push(request.clone());
-        self.decision.clone()
-    }
-}
 
 fn policy_router(authorizer: Arc<RecordingAuthorizer>, reached: Arc<AtomicBool>) -> Router {
     let authorizer: Arc<dyn Authorizer> = authorizer;
@@ -92,7 +50,7 @@ fn request(method: &str, uri: &str, body: Body) -> axum::http::Request<Body> {
 
 #[tokio::test]
 async fn pod_subresource_routes_denied_with_deny_all_authorizer() {
-    let authorizer = Arc::new(RecordingAuthorizer::deny());
+    let authorizer = Arc::new(RecordingAuthorizer::deny("focused policy test denial"));
     let reached = Arc::new(AtomicBool::new(false));
     let app = policy_router(authorizer, reached.clone());
     let tests = [
@@ -451,7 +409,10 @@ async fn handwritten_routes_emit_exact_rbac_attributes() {
 #[tokio::test]
 async fn proxy_denied_does_not_connect_to_backend() {
     let reached = Arc::new(AtomicBool::new(false));
-    let app = policy_router(Arc::new(RecordingAuthorizer::deny()), reached.clone());
+    let app = policy_router(
+        Arc::new(RecordingAuthorizer::deny("focused policy test denial")),
+        reached.clone(),
+    );
     let response = app
         .oneshot(request(
             "GET",
@@ -469,7 +430,10 @@ async fn proxy_denied_does_not_connect_to_backend() {
 
 async fn assert_denied(cases: &[(&str, &str)]) {
     let reached = Arc::new(AtomicBool::new(false));
-    let app = policy_router(Arc::new(RecordingAuthorizer::deny()), reached.clone());
+    let app = policy_router(
+        Arc::new(RecordingAuthorizer::deny("focused policy test denial")),
+        reached.clone(),
+    );
     for (method, uri) in cases {
         let response = app
             .clone()
@@ -544,7 +508,10 @@ async fn pod_list_authorization_attributes_recorded_by_middleware() {
 #[tokio::test]
 async fn k8s_non_resource_info_endpoints_still_require_authorization() {
     let reached = Arc::new(AtomicBool::new(false));
-    let app = policy_router(Arc::new(RecordingAuthorizer::deny()), reached.clone());
+    let app = policy_router(
+        Arc::new(RecordingAuthorizer::deny("focused policy test denial")),
+        reached.clone(),
+    );
 
     for uri in ["/openid/v1/jwks", "/.well-known/openid-configuration"] {
         let response = app

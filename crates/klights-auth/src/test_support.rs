@@ -25,6 +25,68 @@ impl crate::authorizer::Authorizer for AllowAllAuthorizer {
     }
 }
 
+/// Authorizer fake that returns one fixed decision and records exact calls.
+pub struct RecordingAuthorizer {
+    calls: tokio::sync::Mutex<
+        Vec<(
+            crate::AuthenticatedIdentity,
+            crate::request_attributes::AuthorizationRequest,
+        )>,
+    >,
+    decision: crate::authorizer::AuthorizationDecision,
+}
+
+impl RecordingAuthorizer {
+    pub fn allow() -> Self {
+        Self::new(crate::authorizer::AuthorizationDecision::allow(
+            "integration recording allow",
+        ))
+    }
+
+    pub fn deny(reason: &str) -> Self {
+        Self::new(crate::authorizer::AuthorizationDecision::deny(reason))
+    }
+
+    pub fn new(decision: crate::authorizer::AuthorizationDecision) -> Self {
+        Self {
+            calls: tokio::sync::Mutex::new(Vec::new()),
+            decision,
+        }
+    }
+
+    pub async fn take_calls(
+        &self,
+    ) -> Vec<(
+        crate::AuthenticatedIdentity,
+        crate::request_attributes::AuthorizationRequest,
+    )> {
+        std::mem::take(&mut *self.calls.lock().await)
+    }
+
+    pub async fn take_requests(&self) -> Vec<crate::request_attributes::AuthorizationRequest> {
+        self.take_calls()
+            .await
+            .into_iter()
+            .map(|(_, request)| request)
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::authorizer::Authorizer for RecordingAuthorizer {
+    async fn authorize(
+        &self,
+        identity: &crate::AuthenticatedIdentity,
+        request: &crate::request_attributes::AuthorizationRequest,
+    ) -> crate::authorizer::AuthorizationDecision {
+        self.calls
+            .lock()
+            .await
+            .push((identity.clone(), request.clone()));
+        self.decision.clone()
+    }
+}
+
 /// Observation handle paired with [`recording_csr_signer`].
 #[derive(Clone)]
 pub struct IntegrationCsrSignerObservation {
@@ -139,7 +201,7 @@ mod tests {
         request_attributes::AuthorizationRequest,
     };
 
-    use super::{AllowAllAuthorizer, recording_csr_signer};
+    use super::{AllowAllAuthorizer, RecordingAuthorizer, recording_csr_signer};
 
     #[tokio::test]
     async fn allow_all_authorizer_preserves_the_harness_allow_decision() {
@@ -154,6 +216,25 @@ mod tests {
             decision,
             AuthorizationDecision::allow("integration harness allow-all")
         );
+    }
+
+    #[tokio::test]
+    async fn recording_authorizer_preserves_identity_request_and_decision() {
+        let authorizer = RecordingAuthorizer::deny("denied by fixture");
+        let identity = AuthenticatedIdentity::anonymous();
+        let request = AuthorizationRequest::resource(
+            "delete",
+            "default",
+            "v1",
+            "pods",
+            Some("pod-a"),
+            None,
+            None,
+        );
+
+        let decision = authorizer.authorize(&identity, &request).await;
+        assert_eq!(decision, AuthorizationDecision::deny("denied by fixture"));
+        assert_eq!(authorizer.take_calls().await, vec![(identity, request)]);
     }
 
     #[tokio::test]

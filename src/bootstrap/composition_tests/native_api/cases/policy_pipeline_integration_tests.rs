@@ -168,9 +168,7 @@ async fn unbound_service_account_token_uses_only_service_account_identity() {
 async fn authorization_denial_writes_structured_audit_event() {
     let audit_sink = Arc::new(k8s_native_service::audit::MemoryAuditSink::default());
     let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> = Arc::new(
-        crate::bootstrap::composition_tests::native_api::support::RecordingAuthorizer::deny(
-            "policy denied secret read",
-        ),
+        klights_auth::test_support::RecordingAuthorizer::deny("policy denied secret read"),
     );
     let state = crate::bootstrap::composition_tests::native_api::support::build_test_app_state_with_authorizer_and_audit_sink(
         authorizer,
@@ -217,9 +215,8 @@ async fn authorization_denial_writes_structured_audit_event() {
 #[tokio::test]
 async fn pod_exec_authorization_writes_high_value_audit_event() {
     let audit_sink = Arc::new(k8s_native_service::audit::MemoryAuditSink::default());
-    let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> = Arc::new(
-        crate::bootstrap::composition_tests::native_api::support::RecordingAuthorizer::allow(),
-    );
+    let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
+        Arc::new(klights_auth::test_support::RecordingAuthorizer::allow());
     let state = crate::bootstrap::composition_tests::native_api::support::build_test_app_state_with_authorizer_and_audit_sink(
         authorizer,
         audit_sink.clone(),
@@ -316,15 +313,17 @@ async fn auth_policy_failures_have_json_and_protobuf_parity() {
         for (accept, expected_content_type) in encodings {
             let state = match failure.failure {
                 Failure::ForbiddenImpersonation => {
-                    let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> = Arc::new(
-                        crate::bootstrap::composition_tests::native_api::support::RecordingAuthorizer::deny("impersonation denied"),
-                    );
+                    let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
+                        Arc::new(klights_auth::test_support::RecordingAuthorizer::deny(
+                            "impersonation denied",
+                        ));
                     crate::bootstrap::composition_tests::native_api::support::build_test_app_state_with_authorizer(authorizer).await
                 }
                 Failure::AuthorizationDenied => {
-                    let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> = Arc::new(
-                        crate::bootstrap::composition_tests::native_api::support::RecordingAuthorizer::deny("authorization denied"),
-                    );
+                    let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
+                        Arc::new(klights_auth::test_support::RecordingAuthorizer::deny(
+                            "authorization denied",
+                        ));
                     crate::bootstrap::composition_tests::native_api::support::build_test_app_state_with_authorizer(authorizer).await
                 }
                 Failure::InvalidAuthorization | Failure::InvalidImpersonation => {

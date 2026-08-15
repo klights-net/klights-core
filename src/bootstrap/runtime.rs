@@ -937,10 +937,9 @@ mod tests {
         assert_eq!(row.subject().resource().kind, "Node");
         assert_eq!(row.subject().resource().name, "worker-a");
         assert_eq!(row.subject().subject_key(), "v1/Node/worker-a/dataplane");
-        let payload = crate::bootstrap::composition_tests::support::OutboxPayload::decode_protobuf(
-            row.payload(),
-        )
-        .expect("decode dataplane outbox payload");
+        let payload =
+            klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(row.payload())
+                .expect("decode dataplane outbox payload");
         match payload.command {
             klights_cluster_core::command::StorageCommand::UpdateNodeDataplane {
                 node_name,

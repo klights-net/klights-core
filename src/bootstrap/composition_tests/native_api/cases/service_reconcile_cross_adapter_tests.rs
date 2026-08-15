@@ -1,7 +1,7 @@
 //! Base-owned Service reconcile coverage crossing controller and datastore adapters.
 
-use crate::bootstrap::composition_tests::native_api::support::klights_cluster_datastore::test_support::ResourceTestStore;
 use klights_cluster_core::Resource;
+use klights_cluster_datastore::test_support::ResourceTestStore;
 use klights_cluster_store::ResourceListOptions;
 use klights_controllers::service::*;
 use klights_pod_api::{
@@ -266,8 +266,7 @@ async fn reconcile_service(
         service_ipam,
         &NodePortAllocator::new(),
         chrono::Utc::now(),
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
 }
@@ -933,8 +932,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -971,8 +969,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -1021,8 +1018,7 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();
@@ -1041,8 +1037,7 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::bootstrap::composition_tests::native_api::support::deterministic_controller_identity()
-            .as_ref(),
+        &klights_controllers::test_support::DeterministicControllerIdentity::default(),
     )
     .await
     .unwrap();

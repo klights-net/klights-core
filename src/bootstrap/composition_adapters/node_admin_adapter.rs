@@ -175,19 +175,20 @@ mod tests {
     }
 
     fn pod_status_payload() -> Vec<u8> {
-        crate::bootstrap::composition_tests::support::OutboxPayload::from_command(
-            klights_cluster_core::StorageCommand::UpdateStatus {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                name: "web".to_string(),
-                status: serde_json::json!({"phase": "Running"}),
-                expected_rv: None,
-                preconditions: klights_cluster_core::ResourcePreconditions::uid("uid-1"),
-                observed_status_stamp: Some(1),
-            },
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(
+                klights_cluster_core::StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "web".to_string(),
+                    status: serde_json::json!({"phase": "Running"}),
+                    expected_rv: None,
+                    preconditions: klights_cluster_core::ResourcePreconditions::uid("uid-1"),
+                    observed_status_stamp: Some(1),
+                },
+            ),
         )
-        .encode_protobuf()
         .expect("encode test Pod status outbox envelope")
     }
 

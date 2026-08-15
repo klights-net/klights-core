@@ -290,6 +290,7 @@ klights-auth = { workspace = true, features = ["test-support"] }
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-controllers = { workspace = true, features = ["test-support"] }
+klights-leader-api = { workspace = true, features = ["test-support"] }
 klights-kubelet = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
 klights-watch = { workspace = true, features = ["integration-test-harness"] }

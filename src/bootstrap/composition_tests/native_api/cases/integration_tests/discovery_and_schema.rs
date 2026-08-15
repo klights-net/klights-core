@@ -3068,7 +3068,7 @@ async fn test_deployment_unconditional_main_update_ignores_status_churn() {
         .unwrap();
 
     let pause = state.install_resource_mutation_pause(
-        crate::bootstrap::composition_tests::native_api::support::IntegrationResourceMutationPauseOperation::MainUpdate,
+        klights_cluster_datastore::test_support::ResourceMutationPauseOperation::MainUpdate,
         "apps/v1",
         "Deployment",
         Some("deploy-main-update-race"),

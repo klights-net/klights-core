@@ -791,7 +791,6 @@ async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
         &[command]
     );
 }
-use crate::bootstrap::composition_tests::support::OutboxPayload;
 use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::command::StorageCommand;
 use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
@@ -855,9 +854,10 @@ fn pod_status_payload(uid: &str) -> Bytes {
         observed_status_stamp: None,
     };
     Bytes::from(
-        OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .expect("encode payload"),
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(command),
+        )
+        .expect("encode payload"),
     )
 }
 
@@ -879,9 +879,10 @@ fn pod_delete_payload_for(
         observed_resource_version,
     };
     Bytes::from(
-        OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .expect("encode payload"),
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(command),
+        )
+        .expect("encode payload"),
     )
 }
 

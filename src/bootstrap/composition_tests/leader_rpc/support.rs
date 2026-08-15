@@ -19,32 +19,6 @@ pub(crate) async fn canonical_sqlite_fixture()
     crate::bootstrap::composition::cluster_store::selector::canonical_sqlite_fixture().await
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct OutboxPayload {
-    pub(crate) command: klights_cluster_core::StorageCommand,
-}
-
-impl OutboxPayload {
-    pub(crate) fn from_command(command: klights_cluster_core::StorageCommand) -> Self {
-        Self { command }
-    }
-
-    pub(crate) fn encode_protobuf(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(
-            klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
-                &klights_cluster_core::OutboxPayload::new(self.command.clone()),
-            )?,
-        )
-    }
-
-    pub(crate) fn decode_protobuf(bytes: &[u8]) -> anyhow::Result<Self> {
-        Ok(Self {
-            command: klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(bytes)?
-                .into_command(),
-        })
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum BootstrapTokenScope {
     Worker,
