@@ -225,52 +225,24 @@ klights-kubelet = { workspace = true }
 klights-auth = { workspace = true }
 klights-controllers = { workspace = true }
 klights-supervisor = { workspace = true }
-klights-internal-protobuf = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }
-rustls = { workspace = true }
-rcgen = { workspace = true }
-rusqlite = { workspace = true }
-tokio-rusqlite = { workspace = true }
-redb = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-k8s-openapi = { workspace = true }
-kube = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-async-stream = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
-hyper = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-bytes = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
-hyper-util = { workspace = true }
 time = { workspace = true }
-x509-parser = { workspace = true }
-base64 = { workspace = true }
 hostname = { workspace = true }
-tonic = { workspace = true, features = ["router", "transport", "codegen", "tls-ring"] }
-tonic-reflection = { workspace = true }
 async-trait = { workspace = true }
-k8s-cri = { workspace = true }
 chrono = { workspace = true, features = ["clock", "oldtime", "wasmbind"] }
-reqwest = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
-tokio-tungstenite = { workspace = true }
-sha2 = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
-rsa = { workspace = true }
-h2 = { workspace = true }
-cron = { workspace = true }
 # memory: jemalloc global allocator. Replaces glibc malloc, whose per-thread
 # arenas retain freed memory under churn and never return it to the OS
 # (multi-GB RSS that never shrinks). jemalloc fragments far less and, with
@@ -287,30 +259,41 @@ debug = 0
 incremental = false
 
 [dev-dependencies]
+async-stream = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
 k8s-native-service = { workspace = true, features = ["test-support"] }
 klights-auth = { workspace = true, features = ["test-support"] }
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-controllers = { workspace = true, features = ["test-support"] }
-klights-leader-api = { workspace = true, features = ["test-support"] }
+klights-internal-protobuf = { workspace = true }
 klights-kubelet = { workspace = true, features = ["test-support"] }
+klights-leader-api = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
-klights-watch = { workspace = true, features = ["integration-test-harness"] }
 klights-node-datastore = { workspace = true, features = ["test-support"] }
 klights-pod-api = { workspace = true, features = ["test-support"] }
+klights-watch = { workspace = true, features = ["integration-test-harness"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 openraft = { workspace = true }
-rtnetlink = { workspace = true }
+rcgen = { workspace = true }
+rsa = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tonic = { workspace = true, features = ["router", "transport", "codegen", "tls-ring"] }
+tonic-reflection = { workspace = true }
+tower = { workspace = true }
 urlencoding = { workspace = true }
+x509-parser = { workspace = true }
 
 [lints]
 workspace = true
 
 [features]
 default = ["full"]
-full = ["sqlite", "redb", "linux-network", "containerd"]
-sqlite = []
-redb = []
-linux-network = []
-containerd = []
+full = []
