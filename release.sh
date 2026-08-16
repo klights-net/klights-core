@@ -6,6 +6,13 @@ export CARGO_INCREMENTAL=1
 unset RUSTC_WRAPPER
 export CARGO_HOME="${HOME}/.cargo"
 
+RELEASE_TMP_ROOT="${KLIGHTS_TMP_ROOT:-/tmp/klights}"
+if [ -z "${TMPDIR:-}" ]; then
+  mkdir -p -m 700 "$RELEASE_TMP_ROOT"
+  export TMPDIR="$RELEASE_TMP_ROOT"
+fi
+export KLIGHTS_TMP_ROOT="$RELEASE_TMP_ROOT"
+
 usage() {
   cat <<'EOF_USAGE'
 Usage: ./release.sh [--dynamic|--static]
