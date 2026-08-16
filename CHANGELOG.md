@@ -6,6 +6,70 @@ This project uses GitHub Releases as the canonical public release page. The
 release workflow extracts the matching version section from this file and
 attaches distro packages to the GitHub Release.
 
+## [0.10.3] - 2026-08-16
+
+This release strengthens multinode correctness, Kubernetes API compatibility,
+Pod lifecycle reliability, and standalone package publication. It also
+completes a major internal ownership refactor for maintainability and clearer
+component boundaries.
+
+### What's new
+
+- **Multinode and Raft correctness.** Namespace, controller, CronJob, Service
+  allocation, Node lifecycle, garbage-collection, and bootstrap mutations now
+  consistently flow through committed Raft state. Snapshot delivery preserves
+  live state, and visible worker outbox effects retain strict ordering and
+  authority boundaries.
+- **Pod and kubelet reliability.** Actor-owned Pod finalization is serialized
+  and deadline-bounded, deferred deletion reminders survive leases, stale
+  same-name replacements are rejected, and CRI startup, reconnect, sandbox
+  event, and sandbox garbage-collection races are fenced. StatefulSet Pod
+  finalization and unscheduled Pod CAS deletion now complete through replicated
+  paths.
+- **API, LIST, and watch compatibility.** Typed LIST continuation semantics,
+  exact remaining-item counts, continuation TTL expiry, replicated
+  `resourceVersion` advancement, cross-version Event lists, CRD replay, and
+  positioned watch recovery are preserved across leader and datastore paths.
+  No-op mutations no longer churn public resource versions.
+- **Controller and admission behavior.** PodDisruptionBudget eviction admission
+  is centralized, webhook calls use the service routing path, CronJob status is
+  checked against live state, generated Pod name collisions are retried, and
+  foreground/orphan garbage collection retries safely through Raft conflicts.
+- **Networking and image distribution.** Routing watches remain live across
+  Raft progress, Docker Hub image names are normalized, and image pulls can be
+  routed through the registry proxy.
+- **Maintainability.** A major internal refactor establishes focused crate
+  ownership, private composition boundaries, and clearer datastore, kubelet,
+  controller, networking, authentication, and replication interfaces.
+- **Standalone releases.** `klights-core` release builds now create their own
+  temporary root and no longer inherit the base repository's sccache wrapper,
+  while base builds continue to use the shared sccache configuration.
+
+### Kubernetes compatibility status
+
+- Targets Kubernetes v1.34.6 API compatibility.
+- Multinode writes consistently use committed Raft apply paths, including
+  controller, lifecycle, allocation, and cleanup effects.
+- JSON and protobuf LIST/watch behavior retains positioned resource-version
+  and continuation semantics across failover and replay.
+
+### Binary packages
+
+This release publishes:
+
+- Static binaries: `klights-linux-x86_64-static`, `klights-linux-arm64-static`
+- Ubuntu 24.04 (noble): `klights_0.10.3-1~noble_amd64.deb`, `klights_0.10.3-1~noble_arm64.deb`
+- Ubuntu 26.04 (resolute): `klights_0.10.3-1~resolute_amd64.deb`, `klights_0.10.3-1~resolute_arm64.deb`
+- RHEL 9: `klights-0.10.3-1.el9.x86_64.rpm`, `klights-0.10.3-1.el9.aarch64.rpm`
+- RHEL 10: `klights-0.10.3-1.el10.x86_64.rpm`, `klights-0.10.3-1.el10.aarch64.rpm`
+- RHEL runtime dependencies: `containerd-2.3.2-1.el9.x86_64.rpm`, `containerd-2.3.2-1.el9.aarch64.rpm`, `containerd-2.3.2-1.el10.x86_64.rpm`, `containerd-2.3.2-1.el10.aarch64.rpm`, `runc-1.5.0-1.el9.x86_64.rpm`, `runc-1.5.0-1.el9.aarch64.rpm`, `runc-1.5.0-1.el10.x86_64.rpm`, `runc-1.5.0-1.el10.aarch64.rpm`
+
+Package repositories are published from the `package-repo` branch:
+
+- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
+- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
+
 ## [0.9.14] - 2026-07-14
 
 This release completes **HTTP content-negotiation (Accept) fidelity** for
