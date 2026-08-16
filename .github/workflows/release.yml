@@ -443,6 +443,11 @@ jobs:
           test -s public/klights-archive-keyring.asc
           grep -q "BEGIN PGP PUBLIC KEY BLOCK" public/klights-archive-keyring.asc
 
+      - name: Prepare publish temporary root
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/klights"
+          echo "KLIGHTS_TMP_ROOT=$RUNNER_TEMP/klights" >> "$GITHUB_ENV"
+
       - name: Sign RPM packages
         env:
           PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
