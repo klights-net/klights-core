@@ -55,9 +55,6 @@ component boundaries.
 
 ### Known beta limitations
 
-The following limitations are carried forward from 0.9.14; this release does
-not claim to resolve them:
-
 - HPA autoscaling and metrics-backed control loops remain incomplete.
 - Pod subresource coverage remains incomplete, including `pods/attach` and
   `pods/binding` compatibility gaps.
