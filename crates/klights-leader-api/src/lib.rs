@@ -8,13 +8,14 @@ pub mod replication;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub use controlplane_join::{
-    ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
-    ControlplaneJoinAuthority, ControlplaneJoinError, ControlplaneJoinFuture,
-    ControlplaneJoinHandler, ControlplaneJoinMetadata, ControlplaneJoinMetadataFuture,
-    ControlplaneJoinOutcome, ControlplaneJoinRegistration, ControlplaneJoinRegistrationFuture,
-    ControlplaneJoinRegistrationSnapshot, ControlplaneJoinRequest, ControlplaneJoinRoute,
-    ControlplaneMemberQuery, ControlplaneMemberQueryFuture, RaftStorageAttestation,
-    RaftStorageLogAttestation, RemoteNodeHostFacts, RemoteNodeMode, RemoteNodeRegistrationSnapshot,
+    CONTROLPLANE_JOIN_RPC_DEADLINE, ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture,
+    ControlplaneJoinAdmissionOutcome, ControlplaneJoinAuthority, ControlplaneJoinError,
+    ControlplaneJoinFuture, ControlplaneJoinHandler, ControlplaneJoinMetadata,
+    ControlplaneJoinMetadataFuture, ControlplaneJoinOutcome, ControlplaneJoinRegistration,
+    ControlplaneJoinRegistrationFuture, ControlplaneJoinRegistrationSnapshot,
+    ControlplaneJoinRequest, ControlplaneJoinRoute, ControlplaneMemberQuery,
+    ControlplaneMemberQueryFuture, RaftStorageAttestation, RaftStorageLogAttestation,
+    RemoteNodeHostFacts, RemoteNodeMode, RemoteNodeRegistrationSnapshot,
 };
 pub use peer_endpoint::{
     ControlplaneDiscoveryEvent, PeerEndpoint, extract_controlplane_endpoint, node_external_ip,

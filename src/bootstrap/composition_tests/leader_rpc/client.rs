@@ -1713,14 +1713,20 @@ mod cases {
         );
 
         // Each closure invokes one unary RPC; all must be bounded.
-        macro_rules! assert_bounded {
-            ($label:expr, $call:expr) => {{
-                let outcome = tokio::time::timeout(Duration::from_secs(5), $call).await;
+        macro_rules! assert_bounded_with {
+            ($label:expr, $limit:expr, $call:expr) => {{
+                let outcome = tokio::time::timeout($limit, $call).await;
                 assert!(
                     outcome.is_ok(),
                     "{} must be bounded by the per-call deadline, not the server wedge",
                     $label
                 );
+            }};
+        }
+
+        macro_rules! assert_bounded {
+            ($label:expr, $call:expr) => {{
+                assert_bounded_with!($label, Duration::from_secs(5), $call);
             }};
         }
 
@@ -1821,8 +1827,12 @@ mod cases {
                 },
             },
         };
-        assert_bounded!(
+        // Control-plane admission deliberately has a 30-second proof budget
+        // for lossy 200 ms RTT links; its bound is checked separately from
+        // ordinary 300 ms unary calls.
+        assert_bounded_with!(
             "join_as_controlplane_rpc",
+            Duration::from_secs(35),
             client.join_as_controlplane_rpc(2, "https://127.0.0.1:1", &controlplane_registration,)
         );
         assert_bounded!(

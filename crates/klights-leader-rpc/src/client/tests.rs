@@ -9,7 +9,7 @@ mod cases {
     use super::super::{ConnectDispatchContext, dispatch_leader_message};
 
     use klights_internal_protobuf::{self, follower_message, leader_message};
-    use klights_leader_api::JoinRole;
+    use klights_leader_api::{CONTROLPLANE_JOIN_RPC_DEADLINE, JoinRole};
 
     use klights_leader_rpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, NodeControlRuntimes, NodeExecCapability,
@@ -91,6 +91,15 @@ mod cases {
             super::super::worker_control_stream_reconnect_delay(u32::MAX),
             Duration::from_secs(5),
             "control-stream recovery must cap retries instead of growing an unbounded delay"
+        );
+    }
+
+    #[test]
+    fn controlplane_join_uses_a_longer_deadline_than_ordinary_unary_calls() {
+        assert!(
+            CONTROLPLANE_JOIN_RPC_DEADLINE
+                > super::super::GrpcTransportPolicy::default().unary_deadline,
+            "learner admission must have room for replication proof on a lossy WAN"
         );
     }
 

@@ -1287,6 +1287,21 @@ impl ReplicationGrpcClient {
         F: Fn(TonicClient<Channel>) -> Fut,
         Fut: Future<Output = std::result::Result<T, tonic::Status>>,
     {
+        self.unary_call_with_deadline(name, lane, self.policy.unary_deadline, make_call)
+            .await
+    }
+
+    async fn unary_call_with_deadline<T, F, Fut>(
+        &self,
+        name: &'static str,
+        lane: ChannelLane,
+        deadline: std::time::Duration,
+        make_call: F,
+    ) -> std::result::Result<T, UnaryRpcError>
+    where
+        F: Fn(TonicClient<Channel>) -> Fut,
+        Fut: Future<Output = std::result::Result<T, tonic::Status>>,
+    {
         let mut last_retryable: Option<String> = None;
         for endpoint in self.leader_endpoint_candidates() {
             self.set_current_leader_endpoint(Some(endpoint.clone()));
@@ -1299,7 +1314,7 @@ impl ReplicationGrpcClient {
             };
             match self
                 .supervisor
-                .timeout(name, self.policy.unary_deadline, make_call(client))
+                .timeout(name, deadline, make_call(client))
                 .await
             {
                 Ok(Ok(Ok(value))) => return Ok(value),
@@ -1322,10 +1337,7 @@ impl ReplicationGrpcClient {
                     // Evict the lane so the next attempt / durable retry
                     // rebuilds a fresh connection.
                     self.invalidate_lane(lane).await;
-                    last_retryable = Some(format!(
-                        "{name} deadline exceeded after {:?}",
-                        self.policy.unary_deadline
-                    ));
+                    last_retryable = Some(format!("{name} deadline exceeded after {:?}", deadline));
                     continue;
                 }
                 Err(err) => {
@@ -1635,9 +1647,10 @@ impl ReplicationGrpcClient {
         };
         let join_token = self.controlplane_join_token_value()?;
         let response = self
-            .unary_call(
+            .unary_call_with_deadline(
                 "grpc_join_as_controlplane",
                 ChannelLane::Read,
+                klights_leader_api::CONTROLPLANE_JOIN_RPC_DEADLINE,
                 move |mut client| {
                     let request = request.clone();
                     let join_token = join_token.clone();

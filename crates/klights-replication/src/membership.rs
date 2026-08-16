@@ -20,6 +20,13 @@ use crate::types::{RaftMemberLogId, RaftMemberNode, StorageCommandPayload, TypeC
 
 const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
 
+/// A fresh learner may need several lossy round trips before its replication
+/// match becomes observable. Keep this bounded per admission attempt and below
+/// the join RPC deadline; the durable provisional marker lets retries continue
+/// after a lossy 200 ms RTT attempt expires.
+pub const CONTROLPLANE_REPLICATION_WAIT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
 /// Return the supervised retry delay for a rejected or unavailable
 /// control-plane membership join. The caller owns the timer and cancellation;
 /// this membership policy only determines the bounded delay.
@@ -39,6 +46,18 @@ struct RaftMemberAdmission {
 pub enum RaftMemberAdmissionResult {
     Changed,
     Unchanged,
+}
+
+/// Authenticated storage identity and requested role used by a control-plane
+/// admission attempt.
+#[derive(Debug, Clone)]
+pub struct ControlplaneAdmissionRequest {
+    pub node_id: NodeId,
+    pub addr: String,
+    pub as_learner: bool,
+    pub storage_incarnation: String,
+    pub storage_log_attestation: klights_leader_api::RaftStorageAttestation,
+    pub controlplane_limit: usize,
 }
 
 /// One-shot metadata RPC port used by the exact codec-v3 activation preflight.
@@ -296,6 +315,10 @@ impl EmbeddedRaftMembership {
         format!("{RAFT_MEMBER_ADMISSION_META_PREFIX}{node_id}")
     }
 
+    fn admission_marker_is_complete(admission: Option<&RaftMemberAdmission>) -> bool {
+        admission.is_some_and(|admitted| admitted.proven_log.is_some())
+    }
+
     async fn read_member_admission(&self, node_id: NodeId) -> Result<Option<RaftMemberAdmission>> {
         self.materializer
             .read_raft_metadata(&Self::member_admission_meta_key(node_id))
@@ -329,7 +352,7 @@ impl EmbeddedRaftMembership {
 
     async fn wait_for_uniform_membership(&self, operation: &str) -> Result<()> {
         self.raft
-            .wait(Some(std::time::Duration::from_secs(5)))
+            .wait(Some(CONTROLPLANE_REPLICATION_WAIT_TIMEOUT))
             .metrics(
                 |metrics| {
                     metrics
@@ -387,13 +410,14 @@ impl EmbeddedRaftMembership {
             })
     }
 
-    async fn wait_for_target_replication_match(
+    async fn wait_for_target_replication_match_with_timeout(
         &self,
         node_id: NodeId,
+        timeout: std::time::Duration,
     ) -> Result<klights_leader_api::RaftStorageLogAttestation> {
         let metrics = self
             .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
+            .wait(Some(timeout))
             .metrics(
                 |metrics| {
                     metrics
@@ -446,6 +470,38 @@ impl EmbeddedRaftMembership {
         storage_log_attestation: klights_leader_api::RaftStorageAttestation,
         controlplane_limit: usize,
     ) -> Result<RaftMemberAdmissionResult> {
+        self.admit_controlplane_member_with_limit_and_timeout(
+            ControlplaneAdmissionRequest {
+                node_id,
+                addr,
+                as_learner,
+                storage_incarnation,
+                storage_log_attestation,
+                controlplane_limit,
+            },
+            CONTROLPLANE_REPLICATION_WAIT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Admit a control-plane member with an explicit bounded replication-proof
+    /// wait. Production callers use [`Self::admit_controlplane_member_with_limit`]
+    /// so the 20-second lossy-link budget remains a single policy constant;
+    /// composition tests use this seam to inject an interrupted proof without
+    /// waiting for the production timeout.
+    pub async fn admit_controlplane_member_with_limit_and_timeout(
+        &self,
+        request: ControlplaneAdmissionRequest,
+        replication_wait_timeout: std::time::Duration,
+    ) -> Result<RaftMemberAdmissionResult> {
+        let ControlplaneAdmissionRequest {
+            node_id,
+            addr,
+            as_learner,
+            storage_incarnation,
+            storage_log_attestation,
+            controlplane_limit,
+        } = request;
         let _guard = self.membership_mutex.lock().await;
         if node_id == self.node_id {
             anyhow::bail!("control-plane Join node id {node_id} is this leader");
@@ -469,6 +525,7 @@ impl EmbeddedRaftMembership {
         let incarnation_matches = previous.as_ref().is_some_and(|admitted| {
             admitted.storage_incarnation == storage_incarnation && admitted.addr == addr
         });
+        let admission_complete = Self::admission_marker_is_complete(previous.as_ref());
         let behind_admitted = previous.as_ref().is_some_and(|admitted| {
             Self::attestation_is_behind(
                 storage_log_attestation.high_watermark.as_ref(),
@@ -481,7 +538,12 @@ impl EmbeddedRaftMembership {
             live_match.as_ref(),
         );
         let requested_role_matches = is_member && (is_voter != as_learner);
-        if incarnation_matches && !behind_admitted && !behind_live && requested_role_matches {
+        if incarnation_matches
+            && admission_complete
+            && !behind_admitted
+            && !behind_live
+            && requested_role_matches
+        {
             return Ok(RaftMemberAdmissionResult::Unchanged);
         }
 
@@ -546,8 +608,26 @@ impl EmbeddedRaftMembership {
         }
 
         let needs_learner_add = !is_member || session_changed;
-        let needs_catchup = needs_learner_add || (!is_voter && !as_learner);
-        if needs_catchup {
+        let needs_catchup = needs_learner_add
+            || (!is_voter && !as_learner)
+            || (previous.is_some() && !admission_complete);
+        if needs_learner_add {
+            // Record the exact-v3 admission intent before changing Raft
+            // membership.  If the first replication proof times out or the
+            // response is lost, a retry can safely resume this same session
+            // instead of mistaking its learner entry for legacy membership.
+            self.persist_member_admission(
+                node_id,
+                &RaftMemberAdmission {
+                    storage_incarnation: storage_incarnation.clone(),
+                    addr: addr.clone(),
+                    as_learner,
+                    proven_log: None,
+                },
+            )
+            .await?;
+        }
+        if needs_learner_add {
             self.raft
                 .add_learner(
                     node_id,
@@ -558,7 +638,13 @@ impl EmbeddedRaftMembership {
                 .map_err(|error| anyhow::anyhow!("Raft::add_learner({node_id}): {error}"))?;
         }
         let caught_up_match = if needs_catchup {
-            Some(self.wait_for_target_replication_match(node_id).await?)
+            Some(
+                self.wait_for_target_replication_match_with_timeout(
+                    node_id,
+                    replication_wait_timeout,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -584,16 +670,6 @@ impl EmbeddedRaftMembership {
                     )
                 })?;
         }
-        if !as_learner && (!is_voter || session_changed) {
-            voters_after.insert(node_id);
-            self.raft
-                .change_membership(voters_after, true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("Raft::change_membership(promote {node_id}): {error}")
-                })?;
-        }
-
         let proven_log = if needs_catchup {
             caught_up_match.or(storage_log_attestation.high_watermark)
         } else {
@@ -612,6 +688,15 @@ impl EmbeddedRaftMembership {
             },
         )
         .await?;
+        if !as_learner && (!is_voter || session_changed) {
+            voters_after.insert(node_id);
+            self.raft
+                .change_membership(voters_after, true)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("Raft::change_membership(promote {node_id}): {error}")
+                })?;
+        }
         Ok(RaftMemberAdmissionResult::Changed)
     }
 
@@ -831,6 +916,45 @@ mod tests {
             Some(&truncated_boundary),
             Some(&admitted),
         ));
+    }
+
+    #[test]
+    fn provisional_admission_marker_is_not_treated_as_complete() {
+        let pending = RaftMemberAdmission {
+            storage_incarnation: uuid::Uuid::new_v4().to_string(),
+            addr: "https://pending.example:7679".to_string(),
+            as_learner: false,
+            proven_log: None,
+        };
+        let proven = RaftMemberAdmission {
+            proven_log: Some(klights_leader_api::RaftStorageLogAttestation {
+                term: 1,
+                leader_node_id: 1,
+                index: 10,
+            }),
+            ..pending.clone()
+        };
+
+        assert!(!EmbeddedRaftMembership::admission_marker_is_complete(Some(
+            &pending,
+        )));
+        assert!(EmbeddedRaftMembership::admission_marker_is_complete(Some(
+            &proven,
+        )));
+        assert!(!EmbeddedRaftMembership::admission_marker_is_complete(None));
+    }
+
+    #[test]
+    fn lossy_join_wait_budget_exceeds_original_single_retry_window() {
+        assert!(
+            CONTROLPLANE_REPLICATION_WAIT_TIMEOUT > std::time::Duration::from_secs(5),
+            "200 ms RTT with packet loss needs more than the old five-second proof window"
+        );
+        assert!(
+            CONTROLPLANE_REPLICATION_WAIT_TIMEOUT
+                < klights_leader_api::CONTROLPLANE_JOIN_RPC_DEADLINE,
+            "the server proof wait must finish before the join RPC deadline"
+        );
     }
 
     #[test]

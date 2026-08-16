@@ -33,8 +33,8 @@ mod tests {
     };
     use klights_node_datastore::SqliteRaftDurability;
     use klights_replication::membership::{
-        CommandCodecV3ActivationError, CommandCodecV3PreflightError, MemberFeatureProbe,
-        RaftMemberAdmissionResult,
+        CommandCodecV3ActivationError, CommandCodecV3PreflightError, ControlplaneAdmissionRequest,
+        MemberFeatureProbe, RaftMemberAdmissionResult,
     };
     use klights_replication::types::RaftMemberLogId;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
@@ -134,6 +134,10 @@ mod tests {
         fn lookup(&self, node_id: NodeId) -> Option<LoopbackRegistryEntry> {
             self.inner.read().unwrap().get(&node_id).cloned()
         }
+
+        fn unregister(&self, node_id: NodeId) {
+            self.inner.write().unwrap().remove(&node_id);
+        }
     }
 
     #[derive(Clone)]
@@ -174,7 +178,11 @@ mod tests {
 
     impl LoopbackRaftNetwork {
         fn receiver_session_is_stale(&self, entry: &LoopbackRegistryEntry) -> bool {
-            if self.bound_generation != entry.generation
+            // A client created while a peer was temporarily unavailable has
+            // generation zero.  Once that peer registers, the same OpenRaft
+            // retry client must be allowed to establish its first session;
+            // non-zero generations still fence replacement sessions.
+            if (self.bound_generation != 0 && self.bound_generation != entry.generation)
                 || (self.receiver_admission.storage_incarnation != uuid::Uuid::nil().to_string()
                     && self.receiver_admission.storage_incarnation != entry.storage_incarnation)
             {
@@ -2998,6 +3006,124 @@ mod tests {
         leader.shutdown().await.unwrap();
         learner.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn interrupted_controlplane_admission_retry_resumes_provisional_learner() {
+        let registry = LoopbackRegistry::new();
+        let (leader, leader_backend) = fresh_voter_in_registry_with_backend(86, &registry).await;
+        let joiner = fresh_voter_in_registry(87, &registry).await;
+        leader
+            .bootstrap_single_voter("https://10.99.0.86:7679".into())
+            .await
+            .unwrap();
+        wait_for_leader(&leader, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let incarnation = joiner.storage_incarnation().to_string();
+        registry.unregister(87);
+        let first_error = leader
+            .membership()
+            .admit_controlplane_member_with_limit_and_timeout(
+                ControlplaneAdmissionRequest {
+                    node_id: 87,
+                    addr: "https://10.99.0.87:7679".into(),
+                    as_learner: false,
+                    storage_incarnation: incarnation.clone(),
+                    storage_log_attestation: storage_attestation(None),
+                    controlplane_limit: 3,
+                },
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .expect_err("an interrupted first proof must leave a retryable admission");
+        assert!(
+            first_error.to_string().contains("replication match proof"),
+            "unexpected interrupted admission error: {first_error}"
+        );
+        let marker = leader_backend
+            .get_klights_meta("raft_member_admission/87")
+            .await
+            .unwrap()
+            .expect("provisional admission marker must be durable before learner add");
+        assert!(
+            marker.contains("\"proven_log\":null"),
+            "interrupted admission must retain a provisional marker: {marker}"
+        );
+        let pending = leader.raft.metrics().borrow().clone();
+        assert!(
+            pending
+                .membership_config
+                .membership()
+                .nodes()
+                .any(|(id, _)| *id == 87),
+            "the learner membership must survive the interrupted proof"
+        );
+        assert!(
+            !pending
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|id| id == 87),
+            "the interrupted learner must not be promoted"
+        );
+
+        registry.register(
+            87,
+            joiner.raft.clone(),
+            joiner.storage_incarnation().to_string(),
+        );
+        assert_eq!(
+            leader
+                .membership()
+                .admit_controlplane_member_with_limit_and_timeout(
+                    ControlplaneAdmissionRequest {
+                        node_id: 87,
+                        addr: "https://10.99.0.87:7679".into(),
+                        as_learner: false,
+                        storage_incarnation: incarnation,
+                        storage_log_attestation: storage_attestation(None),
+                        controlplane_limit: 3,
+                    },
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .expect("retry must resume the existing provisional learner"),
+            RaftMemberAdmissionResult::Changed
+        );
+        let final_metrics = leader.raft.metrics().borrow().clone();
+        assert!(
+            final_metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|id| id == 87),
+            "a resumed control-plane admission must promote only after proof"
+        );
+        let (_, member) = final_metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .find(|(id, _)| **id == 87)
+            .expect("resumed member remains in membership");
+        assert!(
+            member.admitted_log.is_some(),
+            "the resumed voter must carry the proven replication boundary"
+        );
+        let proven_marker = leader_backend
+            .get_klights_meta("raft_member_admission/87")
+            .await
+            .unwrap()
+            .expect("final admission marker must remain durable");
+        assert!(
+            !proven_marker.contains("\"proven_log\":null"),
+            "the final admission marker must record the proof: {proven_marker}"
+        );
+
+        leader.shutdown().await.unwrap();
+        joiner.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn existing_member_without_v3_admission_marker_fails_closed_without_mutation() {
         let registry = LoopbackRegistry::new();

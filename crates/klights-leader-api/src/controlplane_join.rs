@@ -1,6 +1,14 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
+
+/// The bounded client deadline for authenticated control-plane admission.
+///
+/// Admission may have to wait for a fresh learner to prove replication before
+/// it can be promoted.  That proof is deliberately longer than ordinary
+/// leader reads/writes so a lossy 200 ms RTT link gets a complete retry window.
+pub const CONTROLPLANE_JOIN_RPC_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct RaftStorageLogAttestation {
