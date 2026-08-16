@@ -153,8 +153,18 @@ jobs:
             chmod +x /usr/local/bin/kubectl
             mkdir -p /tmp/klights
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
-            kubectl get nodes
-            kubectl wait --for=condition=Ready node --all --timeout=5s
+            for attempt in $(seq 1 60); do
+              if kubectl get nodes; then
+                break
+              fi
+              if test "$attempt" -eq 60; then
+                systemctl --no-pager --full status klights || true
+                journalctl -u klights --no-pager -n 200 || true
+                exit 1
+              fi
+              sleep 2
+            done
+            kubectl wait --for=condition=Ready node --all --timeout=30s
             kubectl get nodes -o wide
             kubectl version -o yaml | tee /tmp/klights/version.yaml
             grep -F "gitVersion: v1.34.6" /tmp/klights/version.yaml
@@ -324,8 +334,18 @@ jobs:
             chmod +x /usr/local/bin/kubectl
             mkdir -p /tmp/klights
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
-            kubectl get nodes
-            kubectl wait --for=condition=Ready node --all --timeout=5s
+            for attempt in $(seq 1 60); do
+              if kubectl get nodes; then
+                break
+              fi
+              if test "$attempt" -eq 60; then
+                systemctl --no-pager --full status klights || true
+                journalctl -u klights --no-pager -n 200 || true
+                exit 1
+              fi
+              sleep 2
+            done
+            kubectl wait --for=condition=Ready node --all --timeout=30s
             kubectl get nodes -o wide
             kubectl version -o yaml | tee /tmp/klights/version.yaml
             grep -F "gitVersion: v1.34.6" /tmp/klights/version.yaml
