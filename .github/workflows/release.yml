@@ -16,6 +16,9 @@ permissions:
 
 jobs:
   build:
+    # Only run on the public repo (klights-net/klights-core), never on the
+    # private origin mirror (beyona/klights-core).
+    if: github.repository == 'klights-net/klights-core'
     strategy:
       fail-fast: false
       matrix:
@@ -197,6 +200,7 @@ jobs:
           retention-days: 14
   package:
     needs: build
+    if: github.repository == 'klights-net/klights-core'
     strategy:
       fail-fast: false
       matrix:
@@ -339,6 +343,7 @@ jobs:
 
   publish:
     needs: package
+    if: github.repository == 'klights-net/klights-core'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository

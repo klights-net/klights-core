@@ -13,6 +13,9 @@ permissions:
 jobs:
   ubuntu-apt:
     name: Ubuntu ${{ matrix.ubuntu_version }} APT package smoke (${{ matrix.deb_arch }})
+    # Only run on the public repo (klights-net/klights-core), never on the
+    # private origin mirror (beyona/klights-core).
+    if: github.repository == 'klights-net/klights-core'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     strategy:
@@ -204,6 +207,7 @@ jobs:
 
   rhel-rpm:
     name: RHEL-compatible ${{ matrix.rhel_major }} RPM package smoke (${{ matrix.rpm_arch }})
+    if: github.repository == 'klights-net/klights-core'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     strategy:
