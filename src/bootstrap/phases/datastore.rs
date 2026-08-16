@@ -492,13 +492,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 ),
             );
             let local_node_lease_renewal = Arc::new(
-                crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewalAdapter::new(
+                crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewal::new(
                     node_lease_tracker.clone(),
                     leader_authority.clone(),
                 ),
             );
             let local_projected_token = Arc::new(
-                crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+                crate::bootstrap::local_leader_adapters::LocalProjectedToken::new(
                     passive_read_ports.resource_reads(),
                     config.node_name.clone(),
                     config.containerd_namespace.clone(),
@@ -509,7 +509,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 .with_authority_signing_fence(leader_authority.signing_fence()),
             );
             let authenticated_projected_token = Arc::new(
-                crate::bootstrap::local_leader_adapters::AuthenticatedProjectedTokenIssuer::new(
+                crate::bootstrap::local_leader_adapters::AuthenticatedProjectedTokenService::new(
                     local_projected_token.clone(),
                 ),
             );
@@ -529,7 +529,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 ),
             );
             let local_node_lifecycle_status = Arc::new(
-                crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
+                crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatus::new(
                     local_resource_query.clone(),
                     local_resource_commands.clone(),
                     leader_authority.clone(),

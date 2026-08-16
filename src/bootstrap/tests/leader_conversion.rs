@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use crate::bootstrap::local_leader_adapters::{
-    LocalNodeLeaseRenewalAdapter, LocalNodeLifecycleStatusAdapter, LocalProjectedTokenAdapter,
+    LocalNodeLeaseRenewal, LocalNodeLifecycleStatus, LocalProjectedToken,
 };
 use klights_leader_api::{
     LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderOutboxDelivery,
@@ -100,7 +100,7 @@ fn concrete_leader_clients_implement_focused_pod_effect_ports() {
     {
     }
 
-    assert_ports::<LocalProjectedTokenAdapter>();
+    assert_ports::<LocalProjectedToken>();
     assert_ports::<klights_leader_rpc::client::RemoteApiClient>();
     assert_ports::<crate::bootstrap::composition::authority_routed_leader::AuthorityRoutedLeader>();
     assert_ports::<crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder>();
@@ -511,11 +511,11 @@ fn node_effect_ports_have_the_frozen_authority_split() {
     fn assert_lease<T: klights_leader_api::LeaderNodeLeaseRenewal>() {}
     fn assert_local_lifecycle<T: klights_leader_api::LeaderNodeLifecycleStatus>() {}
 
-    assert_lease::<LocalNodeLeaseRenewalAdapter>();
+    assert_lease::<LocalNodeLeaseRenewal>();
     assert_lease::<klights_leader_rpc::client::RemoteApiClient>();
     assert_lease::<crate::bootstrap::composition::authority_routed_leader::AuthorityRoutedLeader>();
     assert_lease::<crate::bootstrap::composition::authority_routed_leader::StubRemoteForwarder>();
-    assert_local_lifecycle::<LocalNodeLifecycleStatusAdapter>();
+    assert_local_lifecycle::<LocalNodeLifecycleStatus>();
 }
 
 #[tokio::test]
@@ -524,7 +524,7 @@ async fn node_effect_ports_gate_follower_lease_before_tracker_mutation() {
         chrono::Utc::now(),
     ));
     let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
-    let local = LocalNodeLeaseRenewalAdapter::new(tracker.clone(), follower_rx);
+    let local = LocalNodeLeaseRenewal::new(tracker.clone(), follower_rx);
     let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
         "cp-1",
         klights_cluster_core::k8s_time::format_time(chrono::Utc::now()),
@@ -570,7 +570,7 @@ async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::Utc::now(),
     ));
-    let client = LocalNodeLeaseRenewalAdapter::new(
+    let client = LocalNodeLeaseRenewal::new(
         tracker.clone(),
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
@@ -641,7 +641,7 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
         Arc::new(canonical.clone()),
         canonical.focused_read_store(),
     );
-    let client = LocalNodeLifecycleStatusAdapter::new(resource_query, resource_commands, authority);
+    let client = LocalNodeLifecycleStatus::new(resource_query, resource_commands, authority);
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
@@ -751,7 +751,7 @@ async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
         resource_version: created.resource_version + 1,
     });
     let client =
-        LocalNodeLifecycleStatusAdapter::new(resource_query, resource_commands.clone(), authority);
+        LocalNodeLifecycleStatus::new(resource_query, resource_commands.clone(), authority);
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),

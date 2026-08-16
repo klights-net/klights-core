@@ -136,21 +136,6 @@ impl RootPeerDataplane {
         }
     }
 
-    #[cfg(feature = "test-support")]
-    pub fn direct_for_test(
-        handle: rtnetlink::Handle,
-        local_pod_subnet: klights_types::PodSubnet,
-        wireguard_device: impl Into<String>,
-        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Self {
-        Self::direct(
-            handle,
-            local_pod_subnet,
-            wireguard_device.into(),
-            task_supervisor,
-        )
-    }
-
     pub fn health(&self) -> &DataplaneHealth {
         &self.health
     }

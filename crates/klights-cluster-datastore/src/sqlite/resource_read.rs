@@ -186,12 +186,6 @@ fn list_response_resource_version(_items: &[Resource], current_rv: i64) -> i64 {
 
 impl SqliteReadStore {
     #[cfg(any(test, feature = "test-support"))]
-    pub fn resource_get_call_count_for_test(&self) -> u64 {
-        self.resource_get_call_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
     pub fn install_list_resources_snapshot_pause_for_test(
         api_version: &str,
         kind: &str,
@@ -275,10 +269,6 @@ impl SqliteReadStore {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        #[cfg(any(test, feature = "test-support"))]
-        self.resource_get_call_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         if api_version == "v1" && kind == "Namespace" && namespace.is_none() {
             return self.get_namespace(name).await;
         }

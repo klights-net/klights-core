@@ -388,7 +388,7 @@ impl IntegrationLeaderRpcComposition {
                 .authority_arc(),
         );
         let lifecycle_status =
-            crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
+            crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatus::new(
                 resource_query.clone(),
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 self.applied_outbox.clone(),
@@ -701,13 +701,13 @@ impl IntegrationLeaderRpcComposition {
                 self.resource_reads.clone(),
             );
         let local_node_lease = Arc::new(
-            crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewalAdapter::new(
+            crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewal::new(
                 node_lease_tracker,
                 authority.clone(),
             ),
         );
         let local_projected_token = Arc::new(
-            crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+            crate::bootstrap::local_leader_adapters::LocalProjectedToken::new(
                 self.resource_reads.clone(),
                 "grpc-test".to_string(),
                 crate::paths::runtime_namespace(),
@@ -717,7 +717,7 @@ impl IntegrationLeaderRpcComposition {
             ),
         );
         let projected_token = Arc::new(
-            crate::bootstrap::local_leader_adapters::AuthenticatedProjectedTokenIssuer::new(
+            crate::bootstrap::local_leader_adapters::AuthenticatedProjectedTokenService::new(
                 local_projected_token,
             ),
         );

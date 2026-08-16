@@ -1242,7 +1242,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
     let local_cache_readiness =
         Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
     let local_projected_token = Arc::new(
-        crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+        crate::bootstrap::local_leader_adapters::LocalProjectedToken::new(
             opened.read_ports.resource_reads(),
             "cp1".to_string(),
             "klights".to_string(),

@@ -3785,7 +3785,6 @@ impl Datastore {
     ) -> Result<Self> {
         // Schema + fingerprint are applied by the cluster-owned open adapter.
         #[cfg(test)]
-        let resource_get_call_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
         let fail_next_watch_position_observation =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3793,7 +3792,6 @@ impl Datastore {
         let focused_reads = std::sync::Arc::new(SqliteReadStore::new_with_test_instrumentation(
             read_executor.clone(),
             fail_next_watch_position_observation,
-            resource_get_call_count.clone(),
         ));
         #[cfg(not(test))]
         let focused_reads = std::sync::Arc::new(SqliteReadStore::new(read_executor.clone()));

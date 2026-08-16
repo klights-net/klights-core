@@ -19,7 +19,7 @@ klights-leader-api = { workspace = true }
 klights-node-api = { workspace = true }
 klights-internal-protobuf = { workspace = true }
 klights-supervisor = { workspace = true }
-klights-watch = { workspace = true, default-features = false, features = ["remote-cache"] }
+klights-watch = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }

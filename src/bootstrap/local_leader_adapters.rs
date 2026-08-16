@@ -95,8 +95,6 @@ impl LeaderNodeLeaseRenewal for LocalNodeLeaseRenewal {
     }
 }
 
-pub(crate) type LocalNodeLeaseRenewalAdapter = LocalNodeLeaseRenewal;
-
 /// Bootstrap-owned Node status CAS publisher.
 pub(crate) struct LocalNodeLifecycleStatus {
     resource_query: Arc<dyn LeaderResourceQuery>,
@@ -163,8 +161,6 @@ impl LeaderNodeLifecycleStatus for LocalNodeLifecycleStatus {
         })
     }
 }
-
-pub(crate) type LocalNodeLifecycleStatusAdapter = LocalNodeLifecycleStatus;
 
 fn node_lifecycle_status_command_error(error: ResourceCommandError) -> NodeLifecycleStatusError {
     let message = error.to_string();
@@ -357,6 +353,3 @@ impl LeaderAuthenticatedProjectedServiceAccountToken for AuthenticatedProjectedT
             .issue_projected_token_after_transport_auth(request)
     }
 }
-
-pub(crate) type LocalProjectedTokenAdapter = LocalProjectedToken;
-pub(crate) type AuthenticatedProjectedTokenIssuer = AuthenticatedProjectedTokenService;

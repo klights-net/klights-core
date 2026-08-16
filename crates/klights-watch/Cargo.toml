@@ -14,7 +14,6 @@ integration-test-harness = [
     "dep:klights-cluster-store",
     "klights-cluster-store/test-support",
 ]
-remote-cache = []
 session = ["dep:klights-cluster-store"]
 
 [dependencies]

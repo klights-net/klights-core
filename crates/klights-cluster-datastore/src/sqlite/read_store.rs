@@ -37,8 +37,6 @@ pub struct SqliteReadStore {
     executor: DbExecutor,
     #[cfg(any(test, feature = "test-support"))]
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(any(test, feature = "test-support"))]
-    pub resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub struct SqliteResourceList {
@@ -1084,8 +1082,6 @@ impl SqliteReadStore {
             fail_next_watch_position_observation: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
-            #[cfg(any(test, feature = "test-support"))]
-            resource_get_call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1093,12 +1089,10 @@ impl SqliteReadStore {
     pub fn new_with_test_instrumentation(
         executor: DbExecutor,
         fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             executor,
             fail_next_watch_position_observation,
-            resource_get_call_count,
         }
     }
 

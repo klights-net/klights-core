@@ -27,13 +27,6 @@ impl CniReadiness {
         (CniReadinessPublisher { tx }, Self { rx })
     }
 
-    #[cfg(test)]
-    pub fn ready_for_tests() -> Self {
-        let (publisher, readiness) = Self::channel();
-        publisher.publish_ready();
-        readiness
-    }
-
     pub async fn wait_ready(&self, cancel: CancellationToken) -> Result<()> {
         let mut rx = self.rx.clone();
         loop {
