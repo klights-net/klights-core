@@ -252,6 +252,11 @@ jobs:
         run: |
           chmod +x dist/binary/klights
 
+      - name: Prepare package temporary root
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/klights"
+          echo "KLIGHTS_TMP_ROOT=$RUNNER_TEMP/klights" >> "$GITHUB_ENV"
+
       - name: Validate tag and derive version
         env:
           RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
