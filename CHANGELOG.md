@@ -53,6 +53,32 @@ component boundaries.
 - JSON and protobuf LIST/watch behavior retains positioned resource-version
   and continuation semantics across failover and replay.
 
+### Known beta limitations
+
+The following limitations are carried forward from 0.9.14; this release does
+not claim to resolve them:
+
+- HPA autoscaling and metrics-backed control loops remain incomplete.
+- Pod subresource coverage remains incomplete, including `pods/attach` and
+  `pods/binding` compatibility gaps.
+- Built-in OpenAPI schemas remain incomplete, limiting `kubectl explain` for
+  built-in fields.
+- Scheduler behavior is not fully upstream-compatible for affinity,
+  anti-affinity, topology spread, PDB-aware preemption, preferred affinity
+  scoring, hostPort predicates, and some taint/default-priority behavior.
+- PodSecurity admission is not implemented.
+- Some ResourceQuota, LimitRange, DefaultStorageClass, Service and Pod
+  defaulting, ServiceAccount image-pull-secret propagation, and built-in field
+  selector behavior remains incomplete.
+- Some watch, delete, DeleteCollection, and foreground/orphan deletion edge
+  semantics remain incomplete.
+- NetworkPolicy resources are stored but are not yet enforced in the datapath.
+- Aggregated API server support remains passthrough-only.
+- API Priority and Fairness resources support CRUD/discovery, but request
+  prioritization is not enforced.
+- Server-Side Apply remains incomplete for schema-driven ownership, CRD
+  managed fields, and protobuf `managedFields` responses.
+
 ## [0.9.14] - 2026-07-14
 
 This release completes **HTTP content-negotiation (Accept) fidelity** for
