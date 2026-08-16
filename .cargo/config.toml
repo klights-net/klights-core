@@ -1,9 +1,6 @@
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
-[build]
-rustc-wrapper = "../scripts/sccache-wrapper.sh"
-
 [env]
 CARGO_INCREMENTAL = { value = "0", force = true }
 KLIGHTS_TMP_ROOT = { value = "/tmp/klights", force = false }
