@@ -55,19 +55,6 @@ impl StatusMutationTarget {
             None => format!("{} {} not found", self.kind, self.name),
         }
     }
-
-    fn disappeared_message(&self, operation: &str) -> String {
-        match self.namespace.as_deref() {
-            Some(namespace) => format!(
-                "{} {}/{} disappeared after status {}",
-                self.kind, namespace, self.name, operation
-            ),
-            None => format!(
-                "{} {} disappeared after status {}",
-                self.kind, self.name, operation
-            ),
-        }
-    }
 }
 
 pub trait StatusMutationDecoder: Send + Sync {
@@ -259,13 +246,13 @@ pub trait StatusMutationWriter: PatchApplication + Send + Sync {
         target: &StatusMutationTarget,
         status: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<(), AppError>;
+    ) -> Result<Resource, AppError>;
     async fn patch_metadata(
         &self,
         target: &StatusMutationTarget,
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<(), AppError>;
+    ) -> Result<Resource, AppError>;
 }
 
 pub struct DatastoreStatusMutationWriter<S> {
@@ -309,7 +296,7 @@ impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWri
         target: &StatusMutationTarget,
         status: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<(), AppError> {
+    ) -> Result<Resource, AppError> {
         crate::generic_command::update_resource_status(
             self.state.command_store().resource_command(),
             &target.api_version,
@@ -319,8 +306,7 @@ impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWri
             status,
             preconditions,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn patch_metadata(
@@ -328,7 +314,7 @@ impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWri
         target: &StatusMutationTarget,
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<(), AppError> {
+    ) -> Result<Resource, AppError> {
         crate::generic_command::patch_non_pod_resource(
             self.state.command_store().resource_command(),
             &target.api_version,
@@ -337,8 +323,7 @@ impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWri
             &target.name,
             ResourcePatchRequest::new(PatchKind::Merge, metadata_patch, preconditions),
         )
-        .await?;
-        Ok(())
+        .await
     }
 }
 
@@ -439,23 +424,27 @@ where
             .precondition
             .expected_resource_version(operation.precondition_document());
 
+        let mut committed_resource = None;
         if let Some(mut status) = operation.status_value(&working) {
             self.merge_policy
                 .merge_status(target, &current, &mut status);
-            self.writer
-                .write_status(
-                    target,
-                    status,
-                    ResourcePreconditions {
-                        uid: Some(current.uid.clone()),
-                        resource_version: expected_rv,
-                    },
-                )
-                .await?;
+            committed_resource = Some(
+                self.writer
+                    .write_status(
+                        target,
+                        status,
+                        ResourcePreconditions {
+                            uid: Some(current.uid.clone()),
+                            resource_version: expected_rv,
+                        },
+                    )
+                    .await?,
+            );
         }
 
         if let Some(metadata_patch) = operation.metadata_patch(&current, &working) {
-            self.writer
+            let metadata_resource = self
+                .writer
                 .patch_metadata(
                     target,
                     metadata_patch,
@@ -465,11 +454,15 @@ where
                     },
                 )
                 .await?;
+            // Return the exact object committed by the last mutation. A
+            // later controller write may race after this command, but
+            // rereading would return a different object than this request
+            // committed. Splicing status and metadata from separate commits
+            // would fabricate a resourceVersion/body pair that never existed.
+            committed_resource = Some(metadata_resource);
         }
 
-        let final_resource = self.writer.get(target).await?.ok_or_else(|| {
-            AppError::NotFound(target.disappeared_message(operation.operation_name()))
-        })?;
+        let final_resource = committed_resource.unwrap_or(current);
         let response = self
             .responder
             .build_response(target, final_resource.clone())?;
@@ -1204,6 +1197,158 @@ fn selector_string_from_flat_selector(resource: &Resource) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    struct EchoStatusResponder;
+
+    impl StatusMutationResponder for EchoStatusResponder {
+        fn build_response(
+            &self,
+            _target: &StatusMutationTarget,
+            final_resource: Resource,
+        ) -> Result<Value, AppError> {
+            Ok((*final_resource.data).clone())
+        }
+    }
+
+    struct ControllerRaceStatusWriter {
+        current: Arc<Mutex<Resource>>,
+        get_count: Arc<Mutex<usize>>,
+    }
+
+    impl ControllerRaceStatusWriter {
+        fn new() -> Self {
+            let resource = Resource::try_from_data(Arc::new(serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": {
+                    "name": "cron",
+                    "namespace": "default",
+                    "uid": "cron-uid",
+                    "resourceVersion": "1"
+                },
+                "spec": {"schedule": "* * * * *"},
+                "status": {}
+            })))
+            .expect("valid CronJob fixture");
+            Self {
+                current: Arc::new(Mutex::new(resource)),
+                get_count: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn resource_from(data: Value, resource_version: i64) -> Resource {
+            let mut resource = Resource::try_from_data(Arc::new(data)).expect("valid resource");
+            resource.resource_version = resource_version;
+            resource
+        }
+    }
+
+    impl PatchApplication for ControllerRaceStatusWriter {
+        fn apply_patch(
+            &self,
+            current: &Value,
+            _patch: &Value,
+            _content_type: Option<&str>,
+        ) -> Result<Value, AppError> {
+            Ok(current.clone())
+        }
+    }
+
+    #[async_trait]
+    impl StatusMutationWriter for ControllerRaceStatusWriter {
+        async fn get(&self, _target: &StatusMutationTarget) -> Result<Option<Resource>, AppError> {
+            let mut get_count = self.get_count.lock().unwrap();
+            *get_count += 1;
+            if *get_count == 2 {
+                // The obsolete final reread observes a controller write that
+                // follows both API mutations. The fixed pipeline never makes
+                // this second read, so it returns the exact prior commit.
+                let mut controller = (*self.current.lock().unwrap().data).clone();
+                controller["status"]["lastScheduleTime"] = serde_json::json!("controller");
+                controller["metadata"]["resourceVersion"] = serde_json::json!("4");
+                *self.current.lock().unwrap() = Self::resource_from(controller, 4);
+            }
+            Ok(Some(self.current.lock().unwrap().clone()))
+        }
+
+        async fn write_status(
+            &self,
+            _target: &StatusMutationTarget,
+            status: Value,
+            _preconditions: ResourcePreconditions,
+        ) -> Result<Resource, AppError> {
+            let mut committed = (*self.current.lock().unwrap().data).clone();
+            committed["status"] = status;
+            committed["metadata"]["resourceVersion"] = serde_json::json!("2");
+            let committed_resource = Self::resource_from(committed.clone(), 2);
+            *self.current.lock().unwrap() = committed_resource.clone();
+            Ok(committed_resource)
+        }
+
+        async fn patch_metadata(
+            &self,
+            _target: &StatusMutationTarget,
+            metadata_patch: Value,
+            _preconditions: ResourcePreconditions,
+        ) -> Result<Resource, AppError> {
+            let mut data = (*self.current.lock().unwrap().data).clone();
+            if let Some(annotations) = metadata_patch.pointer("/metadata/annotations") {
+                data["metadata"]["annotations"] = annotations.clone();
+            }
+            data["metadata"]["resourceVersion"] = serde_json::json!("3");
+            let resource = Self::resource_from(data, 3);
+            *self.current.lock().unwrap() = resource.clone();
+            Ok(resource)
+        }
+    }
+
+    #[tokio::test]
+    async fn status_put_response_preserves_requested_status_when_controller_races() {
+        let writer = ControllerRaceStatusWriter::new();
+        let get_count = writer.get_count.clone();
+        let pipeline = StatusMutationPipeline::new(
+            writer,
+            ApiSubresourceStatusMergePolicy::new(None),
+            LenientStatusResourceVersionPrecondition,
+            EchoStatusResponder,
+        );
+        let target = StatusMutationTarget::namespaced("batch/v1", "CronJob", "default", "cron");
+        let requested = "2026-08-17T13:27:59Z";
+        let result = pipeline
+            .execute(
+                &target,
+                &StatusPutOperation::new(serde_json::json!({
+                    "metadata": {"annotations": {"patchedstatus": "true"}},
+                    "status": {"lastScheduleTime": requested}
+                })),
+            )
+            .await
+            .expect("status update succeeds");
+
+        assert_eq!(
+            result.response["status"]["lastScheduleTime"], requested,
+            "the API response must represent its committed status, not a later controller write"
+        );
+        assert_eq!(
+            result.response["metadata"]["annotations"]["patchedstatus"],
+            "true"
+        );
+        assert_eq!(
+            result.response["metadata"]["resourceVersion"], "3",
+            "the response must retain the resourceVersion of the exact metadata commit"
+        );
+        assert_eq!(
+            *result.final_resource.data, result.response,
+            "the response body must be the exact committed resource body"
+        );
+        assert_eq!(
+            *get_count.lock().unwrap(),
+            1,
+            "the response must not reread after the committed mutation"
+        );
+    }
 
     #[test]
     fn phase17c_scale_response_preserves_resource_version_and_status_shape() {
