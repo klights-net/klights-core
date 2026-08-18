@@ -336,11 +336,25 @@ impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWri
             )
             .await;
         };
-        // Apply the metadata patch to the request's own status commit in
-        // memory, then persist the exact full body it produced. `apply_patch`
-        // returns the merged document; it does not mutate in place.
-        let mut full = std::sync::Arc::unwrap_or_clone(base.data.clone());
+        // Re-read the live row so any metadata changes a controller made
+        // between the two commits are preserved (labels, annotations,
+        // finalizers, etc.). Then apply the request's metadata patch on top
+        // and splice in the request's own committed status so the controller
+        // status can never leak into the API response.
+        let live = crate::generic_read::get_resource(
+            self.state.command_store().resource_query(),
+            &target.api_version,
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(target.not_found_message()))?;
+        let mut full = std::sync::Arc::unwrap_or_clone(live.data.clone());
         full = self.apply_patch(&full, &metadata_patch, Some("application/merge-patch+json"))?;
+        // Splice the request's own committed status back in — the live row
+        // may carry a controller's newer status that must not leak.
+        full["status"] = (*base.data)["status"].clone();
         crate::generic_command::update_resource_with_preconditions(
             self.state.command_store().resource_command(),
             &target.api_version,
@@ -1473,13 +1487,16 @@ mod tests {
             _preconditions: ResourcePreconditions,
             base: Option<&Resource>,
         ) -> Result<Resource, AppError> {
-            // The fixed datastore writer applies the metadata patch to the
-            // request's own status-commit resource (the pipeline's base), so
-            // the controller's later write cannot leak into the response.
-            let mut data = (*base.expect("status commit must be the base").data).clone();
+            // Re-read the live row (matches production: the controller may
+            // have changed metadata between the two commits). Then apply the
+            // metadata patch and splice in the request's own committed status.
+            let mut data = (*self.current.lock().unwrap().data).clone();
             if let Some(annotations) = metadata_patch.pointer("/metadata/annotations") {
                 data["metadata"]["annotations"] = annotations.clone();
             }
+            // Splice in the request's own committed status — the live row
+            // may carry a controller's newer status that must not leak.
+            data["status"] = (*base.expect("status commit must be the base").data)["status"].clone();
             data["metadata"]["resourceVersion"] = serde_json::json!("5");
             let resource = Self::resource_from(data, 5);
             *self.current.lock().unwrap() = resource.clone();
@@ -1519,6 +1536,179 @@ mod tests {
         assert_eq!(
             result.response["status"]["lastScheduleTime"], "2026-08-18T10:12:59+00:00",
             "the API response must represent its committed status, not a later controller write"
+        );
+    }
+
+    /// Same race as above, but the controller also changes metadata between
+    /// the two commits. The metadata commit must preserve the controller's
+    /// metadata change while still splicing in the request's own status.
+    #[tokio::test]
+    async fn status_put_preserves_controller_metadata_changes_across_two_commits() {
+        // A variant writer where the controller adds a metadata annotation
+        // (e.g., setting a finalizer or updating a label) between the two
+        // commits.
+        struct ControllerMetadataWriter {
+            current: Arc<Mutex<Resource>>,
+        }
+
+        impl ControllerMetadataWriter {
+            fn new() -> Self {
+                let resource = Resource::try_from_data(Arc::new(serde_json::json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "metadata": {
+                        "name": "cron",
+                        "namespace": "default",
+                        "uid": "cron-uid",
+                        "resourceVersion": "1"
+                    },
+                    "spec": {"schedule": "* * * * *"},
+                    "status": {}
+                })))
+                .expect("valid CronJob fixture");
+                Self {
+                    current: Arc::new(Mutex::new(resource)),
+                }
+            }
+
+            fn resource_from(data: Value, resource_version: i64) -> Resource {
+                let mut resource = Resource::try_from_data(Arc::new(data)).expect("valid resource");
+                resource.resource_version = resource_version;
+                resource
+            }
+
+            fn controller_write(&self) {
+                let mut data = (*self.current.lock().unwrap().data).clone();
+                // Controller changes both status and metadata.
+                data["status"]["lastScheduleTime"] = serde_json::json!("2026-08-18T10:13:00Z");
+                data["metadata"]["annotations"] =
+                    serde_json::json!({"controller-added": "yes"});
+                data["metadata"]["resourceVersion"] = serde_json::json!("4");
+                *self.current.lock().unwrap() = Self::resource_from(data, 4);
+            }
+        }
+
+        impl PatchApplication for ControllerMetadataWriter {
+            fn apply_patch(
+                &self,
+                current: &Value,
+                patch: &Value,
+                _content_type: Option<&str>,
+            ) -> Result<Value, AppError> {
+                // Realistic merge-patch: shallow-merge top-level keys, then
+                // deep-merge /metadata/annotations.
+                let mut out = current.clone();
+                if let Some(obj) = patch.as_object() {
+                    for (k, v) in obj {
+                        if k == "metadata" {
+                            if let (Some(out_meta), Some(patch_meta)) =
+                                (out.get_mut("metadata"), v.as_object())
+                            {
+                                for (mk, mv) in patch_meta {
+                                    if mk == "annotations" {
+                                        let ann = out_meta
+                                            .as_object_mut()
+                                            .unwrap()
+                                            .entry("annotations")
+                                            .or_insert_with(|| serde_json::json!({}));
+                                        if let (Some(ann_obj), Some(mv_obj)) =
+                                            (ann.as_object_mut(), mv.as_object())
+                                        {
+                                            for (ak, av) in mv_obj {
+                                                ann_obj.insert(ak.clone(), av.clone());
+                                            }
+                                        }
+                                    } else {
+                                        out_meta[mk] = mv.clone();
+                                    }
+                                }
+                            }
+                        } else {
+                            out[k] = v.clone();
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        #[async_trait]
+        impl StatusMutationWriter for ControllerMetadataWriter {
+            async fn get(&self, _target: &StatusMutationTarget) -> Result<Option<Resource>, AppError> {
+                Ok(Some(self.current.lock().unwrap().clone()))
+            }
+
+            async fn write_status(
+                &self,
+                _target: &StatusMutationTarget,
+                status: Value,
+                _preconditions: ResourcePreconditions,
+            ) -> Result<Resource, AppError> {
+                let mut committed = (*self.current.lock().unwrap().data).clone();
+                committed["status"] = status;
+                committed["metadata"]["resourceVersion"] = serde_json::json!("2");
+                let committed_resource = Self::resource_from(committed.clone(), 2);
+                *self.current.lock().unwrap() = committed_resource.clone();
+                self.controller_write();
+                Ok(committed_resource)
+            }
+
+            async fn patch_metadata(
+                &self,
+                _target: &StatusMutationTarget,
+                metadata_patch: Value,
+                _preconditions: ResourcePreconditions,
+                base: Option<&Resource>,
+            ) -> Result<Resource, AppError> {
+                // Re-read the live row (matches production: the controller may
+                // have changed metadata between the two commits). Then apply the
+                // metadata patch and splice in the request's own committed status.
+                let live = (*self.current.lock().unwrap().data).clone();
+                let mut full = self.apply_patch(&live, &metadata_patch, Some("application/merge-patch+json"))?;
+                // Splice in the request's own committed status — the live row
+                // may carry a controller's newer status that must not leak.
+                full["status"] = (*base.expect("status commit must be the base").data)["status"].clone();
+                full["metadata"]["resourceVersion"] = serde_json::json!("5");
+                let resource = Self::resource_from(full, 5);
+                *self.current.lock().unwrap() = resource.clone();
+                Ok(resource)
+            }
+        }
+
+        let writer = ControllerMetadataWriter::new();
+        let pipeline = StatusMutationPipeline::new(
+            writer,
+            ApiSubresourceStatusMergePolicy::new(None),
+            LenientStatusResourceVersionPrecondition,
+            EchoStatusResponder,
+        );
+        let target = StatusMutationTarget::namespaced("batch/v1", "CronJob", "default", "cron");
+
+        let result = pipeline
+            .execute(
+                &target,
+                &StatusPutOperation::new(serde_json::json!({
+                    "metadata": {"annotations": {"patchedstatus": "true"}},
+                    "status": {"lastScheduleTime": "2026-08-18T10:12:59+00:00"}
+                })),
+            )
+            .await
+            .expect("status update succeeds");
+
+        // Request's own status preserved — controller status not leaked.
+        assert_eq!(
+            result.response["status"]["lastScheduleTime"], "2026-08-18T10:12:59+00:00",
+            "the API response must represent its committed status"
+        );
+        // Request's annotation preserved.
+        assert_eq!(
+            result.response["metadata"]["annotations"]["patchedstatus"], "true",
+            "the request's metadata patch must be applied"
+        );
+        // Controller's annotation also preserved (zero data loss).
+        assert_eq!(
+            result.response["metadata"]["annotations"]["controller-added"], "yes",
+            "the controller's metadata change must be preserved, not overwritten"
         );
     }
 
