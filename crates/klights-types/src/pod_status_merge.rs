@@ -147,6 +147,35 @@ pub fn merge_pod_status_for_update(
     if owner.preserves_terminal_runtime_state() {
         preserve_terminal_or_confirmed_runtime_state(current, incoming_status);
     }
+    // The pod IPs are set once at sandbox creation and are immutable for the
+    // lifetime of the Pod. A kubelet status write that omits them (e.g. a
+    // runtime-reconcile whose local row read raced ahead of its own
+    // (Pending, podIP=X) write replicating back from the leader) must never
+    // erase them from the live row. Preserve the live IP fields whenever the
+    // incoming status does not carry them.
+    preserve_omitted_live_ip_fields(current, incoming_status);
+}
+
+/// Back-fill `podIP`, `podIPs`, `hostIP`, `hostIPs` from the live status when
+/// the incoming status omits them. The incoming status is the authoritative
+/// source when it carries the field (even an explicit empty value is kept as
+/// written); omission means "not owned by this write" and the live value
+/// survives.
+fn preserve_omitted_live_ip_fields(current: &Value, incoming_status: &mut Value) {
+    let Some(incoming_obj) = incoming_status.as_object_mut() else {
+        return;
+    };
+    let Some(current_status) = current.get("status") else {
+        return;
+    };
+    for key in ["podIP", "podIPs", "hostIP", "hostIPs"] {
+        if incoming_obj.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = current_status.get(key) {
+            incoming_obj.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 impl PodStatusPatch {
@@ -735,6 +764,68 @@ mod tests {
                 .pointer("/containerStatuses/0/state/waiting")
                 .is_none(),
             "waiting state must be replaced by preserved terminal state: {incoming:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ip_preservation_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Regression: the e2e projected-configmap pod failure. The kubelet's
+    /// runtime-reconcile read the pod row before its own (Pending, podIP=X)
+    /// status write replicated back from the leader, so the incoming status
+    /// carried no podIP. The leader's merge must preserve the live podIP /
+    /// podIPs / hostIP / hostIPs — the IP is set once at sandbox creation and
+    /// a later kubelet status write that omits it must not erase it.
+    #[test]
+    fn kubelet_runtime_status_preserves_live_pod_ip_when_incoming_omits_it() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Pending",
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "hostIP": "10.99.0.14",
+                "hostIPs": [{"ip": "10.99.0.14"}],
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Initialized", "status": "True"}
+                ]
+            }
+        });
+        // The kubelet's runtime-reconcile write after a stale read: phase and
+        // container statuses only, no IP fields.
+        let mut incoming = json!({
+            "phase": "Pending",
+            "containerStatuses": [
+                {"name": "c", "ready": true, "started": true, "state": {"running": {}}}
+            ]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert_eq!(
+            incoming["podIP"], "10.50.1.20",
+            "the live podIP must be preserved: {incoming}"
+        );
+        assert_eq!(
+            incoming["podIPs"][0]["ip"], "10.50.1.20",
+            "the live podIPs must be preserved: {incoming}"
+        );
+        assert_eq!(
+            incoming["hostIP"], "10.99.0.14",
+            "the live hostIP must be preserved: {incoming}"
+        );
+        assert_eq!(
+            incoming["hostIPs"][0]["ip"], "10.99.0.14",
+            "the live hostIPs must be preserved: {incoming}"
         );
     }
 }
