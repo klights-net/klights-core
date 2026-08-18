@@ -1433,3 +1433,73 @@ async fn controller_runtime_fixture_rejects_busy_worker_and_restarts_after_join(
     restarted.join().await.unwrap();
     assert!(fixture.drain_ready().await.unwrap().is_empty());
 }
+
+/// Regression: PATCH /status that carries both a metadata annotation and a
+/// status change must apply the annotation to the response. The e2e CronJob /
+/// Ingress / CSR-approval conformance tests assert
+/// `patched object should have the applied annotation` after a merge-patch
+/// /status request. The status mutation pipeline's metadata commit must not
+/// drop the annotation.
+#[tokio::test]
+async fn test_patch_status_applies_metadata_annotation() {
+    let state = build_test_app_state().await;
+    let db = state.resource_store();
+    let app = state.router();
+    seed_namespace(&db, "default").await;
+    request_json(
+        &app,
+        Method::POST,
+        "/apis/batch/v1/namespaces/default/cronjobs",
+        Some("application/json"),
+        Some(json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "patch-status-ann", "namespace": "default"},
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "nginx"}],
+                    "restartPolicy": "Never"
+                }}}}
+            }
+        })),
+        StatusCode::CREATED,
+    )
+    .await;
+
+    // Merge-patch /status with an annotation AND a status change (mirrors
+    // cronjob.go:472 patching /status step).
+    let patched = request_json(
+        &app,
+        Method::PATCH,
+        "/apis/batch/v1/namespaces/default/cronjobs/patch-status-ann/status",
+        Some("application/merge-patch+json"),
+        Some(json!({
+            "metadata": {"annotations": {"patchedstatus": "true"}},
+            "status": {"lastScheduleTime": "2026-08-18T10:12:55Z"}
+        })),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        patched.pointer("/metadata/annotations/patchedstatus"),
+        Some(&json!("true")),
+        "the PATCH /status response must carry the applied annotation: {}",
+        patched
+    );
+
+    // And the committed row must carry it too (the response must not be a
+    // fabricated body).
+    let live = db
+        .get_resource("batch/v1", "CronJob", Some("default"), "patch-status-ann")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        live.data.pointer("/metadata/annotations/patchedstatus"),
+        Some(&json!("true")),
+        "the committed CronJob must carry the applied annotation: {:?}",
+        live.data
+    );
+}

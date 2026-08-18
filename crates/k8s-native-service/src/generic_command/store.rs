@@ -157,6 +157,40 @@ pub async fn update_non_pod_resource(
     resource_result(result, "resource update")
 }
 
+/// Full-body resource update with explicit preconditions. Used by the status
+/// mutation pipeline's metadata commit so the request's own committed status
+/// (not a later controller write) stays in the row and in the API response.
+pub async fn update_resource_with_preconditions(
+    command: &dyn LeaderResourceCommand,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    data: serde_json::Value,
+    preconditions: ResourcePreconditions,
+) -> Result<klights_cluster_core::Resource, AppError> {
+    if api_version == "v1" && kind == "Pod" {
+        return Err(AppError::Forbidden(
+            "generic Pod updates are forbidden; use the Pod API repository path".to_string(),
+        ));
+    }
+    let request = ResourceCommandRequest::try_new(StorageCommand::UpdateResource {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.map(str::to_string),
+        name: name.to_string(),
+        data,
+        expected_rv: 0,
+        preconditions,
+        preserve_status: false,
+    })?;
+    let result = command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?;
+    resource_result(result, "resource update")
+}
+
 pub async fn patch_non_pod_resource(
     command: &dyn LeaderResourceCommand,
     api_version: &str,

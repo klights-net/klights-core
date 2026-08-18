@@ -45,7 +45,7 @@ pub use response::{
 pub use store::{
     create_namespace, create_non_pod_resource, delete_namespace, delete_non_pod_collection,
     delete_non_pod_resource, patch_non_pod_resource, update_namespace, update_non_pod_resource,
-    update_resource_status,
+    update_resource_status, update_resource_with_preconditions,
 };
 pub use write::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,

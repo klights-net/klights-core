@@ -7,7 +7,7 @@ use klights_cluster_core::{
     LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
     LogApplyWatchEventRow, OutboxStreamWatermark, ResourcePreconditions, SnapshotRestoreOperation,
 };
-use klights_cluster_store::StorageCommandResult;
+use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 use std::net::Ipv4Addr;
 
 fn committed_apply_v1(commit: LogApplyCommit) -> LogApplyCommit {
@@ -4207,5 +4207,152 @@ async fn destination_post_commit_pause_is_scoped_to_its_store_instance() {
             .await
             .unwrap()
             .is_some()
+    );
+}
+
+/// Regression: the e2e CronJob conformance race. The API client GETs a
+/// CronJob (RV=N), sets `lastScheduleTime=10:12:59`, and PUTs /status with
+/// expected_rv=N. The status write commits (RV=N+1). Before the request's
+/// metadata commit applies, the CronJob controller fires and writes
+/// `lastScheduleTime=10:13:00` (RV=N+2). The metadata commit must be based on
+/// the request's own status commit (10:12:59), so the API response never
+/// carries the controller's later write.
+#[tokio::test]
+async fn status_update_metadata_commit_preserves_request_status_across_controller_write() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "batch/v1",
+            "CronJob",
+            Some("default"),
+            "test-api",
+            serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": {"name": "test-api", "namespace": "default", "uid": "cj-uid"},
+                "spec": {"schedule": "* * * * *", "jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}}}},
+                "status": {"lastScheduleTime": "2026-08-18T10:12:55Z"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    // 1. The API client's status commit (status=10:12:59, RV=N -> N+1).
+    let status_commit = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::UpdateStatus {
+                api_version: "batch/v1".to_string(),
+                kind: "CronJob".to_string(),
+                namespace: Some("default".to_string()),
+                name: "test-api".to_string(),
+                status: serde_json::json!({"lastScheduleTime": "2026-08-18T10:12:59+00:00"}),
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions {
+                    uid: Some("cj-uid".to_string()),
+                    resource_version: Some(created.resource_version),
+                },
+                observed_status_stamp: None,
+            },
+            "cronjob-status-race",
+            "leader",
+        )
+        .await
+        .expect("UpdateStatus must materialize");
+    let status_result = db
+        .apply_raft_log_apply_commit(status_commit)
+        .await
+        .expect("status commit must apply");
+    assert!(status_result.error_message.is_none());
+    let status_resource = match status_result
+        .applied_mutation
+        .clone()
+        .expect("status commit carries its resource")
+    {
+        AppliedMutation::Resource(resource) => resource,
+    };
+    assert_eq!(
+        status_resource
+            .data
+            .pointer("/status/lastScheduleTime")
+            .and_then(|v| v.as_str()),
+        Some("2026-08-18T10:12:59+00:00")
+    );
+
+    // 2. The controller fires and writes the next slot (RV=N+2).
+    db.update_status_only(
+        "batch/v1",
+        "CronJob",
+        Some("default"),
+        "test-api",
+        serde_json::json!({"lastScheduleTime": "2026-08-18T10:13:00Z"}),
+        Some(status_resource.resource_version),
+    )
+    .await
+    .unwrap();
+
+    // 3. The request's metadata commit is built against its own status commit
+    //    (the pipeline's new base), not against the live row. Applying the
+    //    metadata commit must preserve the request's 10:12:59 status even
+    //    though the controller already wrote 10:13:00.
+    let metadata_commit = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::UpdateResource {
+                api_version: "batch/v1".to_string(),
+                kind: "CronJob".to_string(),
+                namespace: Some("default".to_string()),
+                name: "test-api".to_string(),
+                data: serde_json::json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "metadata": {"name": "test-api", "namespace": "default", "uid": "cj-uid", "annotations": {"patchedstatus": "true"}},
+                    "spec": {"schedule": "* * * * *", "jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}}}},
+                    "status": {"lastScheduleTime": "2026-08-18T10:12:59+00:00"}
+                }),
+                expected_rv: 0,
+                preconditions: ResourcePreconditions {
+                    uid: Some("cj-uid".to_string()),
+                    resource_version: None,
+                },
+                preserve_status: false,
+            },
+            "cronjob-status-race",
+            "leader",
+        )
+        .await
+        .expect("metadata commit must materialize");
+    let metadata_result = db
+        .apply_raft_log_apply_commit(metadata_commit)
+        .await
+        .expect("metadata commit must apply");
+    assert!(
+        metadata_result.error_message.is_none(),
+        "metadata commit must not conflict: {:?}",
+        metadata_result.error_message
+    );
+    let metadata_resource = match metadata_result
+        .applied_mutation
+        .clone()
+        .expect("metadata commit carries its resource")
+    {
+        AppliedMutation::Resource(resource) => resource,
+    };
+    // The response to the client's PUT /status must be the request's own
+    // commit: the status it wrote plus the metadata patch — never the
+    // controller's later 10:13:00.
+    assert_eq!(
+        metadata_resource
+            .data
+            .pointer("/status/lastScheduleTime")
+            .and_then(|v| v.as_str()),
+        Some("2026-08-18T10:12:59+00:00"),
+        "the API response must be the exact status the request committed, not the controller's later write"
+    );
+    assert_eq!(
+        metadata_resource
+            .data
+            .pointer("/metadata/annotations/patchedstatus")
+            .and_then(|v| v.as_str()),
+        Some("true"),
+        "the metadata patch must still apply"
     );
 }

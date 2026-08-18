@@ -252,6 +252,7 @@ pub trait StatusMutationWriter: PatchApplication + Send + Sync {
         target: &StatusMutationTarget,
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
+        base: Option<&Resource>,
     ) -> Result<Resource, AppError>;
 }
 
@@ -314,14 +315,43 @@ impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWri
         target: &StatusMutationTarget,
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
+        base: Option<&Resource>,
     ) -> Result<Resource, AppError> {
-        crate::generic_command::patch_non_pod_resource(
+        // When the request also committed a status write, the metadata commit
+        // must be built against that committed resource — never against the
+        // live row, or a controller write landing between the two commits
+        // leaks its status into the API response (the CronJob conformance
+        // lastScheduleTime race).
+        let Some(base) = base else {
+            // Metadata-only status request: the request did not touch status,
+            // so the metadata commit patches the live row exactly as before,
+            // preserving any newer controller status.
+            return crate::generic_command::patch_non_pod_resource(
+                self.state.command_store().resource_command(),
+                &target.api_version,
+                &target.kind,
+                target.namespace.as_deref(),
+                &target.name,
+                ResourcePatchRequest::new(PatchKind::Merge, metadata_patch, preconditions),
+            )
+            .await;
+        };
+        // Apply the metadata patch to the request's own status commit in
+        // memory, then persist the exact full body it produced. `apply_patch`
+        // returns the merged document; it does not mutate in place.
+        let mut full = std::sync::Arc::unwrap_or_clone(base.data.clone());
+        full = self.apply_patch(&full, &metadata_patch, Some("application/merge-patch+json"))?;
+        crate::generic_command::update_resource_with_preconditions(
             self.state.command_store().resource_command(),
             &target.api_version,
             &target.kind,
             target.namespace.as_deref(),
             &target.name,
-            ResourcePatchRequest::new(PatchKind::Merge, metadata_patch, preconditions),
+            full,
+            ResourcePreconditions {
+                uid: preconditions.uid.clone(),
+                resource_version: None,
+            },
         )
         .await
     }
@@ -443,6 +473,12 @@ where
         }
 
         if let Some(metadata_patch) = operation.metadata_patch(&current, &working) {
+            // The metadata commit must be based on the resource this request
+            // committed (the status write, or None when only metadata changed
+            // so the live row is patched as before): a controller status write
+            // landing between the status commit and this commit must not leak
+            // into the API response.
+            let base = committed_resource.as_ref();
             let metadata_resource = self
                 .writer
                 .patch_metadata(
@@ -452,6 +488,7 @@ where
                         uid: Some(current.uid.clone()),
                         resource_version: None,
                     },
+                    base,
                 )
                 .await?;
             // Return the exact object committed by the last mutation. A
@@ -1292,6 +1329,7 @@ mod tests {
             _target: &StatusMutationTarget,
             metadata_patch: Value,
             _preconditions: ResourcePreconditions,
+            _base: Option<&Resource>,
         ) -> Result<Resource, AppError> {
             let mut data = (*self.current.lock().unwrap().data).clone();
             if let Some(annotations) = metadata_patch.pointer("/metadata/annotations") {
@@ -1347,6 +1385,140 @@ mod tests {
             *get_count.lock().unwrap(),
             1,
             "the response must not reread after the committed mutation"
+        );
+    }
+
+    /// Simulates the datastore's separate-commit behavior for a PUT /status
+    /// that carries both status and metadata: the status commit applies, then
+    /// a controller write lands (RV 4, controller status), and only then does
+    /// the metadata commit apply against the live row.
+    struct TwoCommitRaceWriter {
+        current: Arc<Mutex<Resource>>,
+    }
+
+    impl TwoCommitRaceWriter {
+        fn new() -> Self {
+            let resource = Resource::try_from_data(Arc::new(serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": {
+                    "name": "cron",
+                    "namespace": "default",
+                    "uid": "cron-uid",
+                    "resourceVersion": "1"
+                },
+                "spec": {"schedule": "* * * * *"},
+                "status": {}
+            })))
+            .expect("valid CronJob fixture");
+            Self {
+                current: Arc::new(Mutex::new(resource)),
+            }
+        }
+
+        fn resource_from(data: Value, resource_version: i64) -> Resource {
+            let mut resource = Resource::try_from_data(Arc::new(data)).expect("valid resource");
+            resource.resource_version = resource_version;
+            resource
+        }
+
+        fn controller_write(&self) {
+            // The CronJob controller fires between the request's two commits.
+            let mut data = (*self.current.lock().unwrap().data).clone();
+            data["status"]["lastScheduleTime"] = serde_json::json!("2026-08-18T10:13:00Z");
+            data["metadata"]["resourceVersion"] = serde_json::json!("4");
+            *self.current.lock().unwrap() = Self::resource_from(data, 4);
+        }
+    }
+
+    impl PatchApplication for TwoCommitRaceWriter {
+        fn apply_patch(
+            &self,
+            current: &Value,
+            _patch: &Value,
+            _content_type: Option<&str>,
+        ) -> Result<Value, AppError> {
+            Ok(current.clone())
+        }
+    }
+
+    #[async_trait]
+    impl StatusMutationWriter for TwoCommitRaceWriter {
+        async fn get(&self, _target: &StatusMutationTarget) -> Result<Option<Resource>, AppError> {
+            Ok(Some(self.current.lock().unwrap().clone()))
+        }
+
+        async fn write_status(
+            &self,
+            _target: &StatusMutationTarget,
+            status: Value,
+            _preconditions: ResourcePreconditions,
+        ) -> Result<Resource, AppError> {
+            let mut committed = (*self.current.lock().unwrap().data).clone();
+            committed["status"] = status;
+            committed["metadata"]["resourceVersion"] = serde_json::json!("2");
+            let committed_resource = Self::resource_from(committed.clone(), 2);
+            *self.current.lock().unwrap() = committed_resource.clone();
+            // Simulate the controller firing between the request's status
+            // commit and its metadata commit: the live row now carries the
+            // controller's next-slot status at a newer RV.
+            self.controller_write();
+            Ok(committed_resource)
+        }
+
+        async fn patch_metadata(
+            &self,
+            _target: &StatusMutationTarget,
+            metadata_patch: Value,
+            _preconditions: ResourcePreconditions,
+            base: Option<&Resource>,
+        ) -> Result<Resource, AppError> {
+            // The fixed datastore writer applies the metadata patch to the
+            // request's own status-commit resource (the pipeline's base), so
+            // the controller's later write cannot leak into the response.
+            let mut data = (*base.expect("status commit must be the base").data).clone();
+            if let Some(annotations) = metadata_patch.pointer("/metadata/annotations") {
+                data["metadata"]["annotations"] = annotations.clone();
+            }
+            data["metadata"]["resourceVersion"] = serde_json::json!("5");
+            let resource = Self::resource_from(data, 5);
+            *self.current.lock().unwrap() = resource.clone();
+            Ok(resource)
+        }
+    }
+
+    #[tokio::test]
+    async fn status_put_with_status_and_metadata_survives_controller_write_between_commits() {
+        let writer = TwoCommitRaceWriter::new();
+        let pipeline = StatusMutationPipeline::new(
+            writer,
+            ApiSubresourceStatusMergePolicy::new(None),
+            LenientStatusResourceVersionPrecondition,
+            EchoStatusResponder,
+        );
+        let target = StatusMutationTarget::namespaced("batch/v1", "CronJob", "default", "cron");
+
+        // The test's PUT /status carries both a status change and a metadata
+        // change. The status commit applies (RV 2), then the controller fires
+        // and writes 10:13:00 (RV 4), and only then does the metadata commit
+        // apply.
+        let result = pipeline
+            .execute(
+                &target,
+                &StatusPutOperation::new(serde_json::json!({
+                    "metadata": {"annotations": {"patchedstatus": "true"}},
+                    "status": {"lastScheduleTime": "2026-08-18T10:12:59+00:00"}
+                })),
+            )
+            .await
+            .expect("status update succeeds");
+
+        // The API response must be the request's own commit: the status it
+        // wrote (10:12:59), never the controller's later 10:13:00 that landed
+        // on the live row before the metadata commit.
+        assert_eq!(
+            result.response["status"]["lastScheduleTime"], "2026-08-18T10:12:59+00:00",
+            "the API response must represent its committed status, not a later controller write"
         );
     }
 
