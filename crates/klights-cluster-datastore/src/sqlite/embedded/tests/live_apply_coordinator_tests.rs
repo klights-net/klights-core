@@ -4356,3 +4356,94 @@ async fn status_update_metadata_commit_preserves_request_status_across_controlle
         "the metadata patch must still apply"
     );
 }
+
+/// Regression: the e2e Job conformance failure. A lenient merge PATCH /status
+/// (uid-only preconditions, no client resourceVersion) materializes a commit
+/// whose apply-time row has advanced because the controller wrote status
+/// between the build and the raft apply. The patch must merge into the live
+/// row (server-side merge-patch semantics), not fail with a spurious 409
+/// resourceVersion conflict stamped from the build-time snapshot.
+#[tokio::test]
+async fn lenient_merge_patch_applies_against_live_row_despite_apply_time_rv_advance() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "lenient-patch",
+        serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": "lenient-patch", "namespace": "default", "uid": "job-uid"},
+            "spec": {"completions": 1, "template": {"spec": {"containers": [{"name": "c", "image": "busybox"}], "restartPolicy": "Never"}}},
+            "status": {"active": 0}
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The status pipeline's metadata commit: a merge patch with uid-only
+    // preconditions (no resourceVersion). The build-time row has RV N.
+    let commit = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::PatchResource {
+                api_version: "batch/v1".to_string(),
+                kind: "Job".to_string(),
+                namespace: Some("default".to_string()),
+                name: "lenient-patch".to_string(),
+                patch_kind: klights_cluster_core::PatchKind::Merge,
+                patch: serde_json::json!({"metadata": {"annotations": {"patchedstatus": "true"}}}),
+                preconditions: ResourcePreconditions::uid("job-uid"),
+                strict_resource_version: false,
+            },
+            "lenient-patch-test",
+            "leader",
+        )
+        .await
+        .expect("lenient patch must materialize");
+
+    // The Job controller writes status between the build and the raft apply,
+    // advancing the live RV.
+    let live_after_controller = db
+        .update_status_only(
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "lenient-patch",
+            serde_json::json!({"active": 1, "conditions": [{"type": "Running", "status": "True"}]}),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Applying the stale-build patch must succeed (merge into the live row),
+    // not surface a spurious resourceVersion conflict.
+    let result = db
+        .apply_raft_log_apply_commit(commit)
+        .await
+        .expect("lenient patch must apply");
+    assert!(
+        result.error_message.is_none(),
+        "lenient patch must not conflict when the row advanced between build and apply: {:?}",
+        result.error_message
+    );
+    let live = db
+        .get_resource("batch/v1", "Job", Some("default"), "lenient-patch")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        live.data.pointer("/metadata/annotations/patchedstatus"),
+        Some(&serde_json::json!("true")),
+        "the patch must merge into the live row"
+    );
+    assert_eq!(
+        live.data.pointer("/status/active"),
+        Some(&serde_json::json!(1)),
+        "the controller's status write must be preserved"
+    );
+    assert!(
+        live.resource_version > live_after_controller.resource_version,
+        "the patch must advance the RV on top of the controller write"
+    );
+}

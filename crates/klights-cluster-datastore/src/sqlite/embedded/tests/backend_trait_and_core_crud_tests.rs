@@ -4410,19 +4410,22 @@ async fn destination_noop_patch_built_before_spec_update_preserves_live_spec() {
     .await
     .expect("client scale update applies before stale patch commit");
 
-    // Committed apply keeps strict captured-RV validation even when the patch
-    // was already materialized at proposal time. The stale command must be
-    // rejected without rolling back the newer client-owned state.
+    // Committed apply of a lenient merge patch (uid-only, no client RV)
+    // merges into the live row at apply time: the newer client-owned spec
+    // state is preserved and the patch's metadata annotation is applied on
+    // top. This is the server-side merge-patch semantic; the previous strict
+    // captured-RV rejection produced spurious 409 conflicts for the status
+    // subresource pipeline (e2e Job conformance failure).
     let apply_result = db
         .apply_raft_log_apply_commit(commit)
         .await
-        .expect("stale committed apply returns a deterministic outcome");
+        .expect("lenient committed patch must apply");
     assert!(
-        apply_result.error_message.is_some(),
-        "stale committed apply must fail strict RV validation: {apply_result:?}"
+        apply_result.error_message.is_none(),
+        "lenient committed apply must merge into the live row: {apply_result:?}"
     );
-    assert_eq!(apply_result.applied_rv, None);
-    assert!(!apply_result.public_resource_changed);
+    assert!(apply_result.applied_rv.is_some());
+    assert!(apply_result.public_resource_changed);
 
     let live = db
         .get_resource("apps/v1", "Deployment", Some("default"), "web")
@@ -4435,7 +4438,7 @@ async fn destination_noop_patch_built_before_spec_update_preserves_live_spec() {
             .pointer("/spec/replicas")
             .and_then(|value| value.as_i64()),
         Some(30),
-        "same-UID stale raft PUT must not roll back newer local replicas=30 to its captured replicas=10"
+        "same-UID stale raft patch must not roll back newer local replicas=30 to its captured replicas=10"
     );
     assert_eq!(
         live.data
@@ -4535,15 +4538,19 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     .await
     .expect("client scale update applies before stale patch commit");
 
+    // Lenient merge patch (uid-only, no client RV) merges into the live row
+    // at apply time: the newer spec is preserved, the annotation applies on
+    // top. The previous strict captured-RV rejection caused the e2e Job
+    // status-pipeline spurious 409.
     let apply_result = db
         .apply_raft_log_apply_commit(commit)
         .await
-        .expect("stale committed apply returns a deterministic outcome");
+        .expect("lenient committed patch must apply");
     assert!(
-        apply_result.error_message.is_some(),
-        "stale committed apply must fail strict RV validation: {apply_result:?}"
+        apply_result.error_message.is_none(),
+        "lenient committed apply must merge into the live row: {apply_result:?}"
     );
-    assert_eq!(apply_result.applied_rv, None);
+    assert!(apply_result.applied_rv.is_some());
 
     let live = db
         .get_resource("apps/v1", "Deployment", Some("default"), "web")
@@ -4555,13 +4562,14 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
             .pointer("/spec/replicas")
             .and_then(serde_json::Value::as_i64),
         Some(30),
-        "same-UID stale raft PUT must not roll back newer client-owned state"
+        "same-UID stale raft patch must not roll back newer client-owned state"
     );
     assert_eq!(
         live.data
             .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
             .and_then(serde_json::Value::as_str),
         Some("2"),
+        "the patch's annotation must apply on top of the live row"
     );
 }
 

@@ -1622,7 +1622,10 @@ mod tests {
 
         #[async_trait]
         impl StatusMutationWriter for ControllerMetadataWriter {
-            async fn get(&self, _target: &StatusMutationTarget) -> Result<Option<Resource>, AppError> {
+            async fn get(
+                &self,
+                _target: &StatusMutationTarget,
+            ) -> Result<Option<Resource>, AppError> {
                 Ok(Some(self.current.lock().unwrap().clone()))
             }
 

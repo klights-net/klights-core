@@ -1561,6 +1561,7 @@ impl Datastore {
                     patch_kind,
                     &patch,
                     &preconditions,
+                    strict_resource_version,
                 ) {
                     let terminating_pod_unready_timestamp =
                         klights_types::is_zero_grace_pod_delete_mark_patch(
@@ -3165,12 +3166,23 @@ impl Datastore {
         patch_kind: PatchKind,
         patch: &Value,
         preconditions: &ResourcePreconditions,
+        strict_resource_version: bool,
     ) -> bool {
         if patch_kind != PatchKind::Merge
             || preconditions.uid.is_none()
             || preconditions.resource_version.is_some()
         {
             return false;
+        }
+        // An explicitly lenient merge patch (uid-only preconditions, no client
+        // resourceVersion, non-strict) applies against whatever the live row
+        // is at raft-apply time — that is the server-side merge-patch
+        // semantic. Stamping a build-time snapshot RV or a pre-merged full
+        // body would turn a row advance between build and apply (a controller
+        // status write) into a spurious 409 or a lost update. The status
+        // subresource pipeline's metadata commit is exactly this shape.
+        if !strict_resource_version {
+            return true;
         }
         Self::is_unconditional_workload_scale_patch(api_version, kind, patch)
             || Self::is_pod_delete_mark_patch(api_version, kind, patch)
