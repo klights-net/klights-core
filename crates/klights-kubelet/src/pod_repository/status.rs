@@ -311,6 +311,23 @@ pub trait PodStatusWriter: Send + Sync {
         terminated: Value,
         expected_rv: Option<i64>,
     ) -> Result<Option<Resource>>;
+
+    /// Read this Pod with the caller's own pending outbox writes applied.
+    ///
+    /// This is the read-your-own-writes-correct path: it uses
+    /// `LeaderFresh` consistency when a cluster API is available and
+    /// overlays the kubelet's own pending outbox checkpoint so the caller
+    /// sees its most recent status write even before it has committed.
+    ///
+    /// The reconcile path needs this so that `ready`, `restartCount`,
+    /// and `lastState` are derived from the kubelet's own latest
+    /// observation rather than a stale leader read.
+    async fn read_pod_with_own_writes(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<Resource>>;
 }
 
 #[derive(Debug)]
@@ -390,6 +407,30 @@ impl PodStatusService {
     #[cfg(feature = "test-support")]
     pub fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
         self.deferred_runtime.contains(pod_uid)
+    }
+
+    /// Read this Pod with the caller's own pending outbox writes applied.
+    ///
+    /// Uses `LeaderFresh` consistency when a cluster API is available and
+    /// overlays the kubelet's own pending outbox checkpoint. Returns
+    /// `Ok(None)` when the Pod does not exist.
+    pub async fn read_pod_with_own_writes(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<Resource>> {
+        match self.read_current_pod(ns, name, Some(pod_uid)).await {
+            Ok(resource) => Ok(Some(resource)),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("Pod not found") || msg.contains("not found") {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     async fn send_status_command(&self, command: OutboxCommand) -> Result<bool> {

@@ -372,6 +372,15 @@ impl PodStatusWriter for TestPodStatusWriter {
             .note_container_restart_for_uid(ns, name, uid, container, terminated, rv)
             .await
     }
+
+    async fn read_pod_with_own_writes(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.status.read_pod_with_own_writes(ns, name, uid).await
+    }
 }
 
 pub(super) struct TestDeletionFinalizer {

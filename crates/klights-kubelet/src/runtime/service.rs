@@ -2270,10 +2270,11 @@ impl PodRuntimeService for RealPodRuntimeService {
         key: PodRuntimeKey,
         hint: RuntimeReconcileHint,
     ) -> anyhow::Result<()> {
-        let resource =
-            get_pod_for_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to read pod for runtime reconcile: {e:#}"))?;
+        let resource = self
+            .pod_status_writer
+            .read_pod_with_own_writes(&key.namespace, &key.name, &key.uid)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read pod for runtime reconcile: {e:#}"))?;
         let Some(resource) = resource else {
             return Ok(());
         };

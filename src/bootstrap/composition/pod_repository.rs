@@ -1581,6 +1581,17 @@ impl klights_kubelet::pod_repository::status::PodStatusWriter for RootPodStatusW
         }
         Ok(updated)
     }
+
+    async fn read_pod_with_own_writes(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        self.status
+            .read_pod_with_own_writes(ns, name, pod_uid)
+            .await
+    }
 }
 
 /// Trait-object across the workqueue's durable namespace-termination
