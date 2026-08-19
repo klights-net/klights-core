@@ -91,6 +91,25 @@ impl PodStatusOwner {
             PodStatusOwner::KubeletRuntime | PodStatusOwner::ReplicatedApply
         )
     }
+
+    /// Status fields this writer regenerates from scratch on every write. An
+    /// omission of one of these means "genuinely empty" and must not be
+    /// back-filled. Every other field is preserved from the live status when
+    /// the writer does not mention it.
+    ///
+    /// `conditions` are owned by `apply_conditions` and skipped here so the
+    /// two rules cannot fight.
+    pub(crate) fn rebuilds_status_field(self, field: &str) -> bool {
+        match self {
+            PodStatusOwner::KubeletRuntime => {
+                matches!(field, "phase" | "conditions" | "containerStatuses")
+            }
+            // An API `/status` PUT is authoritative for the whole document.
+            PodStatusOwner::ApiStatusSubresource => true,
+            PodStatusOwner::Scheduler => matches!(field, "phase" | "conditions"),
+            PodStatusOwner::ReplicatedApply => false,
+        }
+    }
 }
 
 /// Narrow, per-owner view of the status fields a writer is contributing.
@@ -163,46 +182,64 @@ pub fn merge_pod_status_for_update(
     if owner.preserves_terminal_runtime_state() {
         preserve_terminal_or_confirmed_runtime_state(current, incoming_status);
     }
-    if owner.preserves_omitted_network_status() {
-        // A writer that does not own network status cannot clear it by
-        // omission; a writer that does own it clears it by writing it.
-        // Back-fill podIP/podIPs/hostIP/hostIPs from the live status
-        // whenever the incoming kubelet or replicated-apply status omits
-        // them. Also normalize empty strings and empty arrays from a
-        // mixed-version worker that still sends the old wire format
-        // (pre-`PublishedAddress`), so those treat omission the same way.
-        normalize_omitted_network_status(current, incoming_status);
-    }
+    // General field preservation: every status field the writer did not
+    // mention and does not rebuild is preserved from the live status.
+    // This replaces the old per-key network back-fill with a single
+    // owner-declared policy.
+    preserve_unmentioned_live_status_fields(owner, current, incoming_status);
 }
 
-/// Back-fill network fields from the live status when the incoming status
-/// omits them, and normalize empty strings and empty arrays from a
-/// mixed-version worker that still sends the old wire format (empty string
-/// instead of omitting the key).
-fn normalize_omitted_network_status(current: &Value, incoming_status: &mut Value) {
+/// Preserve every live `.status` field the incoming status does not contain
+/// and the writer does not rebuild from scratch.
+///
+/// This is the general replacement for the old `normalize_omitted_network_status`.
+/// The owner's [`PodStatusOwner::rebuilds_status_field`] determines which
+/// fields are "rebuilt" (omission means genuinely empty) vs which must be
+/// preserved from the live status (omission means the writer didn't mention it).
+///
+/// `conditions` are skipped here because they are owned by `apply_conditions`.
+/// Empty strings and empty arrays from a mixed-version worker are treated as
+/// omission for writers that `preserves_omitted_network_status`.
+pub(crate) fn preserve_unmentioned_live_status_fields(
+    owner: PodStatusOwner,
+    current: &Value,
+    incoming_status: &mut Value,
+) {
     let Some(incoming_obj) = incoming_status.as_object_mut() else {
         return;
     };
     let Some(current_status) = current.get("status") else {
         return;
     };
-    for key in ["podIP", "podIPs", "hostIP", "hostIPs"] {
-        // Treat explicit empty values (empty string or empty array) from a
-        // mixed-version worker the same as omission: the old wire format
-        // cannot distinguish "unknown" from "cleared", and for a kubelet or
-        // replicated-apply writer the intent is always "not yet known".
-        let dominated = incoming_obj.get(key).is_some_and(|v| {
-            (v.is_string() && v.as_str().is_some_and(str::is_empty))
-                || (v.is_array() && v.as_array().is_some_and(Vec::is_empty))
-        });
-        if dominated {
-            incoming_obj.remove(key);
-        }
-        if incoming_obj.contains_key(key) {
+    let Some(current_obj) = current_status.as_object() else {
+        return;
+    };
+
+    for (key, value) in current_obj {
+        // Skip conditions — they are owned by `apply_conditions`.
+        if key == "conditions" {
             continue;
         }
-        if let Some(value) = current_status.get(key) {
-            incoming_obj.insert(key.to_string(), value.clone());
+        // If the writer rebuilds this field, omission means genuinely empty.
+        if owner.rebuilds_status_field(key) {
+            continue;
+        }
+        // For writers that preserve omitted network status, normalize
+        // empty strings and empty arrays as omission (mixed-version
+        // compatibility).
+        if owner.preserves_omitted_network_status() {
+            let dominated = incoming_obj.get(key.as_str()).is_some_and(|v| {
+                (v.is_string() && v.as_str().is_some_and(str::is_empty))
+                    || (v.is_array() && v.as_array().is_some_and(Vec::is_empty))
+            });
+            if dominated {
+                incoming_obj.remove(key.as_str());
+            }
+        }
+        // If the field is absent from the incoming status, preserve it
+        // from the live status.
+        if !incoming_obj.contains_key(key.as_str()) {
+            incoming_obj.insert(key.clone(), value.clone());
         }
     }
 }
