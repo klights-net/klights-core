@@ -2078,12 +2078,20 @@ fn can_publish_probe_ready(status: &Value, container_name: &str) -> bool {
         return true;
     };
 
-    if container_status.get("started").and_then(|v| v.as_bool()) == Some(false) {
-        return false;
-    }
+    // The stored container status can have started=false with state=running
+    // when the container-state write lags behind the container-start write
+    // (the 200ms RTT race under the netem harness). A running container is
+    // by definition started, so check the state first: if state=running,
+    // always allow the probe result regardless of the started flag.
     if container_status.pointer("/state/waiting").is_some()
         || container_status.pointer("/state/terminated").is_some()
     {
+        return false;
+    }
+    if container_status.pointer("/state/running").is_some() {
+        return true;
+    }
+    if container_status.get("started").and_then(|v| v.as_bool()) == Some(false) {
         return false;
     }
 
@@ -2493,6 +2501,33 @@ mod debug_diff_tests {
                 "status.containerStatuses[0].ready".to_string(),
                 "status.phase".to_string(),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_publish_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn can_publish_probe_ready_when_container_state_is_running_regardless_of_started_flag() {
+        // The stored status can have started=false with state=running when the
+        // container-state write lags behind the container-start write (200ms
+        // RTT race under the netem harness). The probe result must still be
+        // published — a running container is by definition started.
+        let status = json!({
+            "phase": "Running",
+            "containerStatuses": [{
+                "name": "sample-webhook",
+                "started": false,
+                "ready": false,
+                "state": {"running": {"startedAt": "2026-08-18T23:25:16Z"}}
+            }]
+        });
+        assert!(
+            can_publish_probe_ready(&status, "sample-webhook"),
+            "a running container must allow probe-ready even if started=false"
         );
     }
 }
