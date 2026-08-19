@@ -307,3 +307,212 @@ fn upsert_terminating_readiness_condition(
         "message": "Pod is terminating"
     }));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // T1 red test: privilege boundary — a main-resource update that carries
+    // status.podIP/podIPs/hostIP/hostIPs in the request body must NOT leak
+    // those fields into the merged status when the live row has none.
+    // The request body's .status is a proposed mutation; the live row's
+    // .status is authoritative. Since the live row has no IP fields and
+    // the merge's back-fill is gated on the owner (ApiStatusSubresource
+    // does not back-fill), the merged status must be IP-free.
+    //
+    // This is the canonical privilege-boundary test: pods and pods/status
+    // are separately authorized in RBAC, and status.podIP feeds
+    // Endpoints/EndpointSlice reconciliation. A regression here is a
+    // privilege-boundary failure, not just a wire deviation.
+    #[test]
+    fn main_update_status_pod_ip_does_not_leak_when_live_row_has_no_ip() {
+        // Live row: Pod exists, no status at all.
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"}
+        });
+        // Request body: main-resource update that mistakenly carries
+        // status.podIP (a privilege-boundary violation if it leaks).
+        let mut proposed = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"},
+            "status": {
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "hostIP": "10.99.0.14",
+                "hostIPs": [{"ip": "10.99.0.14"}]
+            }
+        });
+
+        preserve_status_subresource_on_main_update("v1", "Pod", &current, &mut proposed);
+
+        let merged_status = proposed.get("status");
+        assert!(
+            merged_status.is_none() || merged_status.is_some_and(|s| s.get("podIP").is_none()),
+            "main-resource update must not inject status.podIP when live row has none: {proposed:?}"
+        );
+        assert!(
+            merged_status.is_none() || merged_status.is_some_and(|s| s.get("podIPs").is_none()),
+            "main-resource update must not inject status.podIPs when live row has none: {proposed:?}"
+        );
+        assert!(
+            merged_status.is_none() || merged_status.is_some_and(|s| s.get("hostIP").is_none()),
+            "main-resource update must not inject status.hostIP when live row has none: {proposed:?}"
+        );
+        assert!(
+            merged_status.is_none() || merged_status.is_some_and(|s| s.get("hostIPs").is_none()),
+            "main-resource update must not inject status.hostIPs when live row has none: {proposed:?}"
+        );
+    }
+
+    // Same as above, but the live row has DIFFERENT IP values. The request
+    // body's values must not overwrite the live row's.
+    #[test]
+    fn main_update_status_pod_ip_does_not_overwrite_live_row_ip() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"},
+            "status": {
+                "podIP": "10.50.1.10",
+                "podIPs": [{"ip": "10.50.1.10"}],
+                "hostIP": "10.99.0.10",
+                "hostIPs": [{"ip": "10.99.0.10"}]
+            }
+        });
+        let mut proposed = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"},
+            "status": {
+                "podIP": "10.50.1.99",
+                "podIPs": [{"ip": "10.50.1.99"}],
+                "hostIP": "10.99.0.99",
+                "hostIPs": [{"ip": "10.99.0.99"}]
+            }
+        });
+
+        preserve_status_subresource_on_main_update("v1", "Pod", &current, &mut proposed);
+
+        // The merged status must carry the LIVE values, not the request body's.
+        assert_eq!(
+            proposed.pointer("/status/podIP"),
+            Some(&json!("10.50.1.10")),
+            "live podIP must not be overwritten by main-resource request body: {proposed:?}"
+        );
+        assert_eq!(
+            proposed.pointer("/status/podIPs/0/ip"),
+            Some(&json!("10.50.1.10")),
+            "live podIPs must not be overwritten by main-resource request body: {proposed:?}"
+        );
+        assert_eq!(
+            proposed.pointer("/status/hostIP"),
+            Some(&json!("10.99.0.10")),
+            "live hostIP must not be overwritten by main-resource request body: {proposed:?}"
+        );
+        assert_eq!(
+            proposed.pointer("/status/hostIPs/0/ip"),
+            Some(&json!("10.99.0.10")),
+            "live hostIPs must not be overwritten by main-resource request body: {proposed:?}"
+        );
+    }
+
+    // T1 red test: DisruptionTarget carry-back. The existing canonical
+    // coverage at lib.rs:250 and lib.rs:289 stays green; this Pod-status
+    // variant is local to resource_semantics.rs so the carry-back is
+    // tested at the same call site that implements it.
+    #[test]
+    fn main_update_preserves_disruption_target_condition() {
+        // Live row already has DisruptionTarget (set by scheduler preemption).
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+                ]
+            }
+        });
+        // Main-resource update that does NOT carry DisruptionTarget.
+        let mut proposed = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"}
+        });
+
+        preserve_status_subresource_on_main_update("v1", "Pod", &current, &mut proposed);
+
+        let conditions = proposed
+            .pointer("/status/conditions")
+            .and_then(|v| v.as_array())
+            .expect("merged status must have conditions");
+        assert!(
+            conditions
+                .iter()
+                .any(|c| { c.get("type").and_then(|v| v.as_str()) == Some("DisruptionTarget") }),
+            "DisruptionTarget must survive main-resource update: {proposed:?}"
+        );
+    }
+
+    // T1 red test: Planned-delete readiness carry-back.
+    // Reuse the existing canonical test from lib.rs but exercise it at
+    // the resource_semantics call site to verify the merge + mark path.
+    #[test]
+    fn main_update_planned_delete_preserves_readiness_conditions() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "node-1"},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"name": "app", "ready": true}]
+            }
+        });
+        let mut proposed = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "test",
+                "namespace": "default",
+                "uid": "uid-1",
+                "deletionTimestamp": "2026-07-15T00:00:30Z",
+                "deletionGracePeriodSeconds": 30
+            },
+            "spec": {"nodeName": "node-1"},
+            "status": {"conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "reason": "PodTerminating",
+                "lastTransitionTime": "2026-07-15T00:00:00Z"
+            }]}
+        });
+
+        preserve_status_subresource_on_main_update("v1", "Pod", &current, &mut proposed);
+
+        assert_eq!(proposed.pointer("/status/phase"), Some(&json!("Running")));
+        assert_eq!(
+            proposed.pointer("/status/conditions/0/status"),
+            Some(&json!("False")),
+            "planned-delete must set Ready=False"
+        );
+        assert_eq!(
+            proposed.pointer("/status/containerStatuses/0/ready"),
+            Some(&json!(false)),
+            "planned-delete must mark containers unready"
+        );
+    }
+}

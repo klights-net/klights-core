@@ -995,4 +995,122 @@ mod ip_preservation_tests {
         );
         assert_eq!(incoming["podIP"], "10.50.1.20");
     }
+
+    // T1 red test 3: mixed-version normalization.
+    // KubeletRuntime with "podIP": "" and "podIPs": [] against a live row
+    // holding 10.50.1.20. The empty values must be treated as omission
+    // (mixed-version worker), so the live 10.50.1.20 is preserved.
+    // This is the case the normalization exists for — the existing test
+    // covers incoming-omits-key, this covers incoming-sends-empty-value.
+    #[test]
+    fn kubelet_runtime_empty_pod_ip_preserves_live_ip() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "hostIP": "10.99.0.14",
+                "hostIPs": [{"ip": "10.99.0.14"}],
+                "conditions": []
+            }
+        });
+        // Mixed-version kubelet writer sends empty string/array instead of
+        // omitting the keys.
+        let mut incoming = json!({
+            "phase": "Running",
+            "podIP": "",
+            "podIPs": [],
+            "conditions": []
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert_eq!(
+            incoming["podIP"], "10.50.1.20",
+            "empty podIP from KubeletRuntime must be treated as omission; live IP preserved: {incoming:?}"
+        );
+        assert_eq!(
+            incoming["podIPs"][0]["ip"], "10.50.1.20",
+            "empty podIPs from KubeletRuntime must be treated as omission; live podIPs preserved: {incoming:?}"
+        );
+    }
+
+    // T1 red test 4: ApiStatusSubresource with empty podIP is honored as
+    // a deliberate clear. The client's empty string must NOT be back-filled.
+    // ApiStatusSubresource does not have preserves_omitted_network_status,
+    // so the empty value is kept as-is (the replace semantic).
+    #[test]
+    fn api_status_subresource_empty_pod_ip_is_honored_as_clear() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "conditions": []
+            }
+        });
+        let mut incoming = json!({
+            "podIP": "",
+            "podIPs": [],
+            "conditions": []
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ApiStatusSubresource,
+        );
+        // ApiStatusSubresource doesn't normalize empty values (it doesn't
+        // call normalize_omitted_network_status), so the empty string is
+        // preserved as-is — the client's deliberate clear.
+        assert_eq!(
+            incoming["podIP"], "",
+            "ApiStatusSubresource with empty podIP must keep it as deliberate clear: {incoming:?}"
+        );
+    }
+
+    // T1 red test 5: hostIP/hostIPs normalization. Same shape as test 3
+    // but for hostIP/hostIPs to confirm the normalization is not podIP-only.
+    #[test]
+    fn kubelet_runtime_empty_host_ip_preserves_live_host_ip() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "hostIP": "10.99.0.14",
+                "hostIPs": [{"ip": "10.99.0.14"}],
+                "conditions": []
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "hostIP": "",
+            "hostIPs": [],
+            "conditions": []
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert_eq!(
+            incoming["hostIP"], "10.99.0.14",
+            "empty hostIP from KubeletRuntime must be treated as omission; live hostIP preserved: {incoming:?}"
+        );
+        assert_eq!(
+            incoming["hostIPs"][0]["ip"], "10.99.0.14",
+            "empty hostIPs from KubeletRuntime must be treated as omission; live hostIPs preserved: {incoming:?}"
+        );
+    }
 }
