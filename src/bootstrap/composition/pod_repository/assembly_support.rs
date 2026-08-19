@@ -4059,8 +4059,8 @@ pub(crate) mod support {
     ) -> PodStatusUpdate {
         PodStatusUpdate {
             phase: "Pending".to_string(),
-            pod_ip: pod_ip.to_string(),
-            host_ip: "10.0.0.10".to_string(),
+            pod_ip: klights_kubelet::pod_repository::PublishedAddress::parse(pod_ip),
+            host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
             container_statuses,
             init_container_statuses: None,
             qos_class: None,
@@ -4296,8 +4296,12 @@ pub(crate) mod support {
                     pod_name,
                     PodStatusUpdate {
                         phase: "Running".to_string(),
-                        pod_ip: "10.42.0.55".to_string(),
-                        host_ip: "127.0.0.1".to_string(),
+                        pod_ip: klights_kubelet::pod_repository::PublishedAddress::must(
+                            "10.42.0.55",
+                        ),
+                        host_ip: klights_kubelet::pod_repository::PublishedAddress::must(
+                            "127.0.0.1",
+                        ),
                         container_statuses: Vec::new(),
                         init_container_statuses: None,
                         qos_class: Some("BestEffort".to_string()),

@@ -28,12 +28,37 @@ use klights_pod_api::{
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 use serde_json::{Map, Value};
 
+/// A published network address. Constructing one is only possible from a
+/// non-empty, trimmed string, so "unknown" is `None` and never `""`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PublishedAddress(String);
+
+impl PublishedAddress {
+    pub fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| Self(trimmed.to_string()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Convenience: parse a known-non-empty address. Panics in debug builds
+    /// if the value is empty.
+    pub fn must(value: &str) -> Option<Self> {
+        debug_assert!(
+            !value.trim().is_empty(),
+            "PublishedAddress::must called with empty value"
+        );
+        Some(Self(value.trim().to_string()))
+    }
+}
+
 /// Standard post-sandbox status update authored by the kubelet lifecycle.
 #[derive(Debug, Clone)]
 pub struct PodStatusUpdate {
     pub phase: String,
-    pub pod_ip: String,
-    pub host_ip: String,
+    pub pod_ip: Option<PublishedAddress>,
+    pub host_ip: Option<PublishedAddress>,
     pub container_statuses: Vec<Value>,
     pub init_container_statuses: Option<Vec<Value>>,
     pub qos_class: Option<String>,

@@ -1673,6 +1673,7 @@ async fn real_runtime_reconcile_runtime_noop_when_no_sandbox() {
 #[tokio::test]
 async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_container() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -1721,8 +1722,8 @@ async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_co
             "uid-terminate-cmd",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.9".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.9"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -1817,6 +1818,7 @@ async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_co
 #[tokio::test]
 async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_running_status() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -1878,8 +1880,8 @@ async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_runn
             "uid-terminate-rpa",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.10".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.10"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -1970,6 +1972,7 @@ async fn real_runtime_finalize_startup_unconfirmed_when_pod_not_found_or_pending
 #[tokio::test]
 async fn real_runtime_finalize_startup_returns_confirmed_sandbox_id_when_running_with_podip() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::store::PodRuntimeStore;
 
     let harness = PodRuntimeHarness::new().await;
@@ -2000,8 +2003,8 @@ async fn real_runtime_finalize_startup_returns_confirmed_sandbox_id_when_running
             "uid-confirmed",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.0.0.23".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.0.0.23"),
+                host_ip: None,
                 container_statuses: Vec::new(),
                 init_container_statuses: None,
                 qos_class: None,
@@ -2912,6 +2915,7 @@ async fn pod_stop_sandbox_identity_fallback_with_parity() {
 #[tokio::test]
 async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_containers() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -2970,8 +2974,8 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
             "uid-e2e",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.2".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.2"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|v| v.as_array())
@@ -3023,6 +3027,7 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
 #[tokio::test]
 async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succeeded() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
     use crate::runtime::store::PodRuntimeStore;
 
@@ -3070,8 +3075,8 @@ async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succee
             "uid-short-lived",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.3".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.3"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -3130,6 +3135,7 @@ async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succee
 #[tokio::test]
 async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_running_snapshot() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
     use crate::runtime::store::PodRuntimeStore;
 
@@ -3190,8 +3196,8 @@ async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_r
             "uid-terminate-rpof",
             PodStatusUpdate {
                 phase: "Succeeded".to_string(),
-                pod_ip: "10.50.1.11".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.11"),
+                host_ip: None,
                 container_statuses: vec![serde_json::json!({
                     "name": "terminate-cmd-rpof",
                     "containerID": "containerd://ctr-rpof",
@@ -3446,6 +3452,7 @@ async fn real_runtime_reconcile_treats_cri_numeric_running_state_as_running() {
 #[tokio::test]
 async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::RuntimeReconcileHint;
     use crate::runtime::cri::ContainerRuntimeState;
     use crate::runtime::store::PodRuntimeStore;
@@ -3469,8 +3476,8 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
             "uid-fast-exit",
             PodStatusUpdate {
                 phase: "Pending".to_string(),
-                pod_ip: "10.50.2.44".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.2.44"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|v| v.as_array())
@@ -3549,6 +3556,7 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
 #[tokio::test]
 async fn missing_hinted_workload_container_is_an_observation_miss() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::RuntimeReconcileHint;
     use crate::runtime::store::PodRuntimeStore;
 
@@ -3570,8 +3578,8 @@ async fn missing_hinted_workload_container_is_an_observation_miss() {
             "uid-observation-miss",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.2.45".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.2.45"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -3632,6 +3640,7 @@ async fn hinted_container_status_non_not_found_error_remains_fail_closed() {
 async fn started_cri_event_overrides_lagging_created_status_snapshot() {
     use crate::cri_events::KubeletEventKind;
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::RuntimeReconcileHint;
     use crate::runtime::cri::ContainerRuntimeState;
     use crate::runtime::store::PodRuntimeStore;
@@ -3655,8 +3664,8 @@ async fn started_cri_event_overrides_lagging_created_status_snapshot() {
             "uid-coredns",
             PodStatusUpdate {
                 phase: "Pending".to_string(),
-                pod_ip: "10.50.0.2".to_string(),
-                host_ip: "172.31.10.2".to_string(),
+                pod_ip: PublishedAddress::must("10.50.0.2"),
+                host_ip: PublishedAddress::must("172.31.10.2"),
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -3838,6 +3847,7 @@ async fn runtime_reconcile_uses_hinted_container_when_listing_is_partially_stale
     });
     harness.create_runtime_pod(pod.clone()).await;
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     harness
         .repo
         .pod_status_writer
@@ -3847,8 +3857,8 @@ async fn runtime_reconcile_uses_hinted_container_when_listing_is_partially_stale
             "uid-partial-stale",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.0.0.1".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.0.0.1"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .unwrap()
@@ -3916,6 +3926,7 @@ async fn runtime_reconcile_ignores_unknown_hinted_container_without_regressing_t
     });
     harness.create_runtime_pod(pod.clone()).await;
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     harness
         .repo
         .pod_status_writer
@@ -3925,8 +3936,8 @@ async fn runtime_reconcile_ignores_unknown_hinted_container_without_regressing_t
             "uid-unknown-hint",
             PodStatusUpdate {
                 phase: "Succeeded".to_string(),
-                pod_ip: String::new(),
-                host_ip: String::new(),
+                pod_ip: None,
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .unwrap()
@@ -3982,6 +3993,7 @@ async fn fast_exit_multi_container_pod_reaches_terminal_phase_under_empty_listin
     });
     harness.create_runtime_pod(pod.clone()).await;
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     harness
         .repo
         .pod_status_writer
@@ -3991,8 +4003,8 @@ async fn fast_exit_multi_container_pod_reaches_terminal_phase_under_empty_listin
             "uid-multi-exit",
             PodStatusUpdate {
                 phase: "Pending".to_string(),
-                pod_ip: "10.0.0.2".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.0.0.2"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .unwrap()

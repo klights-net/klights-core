@@ -325,6 +325,7 @@ async fn real_runtime_start_pod_uses_hostport_admission_port_before_side_effects
 #[tokio::test]
 async fn hostport_admission_failure_marks_pod_failed_with_parity() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
 
     let harness = PodRuntimeHarness::new().await;
     let holder = serde_json::json!({
@@ -362,8 +363,8 @@ async fn hostport_admission_failure_marks_pod_failed_with_parity() {
             "uid-holder",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.0.63".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.0.63"),
+                host_ip: None,
                 container_statuses: Vec::new(),
                 init_container_statuses: None,
                 qos_class: None,

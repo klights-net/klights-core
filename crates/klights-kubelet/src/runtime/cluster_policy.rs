@@ -95,10 +95,10 @@ pub(super) async fn apply_forwarded_status(
                 phase,
                 pod_ip: optional_status_string(&status, "podIP")
                     .or_else(|| live_status_string(live.as_ref(), "podIP"))
-                    .unwrap_or_default(),
+                    .and_then(|s| crate::pod_repository::PublishedAddress::parse(&s)),
                 host_ip: optional_status_string(&status, "hostIP")
                     .or_else(|| live_status_string(live.as_ref(), "hostIP"))
-                    .unwrap_or_default(),
+                    .and_then(|s| crate::pod_repository::PublishedAddress::parse(&s)),
                 container_statuses,
                 init_container_statuses,
                 qos_class: None,

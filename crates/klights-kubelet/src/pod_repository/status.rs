@@ -788,22 +788,22 @@ impl PodStatusService {
             };
 
             let pod_ip = update.pod_ip.clone();
-            let host_ip = if update.host_ip.is_empty() {
-                self.host_ip.current().to_string()
-            } else {
-                update.host_ip.clone()
-            };
+            let host_ip = update.host_ip.clone().or_else(|| {
+                crate::pod_repository::PublishedAddress::parse(&self.host_ip.current())
+            });
 
             let mut status_obj = json!({
                 "phase": phase,
-                "podIP": pod_ip,
-                "hostIP": host_ip,
-                "hostIPs": [{ "ip": host_ip }],
                 "conditions": conditions,
                 "containerStatuses": container_statuses,
             });
-            if !pod_ip.is_empty() {
-                status_obj["podIPs"] = json!([{ "ip": pod_ip }]);
+            if let Some(ref pod_ip) = pod_ip {
+                status_obj["podIP"] = json!(pod_ip.as_str());
+                status_obj["podIPs"] = json!([{ "ip": pod_ip.as_str() }]);
+            }
+            if let Some(ref host_ip) = host_ip {
+                status_obj["hostIP"] = json!(host_ip.as_str());
+                status_obj["hostIPs"] = json!([{ "ip": host_ip.as_str() }]);
             }
             if !init_container_statuses.is_empty() {
                 status_obj["initContainerStatuses"] = json!(init_container_statuses);
@@ -982,13 +982,12 @@ impl PodStatusService {
         let pod_ip = pod
             .pointer("/status/podIP")
             .and_then(|ip| ip.as_str())
-            .unwrap_or("")
-            .to_string();
+            .and_then(crate::pod_repository::PublishedAddress::parse);
 
         let update = PodStatusUpdate {
             phase: "Pending".to_string(),
             pod_ip,
-            host_ip: String::new(),
+            host_ip: None,
             container_statuses,
             init_container_statuses: Some(init_container_statuses),
             qos_class: None,
@@ -2427,14 +2426,14 @@ fn incoming_container_generations_match(
 }
 
 fn network_status_is_published(update: &PodStatusUpdate, pod: &Value) -> bool {
-    if !update.pod_ip.trim().is_empty() {
+    if update.pod_ip.is_some() {
         return true;
     }
     let host_network = pod
         .pointer("/spec/hostNetwork")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    host_network && !update.host_ip.trim().is_empty()
+    host_network && update.host_ip.is_some()
 }
 
 fn has_create_container_config_error_status(statuses: &[Value]) -> bool {

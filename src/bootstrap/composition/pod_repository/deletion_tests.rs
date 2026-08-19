@@ -1899,8 +1899,8 @@ mod tests {
             let before = create_replacement_pod(&repo, ns, name).await;
             let update = super::super::assembly_support::support::PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.42.0.99".to_string(),
-                host_ip: "192.168.1.99".to_string(),
+                pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.99"),
+                host_ip: klights_kubelet::pod_repository::PublishedAddress::must("192.168.1.99"),
                 container_statuses: vec![],
                 init_container_statuses: None,
                 qos_class: None,

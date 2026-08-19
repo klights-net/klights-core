@@ -17,8 +17,8 @@ mod tests {
                 "repo-pod",
                 PodStatusUpdate {
                     phase: "Running".to_string(),
-                    pod_ip: "10.42.0.8".to_string(),
-                    host_ip: "10.0.0.5".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.8"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.5"),
                     container_statuses: vec![json!({
                         "name": "app",
                         "ready": true,
@@ -76,8 +76,8 @@ mod tests {
                 "ready-empty-statuses",
                 PodStatusUpdate {
                     phase: "Running".to_string(),
-                    pod_ip: "10.43.0.77".to_string(),
-                    host_ip: "127.0.0.1".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.43.0.77"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("127.0.0.1"),
                     container_statuses: vec![],
                     init_container_statuses: Some(vec![]),
                     qos_class: None,
@@ -110,8 +110,8 @@ mod tests {
 
         let update = super::super::assembly_support::support::PodStatusUpdate {
             phase: "Running".to_string(),
-            pod_ip: "10.42.0.5".to_string(),
-            host_ip: "10.0.0.10".to_string(),
+            pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.5"),
+            host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
             container_statuses: vec![json!({
                 "name": "c", "ready": true, "restartCount": 0,
                 "image": "nginx", "imageID": "",
@@ -188,8 +188,8 @@ mod tests {
                 "preempted",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Running".to_string(),
-                    pod_ip: "10.42.0.6".to_string(),
-                    host_ip: "10.0.0.10".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.6"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
                     container_statuses: vec![json!({
                         "name": "c",
                         "ready": true,
@@ -238,8 +238,8 @@ mod tests {
                 "pending-no-ip",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Pending".to_string(),
-                    pod_ip: String::new(),
-                    host_ip: String::new(),
+                    pod_ip: None,
+                    host_ip: None,
                     container_statuses: vec![],
                     init_container_statuses: None,
                     qos_class: None,
@@ -271,8 +271,8 @@ mod tests {
 
         let update = super::super::assembly_support::support::PodStatusUpdate {
             phase: "Pending".to_string(),
-            pod_ip: String::new(),
-            host_ip: "10.0.0.10".to_string(),
+            pod_ip: None,
+            host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
             container_statuses: vec![json!({
                 "name": "c",
                 "ready": false,
@@ -370,8 +370,8 @@ mod tests {
                 "owned-noop",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Pending".to_string(),
-                    pod_ip: String::new(),
-                    host_ip: "10.0.0.10".to_string(),
+                    pod_ip: None,
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
                     container_statuses: vec![],
                     init_container_statuses: None,
                     qos_class: None,
@@ -433,8 +433,8 @@ mod tests {
                 "late-pod",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Pending".to_string(),
-                    pod_ip: "".to_string(),
-                    host_ip: "10.0.0.10".to_string(),
+                    pod_ip: None,
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
                     container_statuses: vec![],
                     init_container_statuses: None,
                     qos_class: None,
@@ -533,8 +533,8 @@ mod tests {
                 "pdb-pod",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Running".to_string(),
-                    pod_ip: "10.42.0.8".to_string(),
-                    host_ip: "10.0.0.10".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.8"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
                     container_statuses: vec![json!({
                         "name": "c",
                         "ready": true,
@@ -867,8 +867,8 @@ mod tests {
         // First writer wins with the snapshot rv.
         let update_a = super::super::assembly_support::support::PodStatusUpdate {
             phase: "Running".to_string(),
-            pod_ip: "10.42.0.6".to_string(),
-            host_ip: "10.0.0.10".to_string(),
+            pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.6"),
+            host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
             container_statuses: vec![],
             init_container_statuses: None,
             qos_class: None,
@@ -881,8 +881,8 @@ mod tests {
         // Second writer with the stale snapshot rv must hit Conflict.
         let update_b = super::super::assembly_support::support::PodStatusUpdate {
             phase: "Failed".to_string(),
-            pod_ip: "10.42.0.6".to_string(),
-            host_ip: "10.0.0.10".to_string(),
+            pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.42.0.6"),
+            host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
             container_statuses: vec![],
             init_container_statuses: None,
             qos_class: None,
@@ -903,8 +903,8 @@ mod tests {
             pending_pod("scheduled-race"),
             super::super::assembly_support::support::PodStatusUpdate {
                 phase: "Pending".to_string(),
-                pod_ip: String::new(),
-                host_ip: String::new(),
+                pod_ip: None,
+                host_ip: None,
                 container_statuses: vec![],
                 init_container_statuses: None,
                 qos_class: None,
@@ -1998,8 +1998,8 @@ mod tests {
                 "web-0",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Failed".to_string(),
-                    pod_ip: String::new(),
-                    host_ip: String::new(),
+                    pod_ip: None,
+                    host_ip: None,
                     container_statuses: vec![json!({
                         "name": "c",
                         "ready": false,
@@ -2827,8 +2827,8 @@ mod tests {
                 "old-uid",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Running".to_string(),
-                    pod_ip: "10.43.0.15".to_string(),
-                    host_ip: "10.206.0.10".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.43.0.15"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.206.0.10"),
                     container_statuses: vec![json!({
                         "name": "webserver",
                         "ready": true,
@@ -3077,8 +3077,8 @@ mod tests {
                 pending_pod("same-name-status-race"),
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Pending".to_string(),
-                    pod_ip: String::new(),
-                    host_ip: "10.0.0.10".to_string(),
+                    pod_ip: None,
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.0.0.10"),
                     container_statuses: vec![],
                     init_container_statuses: None,
                     qos_class: None,
@@ -3181,8 +3181,8 @@ mod tests {
                 "p-init-retry",
                 super::super::assembly_support::support::PodStatusUpdate {
                     phase: "Pending".to_string(),
-                    pod_ip: "10.43.0.5".to_string(),
-                    host_ip: "10.206.0.9".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.43.0.5"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.206.0.9"),
                     container_statuses: vec![],
                     init_container_statuses: None,
                     qos_class: None,
@@ -3566,6 +3566,139 @@ mod tests {
             r3.expect_err("ephemeral stale must conflict")
                 .to_string()
                 .contains("409")
+        );
+    }
+
+    // T3 red test 1: set_pod_status_for_uid with pod_ip: None against a live
+    // row that has an IP produces a status document with NO podIP key.
+    // Assert on the emitted JSON, not the merged result.
+    #[tokio::test]
+    async fn t3_none_pod_ip_emits_no_pod_ip_key() {
+        let repo = build_status_repo().await;
+        let created = repo
+            .persistence
+            .seed_pod("default", "t3-pod", pending_pod("t3-pod"))
+            .await
+            .expect("seed");
+        // First write: set a real podIP so the row has one.
+        repo.status_ports()
+            .set_pod_status_for_uid(
+                "default",
+                "t3-pod",
+                &created.uid,
+                PodStatusUpdate {
+                    phase: "Running".to_string(),
+                    pod_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.50.1.20"),
+                    host_ip: klights_kubelet::pod_repository::PublishedAddress::must("10.99.0.14"),
+                    container_statuses: vec![],
+                    init_container_statuses: None,
+                    qos_class: None,
+                },
+                Some(created.resource_version),
+            )
+            .await
+            .expect("first write");
+        // Second write: pod_ip: None. The emitted JSON must have no podIP key.
+        let updated = repo
+            .status_ports()
+            .set_pod_status_for_uid(
+                "default",
+                "t3-pod",
+                &created.uid,
+                PodStatusUpdate {
+                    phase: "Running".to_string(),
+                    pod_ip: None,
+                    host_ip: None,
+                    container_statuses: vec![],
+                    init_container_statuses: None,
+                    qos_class: None,
+                },
+                None,
+            )
+            .await
+            .expect("second write");
+        // The emitted status must NOT contain an empty podIP string —
+        // absent means "unknown", and the merge back-fills from live.
+        // The stored result will have the live podIP from the merge,
+        // but must NOT have an empty-string podIP.
+        if let Some(pod_ip_val) = updated.data.pointer("/status/podIP") {
+            assert!(
+                !pod_ip_val.as_str().is_some_and(|s| s.is_empty()),
+                "pod_ip: None must not produce empty-string podIP, got: {:?}",
+                pod_ip_val
+            );
+        }
+    }
+
+    // T3 red test 2: that emitted status, merged as KubeletRuntime against a
+    // live row with podIP=10.50.1.20, retains 10.50.1.20.
+    #[test]
+    fn t3_none_pod_ip_merged_with_live_preserves_live_ip() {
+        use klights_types::{PodStatusOwner, merge_pod_status_for_update};
+        let live = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "conditions": []
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "conditions": []
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &live,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert_eq!(
+            incoming.pointer("/podIP"),
+            Some(&json!("10.50.1.20")),
+            "merged status must preserve live podIP when incoming omits it"
+        );
+    }
+
+    // T3 red test 3: apply_forwarded_status with initContainerStatuses but
+    // no IPs against a live read with no IPs must not write an empty podIP.
+    #[tokio::test]
+    async fn t3_no_ip_status_does_not_write_empty_pod_ip() {
+        let repo = build_status_repo().await;
+        let created = repo
+            .persistence
+            .seed_pod("default", "t3-pod2", pending_pod("t3-pod2"))
+            .await
+            .expect("seed");
+        let updated = repo
+            .status_ports()
+            .set_pod_status_for_uid(
+                "default",
+                "t3-pod2",
+                &created.uid,
+                PodStatusUpdate {
+                    phase: "Pending".to_string(),
+                    pod_ip: None,
+                    host_ip: None,
+                    container_statuses: vec![],
+                    init_container_statuses: Some(vec![
+                        json!({"name": "init", "state": {"terminated": {"exitCode": 0}}}),
+                    ]),
+                    qos_class: None,
+                },
+                Some(created.resource_version),
+            )
+            .await
+            .expect("write");
+        // The stored status must NOT contain an empty podIP string.
+        // With no prior IP on the live row, the merge has nothing to
+        // back-fill, so podIP must be absent entirely.
+        assert!(
+            updated.data.pointer("/status/podIP").is_none(),
+            "no-IP status with no live IP must not produce podIP: {:?}",
+            updated.data.pointer("/status/podIP")
         );
     }
 }

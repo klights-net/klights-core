@@ -480,6 +480,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
 #[tokio::test]
 async fn mocked_runtime_does_not_read_termination_message_file_directly() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
     use crate::runtime::store::PodRuntimeStore;
 
@@ -545,8 +546,8 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
             "uid-termination-mock-read",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.3".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.3"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -737,6 +738,7 @@ async fn hosts_file_mount_path_with_parity() {
 #[tokio::test]
 async fn termination_message_file_handling_with_parity() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
     use crate::runtime::store::PodRuntimeStore;
 
@@ -802,8 +804,8 @@ async fn termination_message_file_handling_with_parity() {
             "uid-termination-read",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.3".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.1.3"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())

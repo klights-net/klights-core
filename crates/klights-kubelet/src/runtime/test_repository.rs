@@ -11,7 +11,7 @@ use crate::context::HostIpState;
 use crate::pod_repository::status::{
     PodStatusService, PodStatusServiceDependencies, PodStatusWriter,
 };
-use crate::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
+use crate::pod_repository::{PodStatusUpdate, PublishedAddress, RuntimeReconcileStatus};
 use crate::runtime::{PodDeletionFinalizeResult, PodRuntimeKey};
 
 #[derive(Default)]

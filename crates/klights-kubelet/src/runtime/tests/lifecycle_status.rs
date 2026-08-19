@@ -467,6 +467,7 @@ async fn real_runtime_start_pod_does_not_write_status_to_replacement_uid() {
 #[tokio::test]
 async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
 
     let conflict_cluster = std::sync::Arc::new(FakeCluster::new());
     let (_cri, conflict_runtime, conflict_repo, _conflict_cluster, conflict_hostports) =
@@ -504,8 +505,8 @@ async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
             "uid-holder",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.0.63".to_string(),
-                host_ip: "10.0.0.5".to_string(),
+                pod_ip: PublishedAddress::must("10.50.0.63"),
+                host_ip: PublishedAddress::must("10.0.0.5"),
                 container_statuses: Vec::new(),
                 init_container_statuses: None,
                 qos_class: None,

@@ -149,8 +149,8 @@ mod tests {
         // Stale UID: write with wrong UID must be rejected.
         let update = super::super::assembly_support::support::PodStatusUpdate {
             phase: "Running".to_string(),
-            pod_ip: String::new(),
-            host_ip: String::new(),
+            pod_ip: None,
+            host_ip: None,
             container_statuses: vec![],
             init_container_statuses: None,
             qos_class: None,
@@ -324,8 +324,8 @@ mod tests {
         {
             let update = super::super::assembly_support::support::PodStatusUpdate {
                 phase: "Failed".to_string(),
-                pod_ip: String::new(),
-                host_ip: String::new(),
+                pod_ip: None,
+                host_ip: None,
                 container_statuses: vec![],
                 init_container_statuses: None,
                 qos_class: None,

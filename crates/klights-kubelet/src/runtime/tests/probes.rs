@@ -104,6 +104,7 @@ async fn mock_dependency_matrix_probe() {
 #[tokio::test]
 async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -158,8 +159,8 @@ async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
             "uid-netserver-0",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.0.3".to_string(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.50.0.3"),
+                host_ip: None,
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -215,6 +216,7 @@ async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
 async fn liveness_restart_uses_runtime_container_id_with_parity() {
     use crate::lifecycle::{LifecycleCommand, RestartReason};
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -269,8 +271,8 @@ async fn liveness_restart_uses_runtime_container_id_with_parity() {
             "uid-grpc-liveness",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.4".to_string(),
-                host_ip: "10.99.0.11".to_string(),
+                pod_ip: PublishedAddress::must("10.50.1.4"),
+                host_ip: PublishedAddress::must("10.99.0.11"),
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -363,6 +365,7 @@ async fn liveness_restart_uses_runtime_container_id_with_parity() {
 async fn liveness_restart_publishes_replacement_container_status_immediately() {
     use crate::lifecycle::{LifecycleCommand, RestartReason};
     use crate::pod_repository::PodStatusUpdate;
+    use crate::pod_repository::PublishedAddress;
     use crate::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -425,8 +428,8 @@ async fn liveness_restart_publishes_replacement_container_status_immediately() {
             "uid-liveness-status",
             PodStatusUpdate {
                 phase: "Running".to_string(),
-                pod_ip: "10.50.1.5".to_string(),
-                host_ip: "10.99.0.11".to_string(),
+                pod_ip: PublishedAddress::must("10.50.1.5"),
+                host_ip: PublishedAddress::must("10.99.0.11"),
                 container_statuses: pod
                     .pointer("/status/containerStatuses")
                     .and_then(|value| value.as_array())
@@ -546,8 +549,8 @@ async fn real_runtime_start_pod_does_not_register_readiness_probes_before_finali
             "uid-probe",
             PodStatusUpdate {
                 phase: "Running".into(),
-                pod_ip: "10.0.0.1".into(),
-                host_ip: String::new(),
+                pod_ip: PublishedAddress::must("10.0.0.1"),
+                host_ip: None,
                 container_statuses: Vec::new(),
                 init_container_statuses: None,
                 qos_class: None,

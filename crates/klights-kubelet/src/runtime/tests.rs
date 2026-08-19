@@ -692,7 +692,7 @@ impl crate::runtime_clock::RuntimeClock for FixedRuntimeClock {
 
 // --- Task 22.5: Probe Registration on Start ---
 
-use crate::pod_repository::PodStatusUpdate;
+use crate::pod_repository::{PodStatusUpdate, PublishedAddress};
 
 // --- Task 23.1: PreStop Hooks ---
 
