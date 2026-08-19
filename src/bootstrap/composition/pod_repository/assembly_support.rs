@@ -55,6 +55,7 @@ pub(crate) mod support {
         pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
         deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
         node_local: Arc<crate::bootstrap::composition::node_store::NodeLocalStores>,
+        status_ports: klights_kubelet::test_support::pod_status::PodStatusTestPorts,
         pub query: klights_pod_api::test_support::PodQueryPorts,
         pub update: klights_pod_api::test_support::PodUpdatePorts,
     }
@@ -151,10 +152,19 @@ pub(crate) mod support {
                 query: IntegrationPodQueryPorts::new(pod_query.clone(), pod_snapshot),
                 update: IntegrationPodUpdatePorts::new(pod_update.clone()),
                 pod_update,
+                status_ports: klights_kubelet::test_support::pod_status::PodStatusTestPorts::new(
+                    pod_status_writer.clone(),
+                ),
                 pod_status_writer,
                 deletion_finalizer,
                 node_local,
             }
+        }
+
+        pub fn status_ports(
+            &self,
+        ) -> &klights_kubelet::test_support::pod_status::PodStatusTestPorts {
+            &self.status_ports
         }
 
         pub async fn claim_next_due_outbox(
@@ -215,6 +225,27 @@ pub(crate) mod support {
                 uid,
                 update,
                 expected_rv,
+            )
+            .await
+        }
+
+        /// Read this Pod with the kubelet's own pending outbox writes applied.
+        ///
+        /// This is the exact read `reconcile_runtime` performs before it
+        /// derives `ready`/`restartCount`/`lastState` from the existing
+        /// status. Overlaying the pending checkpoint here is what stops a
+        /// stale leader read from clobbering a just-published probe result.
+        pub async fn read_pod_with_own_writes(
+            &self,
+            namespace: &str,
+            name: &str,
+            uid: &str,
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+            klights_kubelet::pod_repository::PodStatusWriter::read_pod_with_own_writes(
+                self.pod_status_writer.as_ref(),
+                namespace,
+                name,
+                uid,
             )
             .await
         }

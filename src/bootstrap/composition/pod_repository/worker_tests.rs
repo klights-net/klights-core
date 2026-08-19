@@ -363,6 +363,418 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn reconcile_read_pod_with_own_writes_overlays_pending_probe_ready() {
+        // T2 red test 1: a probe has published ready=true into the outbox but
+        // the leader read still returns ready=false (replication lag). The
+        // reconcile-path read must overlay the pending checkpoint so the
+        // derived containerStatuses.ready stays true.
+        let stale_leader = klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "ryow-ready".to_string(),
+            uid: "uid-ryow-ready".to_string(),
+            resource_version: 12,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "ryow-ready",
+                    "uid": "uid-ryow-ready",
+                    "resourceVersion": "12"
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.42.0.9",
+                    "podIPs": [{"ip": "10.42.0.9"}],
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": false,
+                        "started": true,
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-06-01T00:00:00Z"}}
+                    }]
+                }
+            })),
+        };
+        let repo =
+            IntegrationPodWorkerFixture::new(Arc::new(FakeLeaderApiClient::new(stale_leader)))
+                .await;
+
+        // Probe publishes ready=true; this enqueues an outbox row and records
+        // a node-local status checkpoint with the new ready value.
+        repo.status_ports()
+            .set_probe_readiness_for_uid(
+                "default",
+                "ryow-ready",
+                "uid-ryow-ready",
+                "app",
+                true,
+                None,
+            )
+            .await
+            .expect("probe readiness write enqueues outbox and records checkpoint");
+
+        // The reconcile-path read must see the pending own write (ready=true)
+        // even though the leader still returns ready=false.
+        let read = repo
+            .read_pod_with_own_writes("default", "ryow-ready", "uid-ryow-ready")
+            .await
+            .expect("reconcile read")
+            .expect("pod present");
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "reconcile read must overlay the pending ready=true probe write"
+        );
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/restartCount")
+                .and_then(|v| v.as_i64()),
+            Some(0),
+            "reconcile read must preserve restartCount from the own write"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_read_pod_with_own_writes_preserves_pending_restart_count() {
+        // T2 red test 2: a stale leader read showing a lower restartCount must
+        // not produce a status that regresses the count. The reconcile read
+        // must overlay the pending own write (restartCount=3).
+        let stale_leader = klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "ryow-restarts".to_string(),
+            uid: "uid-ryow-restarts".to_string(),
+            resource_version: 12,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "ryow-restarts",
+                    "uid": "uid-ryow-restarts",
+                    "resourceVersion": "12"
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.42.0.9",
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": true,
+                        "started": true,
+                        "restartCount": 1,
+                        "state": {"running": {"startedAt": "2026-06-01T00:00:00Z"}}
+                    }]
+                }
+            })),
+        };
+        let repo =
+            IntegrationPodWorkerFixture::new(Arc::new(FakeLeaderApiClient::new(stale_leader)))
+                .await;
+
+        // The kubelet's own observation recorded restartCount=3.
+        repo.apply_runtime_reconcile_status_for_uid(
+            "default",
+            "ryow-restarts",
+            "uid-ryow-restarts",
+            super::super::assembly_support::support::RuntimeReconcileStatus {
+                phase: "Running".to_string(),
+                container_statuses: vec![json!({
+                    "name": "app",
+                    "ready": true,
+                    "restartCount": 3,
+                    "state": {"running": {"startedAt": "2026-06-01T00:00:00Z"}}
+                })],
+            },
+            None,
+        )
+        .await
+        .expect("record restartCount checkpoint");
+
+        let read = repo
+            .read_pod_with_own_writes("default", "ryow-restarts", "uid-ryow-restarts")
+            .await
+            .expect("reconcile read")
+            .expect("pod present");
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/restartCount")
+                .and_then(|v| v.as_i64()),
+            Some(3),
+            "reconcile read must not regress restartCount to the stale leader's 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_read_pod_with_own_writes_preserves_pending_last_state() {
+        // T2 red test 3: a just-written terminal lastState must survive a
+        // reconcile driven by a stale leader read.
+        let stale_leader = klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "ryow-laststate".to_string(),
+            uid: "uid-ryow-laststate".to_string(),
+            resource_version: 12,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "ryow-laststate",
+                    "uid": "uid-ryow-laststate",
+                    "resourceVersion": "12"
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.42.0.9",
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": true,
+                        "started": true,
+                        "restartCount": 2,
+                        "state": {"running": {"startedAt": "2026-06-01T00:00:00Z"}}
+                    }]
+                }
+            })),
+        };
+        let repo =
+            IntegrationPodWorkerFixture::new(Arc::new(FakeLeaderApiClient::new(stale_leader)))
+                .await;
+
+        // Kubelet observed the container terminate and wrote lastState.
+        repo.apply_runtime_reconcile_status_for_uid(
+            "default",
+            "ryow-laststate",
+            "uid-ryow-laststate",
+            super::super::assembly_support::support::RuntimeReconcileStatus {
+                phase: "Running".to_string(),
+                container_statuses: vec![json!({
+                    "name": "app",
+                    "ready": false,
+                    "restartCount": 3,
+                    "lastState": {"terminated": {"reason": "OOMKilled", "exitCode": 137}},
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}}
+                })],
+            },
+            None,
+        )
+        .await
+        .expect("record lastState checkpoint");
+
+        let read = repo
+            .read_pod_with_own_writes("default", "ryow-laststate", "uid-ryow-laststate")
+            .await
+            .expect("reconcile read")
+            .expect("pod present");
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/lastState/terminated/reason")
+                .and_then(|v| v.as_str()),
+            Some("OOMKilled"),
+            "reconcile read must preserve the just-written terminal lastState"
+        );
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/restartCount")
+                .and_then(|v| v.as_i64()),
+            Some(3),
+            "reconcile read must not regress restartCount alongside lastState"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_read_never_regresses_ready_without_justification() {
+        // T2 red test 4 (oscillation regression): alternate probe-publish and
+        // reconcile against a lagging leader read across several rounds and
+        // assert ready never transitions true -> false without a CRI or probe
+        // event that justifies it.
+        let stale_leader = klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "ryow-oscillate".to_string(),
+            uid: "uid-ryow-oscillate".to_string(),
+            resource_version: 12,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "ryow-oscillate",
+                    "uid": "uid-ryow-oscillate",
+                    "resourceVersion": "12"
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.42.0.9",
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": false,
+                        "started": true,
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-06-01T00:00:00Z"}}
+                    }]
+                }
+            })),
+        };
+        let repo =
+            IntegrationPodWorkerFixture::new(Arc::new(FakeLeaderApiClient::new(stale_leader)))
+                .await;
+
+        // Round 1: probe succeeds -> ready=true pending in the outbox.
+        repo.status_ports()
+            .set_probe_readiness_for_uid(
+                "default",
+                "ryow-oscillate",
+                "uid-ryow-oscillate",
+                "app",
+                true,
+                None,
+            )
+            .await
+            .expect("round 1 probe ready");
+        let read = repo
+            .read_pod_with_own_writes("default", "ryow-oscillate", "uid-ryow-oscillate")
+            .await
+            .expect("round 1 read")
+            .expect("pod present");
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "round 1 must see ready=true from its own pending write"
+        );
+
+        // Round 2: reconcile again while the leader is still stale. Without
+        // the own-writes overlay this read would clobber ready back to false.
+        let read2 = repo
+            .read_pod_with_own_writes("default", "ryow-oscillate", "uid-ryow-oscillate")
+            .await
+            .expect("round 2 read")
+            .expect("pod present");
+        assert_eq!(
+            read2
+                .data
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "round 2 read must not regress ready to the stale leader's false"
+        );
+
+        // Round 3: another reconcile, still stale leader.
+        let read3 = repo
+            .read_pod_with_own_writes("default", "ryow-oscillate", "uid-ryow-oscillate")
+            .await
+            .expect("round 3 read")
+            .expect("pod present");
+        assert_eq!(
+            read3
+                .data
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "repeated reconciles against a lagging leader must never regress ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_read_honors_genuine_probe_failure() {
+        // T2 red test 5: a container whose readiness probe has actually failed
+        // must still read ready=false. The fix must not become "always
+        // preserve live ready".
+        let stale_leader = klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "ryow-unready".to_string(),
+            uid: "uid-ryow-unready".to_string(),
+            resource_version: 12,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "ryow-unready",
+                    "uid": "uid-ryow-unready",
+                    "resourceVersion": "12"
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.42.0.9",
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": true,
+                        "started": true,
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-06-01T00:00:00Z"}}
+                    }]
+                }
+            })),
+        };
+        let repo =
+            IntegrationPodWorkerFixture::new(Arc::new(FakeLeaderApiClient::new(stale_leader)))
+                .await;
+
+        // Probe fails -> ready=false is written to the outbox.
+        repo.status_ports()
+            .set_probe_readiness_for_uid(
+                "default",
+                "ryow-unready",
+                "uid-ryow-unready",
+                "app",
+                false,
+                None,
+            )
+            .await
+            .expect("probe failure write");
+
+        let read = repo
+            .read_pod_with_own_writes("default", "ryow-unready", "uid-ryow-unready")
+            .await
+            .expect("reconcile read")
+            .expect("pod present");
+        assert_eq!(
+            read.data
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "a genuine probe failure must still publish ready=false"
+        );
+    }
+
+    #[tokio::test]
     async fn outbox_status_reads_current_pod_through_leader_api() {
         let pod = klights_cluster_core::Resource {
             id: 1,

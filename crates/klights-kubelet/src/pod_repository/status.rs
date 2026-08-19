@@ -2120,9 +2120,13 @@ fn can_publish_probe_ready(status: &Value, container_name: &str) -> bool {
 
     // The stored container status can have started=false with state=running
     // when the container-state write lags behind the container-start write
-    // (the 200ms RTT race under the netem harness). A running container is
-    // by definition started, so check the state first: if state=running,
-    // always allow the probe result regardless of the started flag.
+    // (the 200ms RTT race under the netem harness). Readiness probes are
+    // already gated on startup-probe completion by the probe scheduler
+    // (probe_manager/scheduler.rs: readiness/startup probes are not run until
+    // the startup probe gate completes), so here a running container with
+    // state=running may publish a probe result even when the started flag has
+    // not yet caught up. Check the state first: if state=running, always allow
+    // the probe result regardless of the started flag.
     if container_status.pointer("/state/waiting").is_some()
         || container_status.pointer("/state/terminated").is_some()
     {
@@ -2555,7 +2559,9 @@ mod probe_publish_tests {
         // The stored status can have started=false with state=running when the
         // container-state write lags behind the container-start write (200ms
         // RTT race under the netem harness). The probe result must still be
-        // published — a running container is by definition started.
+        // published — the readiness probe is already gated on startup-probe
+        // completion by the probe scheduler, so state=running is sufficient
+        // even when the started flag has not caught up.
         let status = json!({
             "phase": "Running",
             "containerStatuses": [{
@@ -2568,6 +2574,27 @@ mod probe_publish_tests {
         assert!(
             can_publish_probe_ready(&status, "sample-webhook"),
             "a running container must allow probe-ready even if started=false"
+        );
+    }
+
+    #[test]
+    fn can_publish_probe_ready_when_startup_probe_is_pending() {
+        // A container with a pending startupProbe is gated by the probe
+        // scheduler before the readiness probe is ever run; the publish gate
+        // must still refuse ready while the container is in waiting (e.g.
+        // ContainerCreating) or explicitly started=false with no running state.
+        let status = json!({
+            "phase": "Running",
+            "containerStatuses": [{
+                "name": "startup-gated",
+                "started": false,
+                "ready": false,
+                "state": {"waiting": {"reason": "ContainerCreating"}}
+            }]
+        });
+        assert!(
+            !can_publish_probe_ready(&status, "startup-gated"),
+            "a container with a pending startup probe must not publish ready"
         );
     }
 }

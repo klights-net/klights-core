@@ -120,6 +120,22 @@ impl PodStatusTestPorts {
             .await
     }
 
+    /// Read this Pod with the kubelet's own pending outbox writes applied.
+    ///
+    /// Exposes the reconcile-path read (`LeaderFresh` + node-local checkpoint
+    /// overlay) so tests can assert read-your-own-writes freshness without
+    /// going through the full runtime service.
+    pub async fn read_pod_with_own_writes(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.writer
+            .read_pod_with_own_writes(namespace, name, uid)
+            .await
+    }
+
     pub async fn set_deadline_exceeded_for_uid(
         &self,
         namespace: &str,

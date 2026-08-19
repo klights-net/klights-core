@@ -128,6 +128,20 @@ pub struct GenericStatusMergePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusMergeProfileKind {
+    /// Pod status merge. Field-ownership policy lives in
+    /// `klights_types::pod_status_merge::PodStatusOwner::rebuilds_status_field`:
+    /// each writer declares which status fields it regenerates from scratch on
+    /// every write (omission means genuinely empty) vs which must be preserved
+    /// from the live status when omitted. `KubeletRuntime` rebuilds
+    /// `phase`/`conditions`/`containerStatuses`; `ApiStatusSubresource` is
+    /// authoritative for the whole document (an API `/status` PUT replaces);
+    /// `Scheduler` rebuilds `phase`/`conditions`; `ReplicatedApply` rebuilds
+    /// nothing. Empty-string/empty-array network values from kubelet writers
+    /// are treated as omission for mixed-version compatibility. `conditions`
+    /// are additionally owned by `apply_conditions` (typed by condition
+    /// `type`), and terminal/confirmed runtime container state is preserved
+    /// for `KubeletRuntime`. See the matrix test in
+    /// `pod_status_merge.rs::pod_status_field_ownership_matrix`.
     PodTyped,
     NodeTyped,
     Generic(GenericStatusMergePolicy),
@@ -1127,6 +1141,54 @@ mod tests {
             incoming.pointer("/conditions/0/status"),
             Some(&json!("True")),
             "API /status clients must remain authoritative for non-scheduler Pod conditions"
+        );
+    }
+
+    // T4 red test 5: a stale kubelet-origin status apply that omits startTime
+    // and podIP must preserve both from the live row.
+    #[test]
+    fn stale_kubelet_origin_status_apply_preserves_unmentioned_fields() {
+        let live = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "startTime": "2026-07-01T00:00:00Z",
+                "containerStatuses": [{"name": "app", "ready": true}]
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "containerStatuses": [{"name": "app", "ready": true}]
+        });
+
+        // Stale apply: expected_rv < current_rv, kubelet origin (outbox).
+        let freshness = apply_status_merge(
+            "v1",
+            "Pod",
+            &live,
+            &mut incoming,
+            Some(5), // expected_rv
+            10,      // current_rv
+            true,    // kubelet_origin
+        );
+        assert_eq!(freshness, StatusApplyFreshness::Stale);
+        assert_eq!(
+            incoming.get("podIP"),
+            Some(&json!("10.50.1.20")),
+            "stale kubelet status apply must preserve live podIP: {incoming:?}"
+        );
+        assert_eq!(
+            incoming.get("startTime"),
+            Some(&json!("2026-07-01T00:00:00Z")),
+            "stale kubelet status apply must preserve live startTime: {incoming:?}"
+        );
+        assert_eq!(
+            incoming.get("containerStatuses"),
+            Some(&json!([{"name": "app", "ready": true}])),
+            "KubeletRuntime rebuilds containerStatuses; the incoming write wins: {incoming:?}"
         );
     }
 

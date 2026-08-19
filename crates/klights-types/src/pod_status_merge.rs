@@ -1150,4 +1150,432 @@ mod ip_preservation_tests {
             "empty hostIPs from KubeletRuntime must be treated as omission; live hostIPs preserved: {incoming:?}"
         );
     }
+
+    // T4 red test 1: declared field-ownership matrix. Every owner x field x
+    // incoming-shape x live-shape combination is exercised as one table so the
+    // Pod merge profile's `rebuilds_status_field` policy is pinned exactly as
+    // declared, including which fields a writer omission clears vs preserves.
+    #[test]
+    fn pod_status_field_ownership_matrix() {
+        use PodStatusOwner::*;
+
+        // Each case: (owner, field, incoming shape, live value, expected).
+        // `expected` is Some(value) when the merged status must carry the field
+        // with that value, None when it must be absent.
+        #[derive(Clone, Debug)]
+        enum IncomingShape {
+            Absent,
+            PresentDifferent(serde_json::Value),
+            PresentEmpty,
+        }
+
+        let live_present = json!({
+            "podIP": "10.50.1.20",
+            "podIPs": [{"ip": "10.50.1.20"}],
+            "hostIP": "10.99.0.14",
+            "hostIPs": [{"ip": "10.99.0.14"}],
+            "startTime": "2026-01-01T00:00:00Z",
+            "qosClass": "Burstable",
+            "message": "live message",
+            "reason": "live reason",
+            "resize": "InPlaceResize",
+            "initContainerStatuses": [{"name": "init", "ready": true}],
+            "containerStatuses": [{"name": "app", "ready": true, "restartCount": 0}]
+        });
+        let live_absent = json!({});
+
+        let cases: Vec<(
+            PodStatusOwner,
+            &str,
+            IncomingShape,
+            &serde_json::Value,
+            Option<serde_json::Value>,
+        )> = vec![
+            // KubeletRuntime: rebuilds phase/conditions/containerStatuses only.
+            // Every other field (network, startTime, qosClass, resize, ...) is
+            // preserved when omitted and empty-values are normalized to omission.
+            (
+                KubeletRuntime,
+                "podIP",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("10.50.1.20")),
+            ),
+            (
+                KubeletRuntime,
+                "podIP",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!("10.50.1.20")),
+            ),
+            (
+                KubeletRuntime,
+                "podIP",
+                IncomingShape::PresentDifferent(json!("10.50.1.99")),
+                &live_present,
+                Some(json!("10.50.1.99")),
+            ),
+            (
+                KubeletRuntime,
+                "podIPs",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!([{"ip": "10.50.1.20"}])),
+            ),
+            (
+                KubeletRuntime,
+                "hostIP",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!("10.99.0.14")),
+            ),
+            (
+                KubeletRuntime,
+                "hostIPs",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!([{"ip": "10.99.0.14"}])),
+            ),
+            (
+                KubeletRuntime,
+                "startTime",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("2026-01-01T00:00:00Z")),
+            ),
+            (
+                KubeletRuntime,
+                "startTime",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!("2026-01-01T00:00:00Z")),
+            ),
+            (
+                KubeletRuntime,
+                "qosClass",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("Burstable")),
+            ),
+            (
+                KubeletRuntime,
+                "resize",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("InPlaceResize")),
+            ),
+            (
+                KubeletRuntime,
+                "message",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("live message")),
+            ),
+            (
+                KubeletRuntime,
+                "reason",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("live reason")),
+            ),
+            (
+                KubeletRuntime,
+                "initContainerStatuses",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!([{"name": "init", "ready": true}])),
+            ),
+            (
+                KubeletRuntime,
+                "containerStatuses",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            (
+                KubeletRuntime,
+                "phase",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            // ReplicatedApply: rebuilds nothing; every omitted field preserved,
+            // empty-values normalized for network keys.
+            (
+                ReplicatedApply,
+                "podIP",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("10.50.1.20")),
+            ),
+            (
+                ReplicatedApply,
+                "podIP",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!("10.50.1.20")),
+            ),
+            (
+                ReplicatedApply,
+                "startTime",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("2026-01-01T00:00:00Z")),
+            ),
+            (
+                ReplicatedApply,
+                "containerStatuses",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!([{"name": "app", "ready": true, "restartCount": 0}])),
+            ),
+            (
+                ReplicatedApply,
+                "podIP",
+                IncomingShape::Absent,
+                &live_absent,
+                None,
+            ),
+            // Scheduler: rebuilds phase/conditions only, no empty normalization.
+            // Omitted non-rebuilt fields are preserved.
+            (
+                Scheduler,
+                "podIP",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("10.50.1.20")),
+            ),
+            (
+                Scheduler,
+                "startTime",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("2026-01-01T00:00:00Z")),
+            ),
+            (
+                Scheduler,
+                "containerStatuses",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!([{"name": "app", "ready": true, "restartCount": 0}])),
+            ),
+            (
+                Scheduler,
+                "qosClass",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("Burstable")),
+            ),
+            (
+                Scheduler,
+                "resize",
+                IncomingShape::Absent,
+                &live_present,
+                Some(json!("InPlaceResize")),
+            ),
+            // ApiStatusSubresource: authoritative PUT. Absent means clear.
+            (
+                ApiStatusSubresource,
+                "podIP",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            (
+                ApiStatusSubresource,
+                "podIP",
+                IncomingShape::PresentDifferent(json!("10.50.1.99")),
+                &live_present,
+                Some(json!("10.50.1.99")),
+            ),
+            (
+                ApiStatusSubresource,
+                "podIP",
+                IncomingShape::PresentEmpty,
+                &live_present,
+                Some(json!("")),
+            ),
+            (
+                ApiStatusSubresource,
+                "startTime",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            (
+                ApiStatusSubresource,
+                "containerStatuses",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            (
+                ApiStatusSubresource,
+                "qosClass",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            (
+                ApiStatusSubresource,
+                "resize",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+            (
+                ApiStatusSubresource,
+                "initContainerStatuses",
+                IncomingShape::Absent,
+                &live_present,
+                None,
+            ),
+        ];
+
+        for (owner, field, shape, live, expected) in cases {
+            let current = json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "status": live.clone(),
+            });
+            let mut incoming = json!({});
+            match shape {
+                IncomingShape::Absent => {}
+                IncomingShape::PresentDifferent(ref value) => {
+                    incoming[field] = value.clone();
+                }
+                IncomingShape::PresentEmpty => {
+                    // Empty string for scalars, empty array for list fields.
+                    if matches!(field, "podIPs" | "hostIPs" | "containerStatuses") {
+                        incoming[field] = json!([]);
+                    } else {
+                        incoming[field] = json!("");
+                    }
+                }
+            }
+            merge_pod_status_for_update("v1", "Pod", &current, &mut incoming, owner);
+            let label = format!("owner={owner:?} field={field} incoming={shape:?} live={live}");
+            match &expected {
+                Some(value) => {
+                    assert_eq!(
+                        incoming.get(field),
+                        Some(value),
+                        "matrix case failed: {label}; merged={incoming:?}"
+                    );
+                }
+                None => {
+                    assert!(
+                        !incoming.as_object().unwrap().contains_key(field),
+                        "matrix case failed: field should be absent: {label}; merged={incoming:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // T4 red test 2: KubeletRuntime writing an empty containerStatuses for a
+    // Pod whose sandbox is gone must NOT be back-filled from live — proves
+    // `rebuilds_status_field` is honored for the rebuilt field.
+    #[test]
+    fn kubelet_runtime_empty_container_statuses_is_not_backfilled() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "app",
+                    "ready": true,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}}
+                }]
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "containerStatuses": []
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert_eq!(
+            incoming["containerStatuses"],
+            json!([]),
+            "KubeletRuntime rebuilds containerStatuses; an empty write is genuinely empty: {incoming:?}"
+        );
+    }
+
+    // T4 red test 3: ApiStatusSubresource PUT with only phase clears every
+    // other live status field.
+    #[test]
+    fn api_status_subresource_put_clears_unmentioned_fields() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "podIP": "10.50.1.20",
+                "startTime": "2026-01-01T00:00:00Z",
+                "qosClass": "Burstable",
+                "containerStatuses": [{"name": "app", "ready": true}]
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running"
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ApiStatusSubresource,
+        );
+        let obj = incoming.as_object().unwrap();
+        assert!(
+            !obj.contains_key("podIP")
+                && !obj.contains_key("startTime")
+                && !obj.contains_key("qosClass")
+                && !obj.contains_key("containerStatuses"),
+            "an authoritative /status PUT that omits fields must clear them: {incoming:?}"
+        );
+        assert_eq!(incoming["phase"], "Running");
+    }
+
+    // T4 red test 4: ReplicatedApply with a partial status preserves everything
+    // it does not mention.
+    #[test]
+    fn replicated_apply_partial_status_preserves_unmentioned_fields() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "podIP": "10.50.1.20",
+                "startTime": "2026-01-01T00:00:00Z",
+                "qosClass": "Burstable",
+                "message": "some message",
+                "reason": "some reason"
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "podIP": "10.50.1.20"
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ReplicatedApply,
+        );
+        assert_eq!(incoming["startTime"], "2026-01-01T00:00:00Z");
+        assert_eq!(incoming["qosClass"], "Burstable");
+        assert_eq!(incoming["message"], "some message");
+        assert_eq!(incoming["reason"], "some reason");
+        assert_eq!(incoming["phase"], "Running");
+    }
 }
