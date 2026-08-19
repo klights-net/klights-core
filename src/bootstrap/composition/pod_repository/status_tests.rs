@@ -249,7 +249,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(updated.data["status"]["podIP"], json!(""));
+        assert!(
+            updated.data["status"]
+                .get("podIP")
+                .is_none_or(|v| v.is_null()),
+            "Pending Pods without an allocated podIP must not expose a podIP key",
+        );
         assert!(
             updated.data["status"].get("podIPs").is_none(),
             "Pending Pods without an allocated podIP must not expose an empty podIPs entry"

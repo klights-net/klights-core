@@ -75,6 +75,22 @@ impl PodStatusOwner {
     fn preserves_terminal_runtime_state(self) -> bool {
         matches!(self, PodStatusOwner::KubeletRuntime)
     }
+
+    /// Whether this writer rebuilds Pod status from its own observation of the
+    /// runtime and therefore must have live network fields back-filled when it
+    /// omits them. A writer that is authoritative over the whole `.status`
+    /// document (an API `/status` PUT) is excluded: omission there means the
+    /// client cleared the field, which is the Kubernetes replace semantic.
+    ///
+    /// `Scheduler` is also excluded: `preempted_status` clones the live
+    /// status before adding `DisruptionTarget`, so the IP fields are already
+    /// present and the back-fill is a no-op there.
+    fn preserves_omitted_network_status(self) -> bool {
+        matches!(
+            self,
+            PodStatusOwner::KubeletRuntime | PodStatusOwner::ReplicatedApply
+        )
+    }
 }
 
 /// Narrow, per-owner view of the status fields a writer is contributing.
@@ -147,21 +163,23 @@ pub fn merge_pod_status_for_update(
     if owner.preserves_terminal_runtime_state() {
         preserve_terminal_or_confirmed_runtime_state(current, incoming_status);
     }
-    // The pod IPs are set once at sandbox creation and are immutable for the
-    // lifetime of the Pod. A kubelet status write that omits them (e.g. a
-    // runtime-reconcile whose local row read raced ahead of its own
-    // (Pending, podIP=X) write replicating back from the leader) must never
-    // erase them from the live row. Preserve the live IP fields whenever the
-    // incoming status does not carry them.
-    preserve_omitted_live_ip_fields(current, incoming_status);
+    if owner.preserves_omitted_network_status() {
+        // A writer that does not own network status cannot clear it by
+        // omission; a writer that does own it clears it by writing it.
+        // Back-fill podIP/podIPs/hostIP/hostIPs from the live status
+        // whenever the incoming kubelet or replicated-apply status omits
+        // them. Also normalize empty strings and empty arrays from a
+        // mixed-version worker that still sends the old wire format
+        // (pre-`PublishedAddress`), so those treat omission the same way.
+        normalize_omitted_network_status(current, incoming_status);
+    }
 }
 
-/// Back-fill `podIP`, `podIPs`, `hostIP`, `hostIPs` from the live status when
-/// the incoming status omits them. The incoming status is the authoritative
-/// source when it carries the field (even an explicit empty value is kept as
-/// written); omission means "not owned by this write" and the live value
-/// survives.
-fn preserve_omitted_live_ip_fields(current: &Value, incoming_status: &mut Value) {
+/// Back-fill network fields from the live status when the incoming status
+/// omits them, and normalize empty strings and empty arrays from a
+/// mixed-version worker that still sends the old wire format (empty string
+/// instead of omitting the key).
+fn normalize_omitted_network_status(current: &Value, incoming_status: &mut Value) {
     let Some(incoming_obj) = incoming_status.as_object_mut() else {
         return;
     };
@@ -169,6 +187,17 @@ fn preserve_omitted_live_ip_fields(current: &Value, incoming_status: &mut Value)
         return;
     };
     for key in ["podIP", "podIPs", "hostIP", "hostIPs"] {
+        // Treat explicit empty values (empty string or empty array) from a
+        // mixed-version worker the same as omission: the old wire format
+        // cannot distinguish "unknown" from "cleared", and for a kubelet or
+        // replicated-apply writer the intent is always "not yet known".
+        let dominated = incoming_obj.get(key).is_some_and(|v| {
+            (v.is_string() && v.as_str().is_some_and(str::is_empty))
+                || (v.is_array() && v.as_array().is_some_and(Vec::is_empty))
+        });
+        if dominated {
+            incoming_obj.remove(key);
+        }
         if incoming_obj.contains_key(key) {
             continue;
         }
@@ -827,5 +856,143 @@ mod ip_preservation_tests {
             incoming["hostIPs"][0]["ip"], "10.99.0.14",
             "the live hostIPs must be preserved: {incoming}"
         );
+    }
+
+    /// P1 red test: ApiStatusSubresource is an authoritative PUT that replaces
+    /// `.status` wholesale. When the incoming status omits podIP, the live
+    /// value must be cleared (the client's omission is deliberate). The
+    /// current unconditional back-fill preserves it — this test must fail
+    /// until the back-fill is gated on the owner.
+    #[test]
+    fn api_status_subresource_clears_omitted_pod_ip() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "hostIP": "10.99.0.14",
+                "hostIPs": [{"ip": "10.99.0.14"}],
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ]
+            }
+        });
+        // An API PUT to /status that only sets phase — podIP is omitted.
+        // K8s PUT /status replaces .status; omission means clear.
+        let mut incoming = json!({
+            "phase": "Running",
+            "conditions": [
+                {"type": "PodScheduled", "status": "True"},
+                {"type": "Ready", "status": "True"}
+            ]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ApiStatusSubresource,
+        );
+        assert!(
+            !incoming.as_object().unwrap().contains_key("podIP"),
+            "an API /status PUT that omits podIP must clear it, not preserve the live value: {incoming}"
+        );
+    }
+
+    /// P1 red test: ApiStatusSubresource that carries podIP must set it.
+    #[test]
+    fn api_status_subresource_sets_pod_ip_when_present() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Pending",
+                "conditions": [{"type": "Initialized", "status": "True"}]
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "podIP": "10.50.1.20",
+            "podIPs": [{"ip": "10.50.1.20"}],
+            "conditions": [
+                {"type": "Initialized", "status": "True"},
+                {"type": "Ready", "status": "True"}
+            ]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ApiStatusSubresource,
+        );
+        assert_eq!(incoming["podIP"], "10.50.1.20");
+    }
+
+    /// P1 red test: ReplicatedApply preserves omitted podIP (same as
+    /// KubeletRuntime — the replicated apply replays a kubelet snapshot).
+    #[test]
+    fn replicated_apply_preserves_live_pod_ip_when_incoming_omits_it() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "conditions": []
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "containerStatuses": []
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ReplicatedApply,
+        );
+        assert_eq!(incoming["podIP"], "10.50.1.20");
+    }
+
+    /// P1 red test: Scheduler writing a preemption status built from the live
+    /// status keeps the IPs — Scheduler is excluded from the back-fill but
+    /// its preemption payload already carries the IPs from the live read.
+    #[test]
+    fn scheduler_keeps_live_pod_ip_when_present_in_incoming() {
+        let current = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "podIP": "10.50.1.20",
+                "podIPs": [{"ip": "10.50.1.20"}],
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        // Scheduler builds the preemption status from the live read, so the
+        // IPs are already present — the back-fill should not clobber them.
+        let mut incoming = json!({
+            "phase": "Running",
+            "podIP": "10.50.1.20",
+            "podIPs": [{"ip": "10.50.1.20"}],
+            "conditions": [
+                {"type": "Ready", "status": "True"},
+                {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+            ]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::Scheduler,
+        );
+        assert_eq!(incoming["podIP"], "10.50.1.20");
     }
 }
