@@ -1650,8 +1650,22 @@ impl PodLifecycleActor {
                 // collapse to Noop), so acting on it is always safe.
                 let terminating_bypasses_stale_rv =
                     (is_terminating || is_node_lost_terminal) && self.active_uid_is(&key);
+                // An ephemeral-container addition is also a real spec change
+                // that must not be dropped as a stale resourceVersion: the
+                // worker status echoes that advanced the actor's last-seen RV
+                // can collide with the real RV at which the leader added
+                // spec.ephemeralContainers, and if the watch echo is dropped
+                // the ReconcileEphemeral that creates the container never
+                // runs, leaving the ephemeral container perpetually Created.
+                // The ephemeral reconcile is idempotent (it skips already-
+                // running container names), so acting on an echo that only
+                // touches status fields is safe.
+                let ephemeral_added_bypasses_stale_rv = self.active_uid_is(&key)
+                    && pod_has_ephemeral_containers(pod)
+                    && !self.state.has_pending_ephemeral_reconcile();
                 if self.state.is_stale_resource_version(resource_version)
                     && !terminating_bypasses_stale_rv
+                    && !ephemeral_added_bypasses_stale_rv
                     && !stale_startup_finalization_retry
                 {
                     return PodAction::Noop;

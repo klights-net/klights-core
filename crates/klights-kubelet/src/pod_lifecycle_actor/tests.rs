@@ -3910,6 +3910,80 @@ fn terminating_watch_with_stale_rv_after_status_echo_inflation_still_stops() {
 }
 
 #[test]
+fn ephemeral_watch_with_stale_rv_after_status_echo_inflation_still_reconciles() {
+    use super::message::PodLifecycleWorkKind;
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    // Regression for the run-8 ephemeral-container conformance failure:
+    // worker status echoes carry a synthetic resourceVersion that can equal
+    // the real RV at which the leader appended spec.ephemeralContainers. The
+    // watch echo introducing the ephemeral container then looked stale and
+    // was dropped, so ReconcileEphemeral never ran and the container stayed
+    // Created until the test timed out. A pod that carries ephemeral
+    // containers with no pending ephemeral reconcile must never be dropped
+    // as stale.
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+
+    // Bring the Pod to Running + finalized with a sandbox.
+    let start = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: test_pod("default", "pod-a", "uid-a"),
+    });
+    let start_op = start.operation_id().expect("start op");
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: start_op,
+        kind: PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sandbox-a".to_string()),
+    });
+    let finalize_op = finalize.operation_id().expect("finalize op");
+    // FinalizeStartup completion drains the deferred runtime reconcile from
+    // StartPod and dispatches a ReconcileRuntime; capture and complete it so
+    // the actor is idle, matching the production sequence where the
+    // ephemeral watch arrives with no in-flight work.
+    let runtime_after_finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: finalize_op,
+        kind: PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: Some("sandbox-a".to_string()),
+    });
+    let runtime_op = runtime_after_finalize.operation_id().expect("runtime reconcile op");
+    let _ = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: runtime_op,
+        kind: PodLifecycleWorkKind::ReconcileRuntime,
+        sandbox_id: None,
+    });
+
+    // A worker status echo inflates the actor's last-seen RV to 100.
+    let _ = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(100),
+        pod: running_test_pod("default", "pod-a", "uid-a"),
+    });
+
+    // The leader appended spec.ephemeralContainers at the real RV (50),
+    // below/equal to the inflated synthetic RV. This watch echo must NOT be
+    // dropped as stale; it must dispatch ReconcileEphemeral.
+    let mut pod = running_test_pod("default", "pod-a", "uid-a");
+    pod["spec"]["ephemeralContainers"] = serde_json::json!([
+        {"name": "debugger", "image": "busybox", "command": ["/bin/sh"]}
+    ]);
+    let action = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(50),
+        pod,
+    });
+
+    assert!(
+        matches!(action, PodAction::ReconcileEphemeral { key: ref k, .. } if *k == key),
+        "ephemeral watch with stale (synthetic-echo-inflated) RV must still dispatch ReconcileEphemeral, got {action:?}"
+    );
+}
+
+#[test]
 fn terminating_watch_added_from_reconnect_snapshot_stops_instead_of_starting() {
     use crate::pod_lifecycle_core::action::PodAction;
 

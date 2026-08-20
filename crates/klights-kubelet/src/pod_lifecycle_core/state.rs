@@ -494,6 +494,14 @@ impl PodLifecycleState {
         self.runtime_reconcile_observations.generation()
     }
 
+    /// Whether an ephemeral reconcile is pending for this UID. When a pod
+    /// carries ephemeral containers but no pending ephemeral reconcile
+    /// exists, the actor has not yet reconciled them; the watch echo that
+    /// introduced them must not be dropped as stale.
+    pub fn has_pending_ephemeral_reconcile(&self) -> bool {
+        self.pending_ephemeral_reconcile.is_some()
+    }
+
     /// Drain all deferred runtime reconcile observations into a `RuntimeReconcileHint`.
     /// Clears both the boolean flag and the accumulated container IDs. Returns
     /// an empty hint when nothing was deferred.
