@@ -1335,14 +1335,24 @@ impl RootPodStatusWriterAdapter {
         result: klights_kubelet::pod_repository::status::PodStatusWriteResult,
         context: &'static str,
     ) -> klights_cluster_core::Resource {
-        let resource = result.resource;
+        self.finish_status_write_result(namespace, result, context)
+            .await
+            .resource
+    }
+
+    async fn finish_status_write_result(
+        &self,
+        namespace: &str,
+        result: klights_kubelet::pod_repository::status::PodStatusWriteResult,
+        context: &'static str,
+    ) -> klights_kubelet::pod_repository::status::PodStatusWriteResult {
         if result.changed {
             if result.endpoint_state_changed {
                 let _ = self
                     .mutation_reconcile
                     .reconcile_pod_mutation(
                         klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
-                            pod: resource.clone(),
+                            pod: result.resource.clone(),
                             named_hook: Some("pdb_reconcile"),
                             context,
                         },
@@ -1351,7 +1361,7 @@ impl RootPodStatusWriterAdapter {
             }
             self.spawn_post_write_maintenance(namespace).await;
         }
-        resource
+        result
     }
 }
 
@@ -1444,13 +1454,13 @@ impl klights_kubelet::pod_repository::status::PodStatusWriter for RootPodStatusW
         container_name: &str,
         ready: bool,
         expected_rp: Option<i64>,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
+    ) -> anyhow::Result<klights_kubelet::pod_repository::status::PodStatusWriteResult> {
         let result = self
             .status
             .set_probe_readiness(ns, name, container_name, ready, expected_rp)
             .await?;
         Ok(self
-            .finish_status_write(ns, result, "pod_probe_readiness")
+            .finish_status_write_result(ns, result, "pod_probe_readiness")
             .await)
     }
 
@@ -1462,13 +1472,13 @@ impl klights_kubelet::pod_repository::status::PodStatusWriter for RootPodStatusW
         container_name: &str,
         ready: bool,
         expected_rp: Option<i64>,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
+    ) -> anyhow::Result<klights_kubelet::pod_repository::status::PodStatusWriteResult> {
         let result = self
             .status
             .set_probe_readiness_for_uid(ns, name, pod_uid, container_name, ready, expected_rp)
             .await?;
         Ok(self
-            .finish_status_write(ns, result, "pod_probe_readiness_uid")
+            .finish_status_write_result(ns, result, "pod_probe_readiness_uid")
             .await)
     }
 

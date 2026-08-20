@@ -2872,9 +2872,9 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = repo
+        let result = repo
             .status_ports()
-            .set_probe_readiness(
+            .set_probe_readiness_with_result(
                 "default",
                 "p-pending-probe",
                 "c",
@@ -2883,6 +2883,12 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            !result.delivered,
+            "ignored early probe must not poison dedupe"
+        );
+        assert!(!result.changed);
+        let updated = result.resource;
 
         assert_eq!(updated.data["status"]["phase"], json!("Pending"));
         assert_eq!(
@@ -2914,11 +2920,20 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = repo
+        let result = repo
             .status_ports()
-            .set_probe_readiness("default", "p-pr", "c", true, Some(created.resource_version))
+            .set_probe_readiness_with_result(
+                "default",
+                "p-pr",
+                "c",
+                true,
+                Some(created.resource_version),
+            )
             .await
             .unwrap();
+        assert!(result.delivered);
+        assert!(result.changed);
+        let updated = result.resource;
 
         // metadata preserved (labels intact)
         assert_eq!(updated.data["metadata"]["labels"]["app"], json!("x"));
@@ -2988,17 +3003,23 @@ mod tests {
 
         let ready = repo
             .status_ports()
-            .set_probe_readiness("default", "p-ready-noop", "c", true, None)
+            .set_probe_readiness_with_result("default", "p-ready-noop", "c", true, None)
             .await
             .unwrap();
         let same_ready = repo
             .status_ports()
-            .set_probe_readiness("default", "p-ready-noop", "c", true, None)
+            .set_probe_readiness_with_result("default", "p-ready-noop", "c", true, None)
             .await
             .unwrap();
 
+        assert!(ready.delivered && ready.changed);
+        assert!(
+            same_ready.delivered,
+            "already-satisfied readiness is accepted"
+        );
+        assert!(!same_ready.changed);
         assert_eq!(
-            same_ready.resource_version, ready.resource_version,
+            same_ready.resource.resource_version, ready.resource.resource_version,
             "matching readiness probe results must not create repeated Pod watch events"
         );
     }

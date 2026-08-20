@@ -3949,7 +3949,9 @@ fn ephemeral_watch_with_stale_rv_after_status_echo_inflation_still_reconciles() 
         kind: PodLifecycleWorkKind::FinalizeStartup,
         sandbox_id: Some("sandbox-a".to_string()),
     });
-    let runtime_op = runtime_after_finalize.operation_id().expect("runtime reconcile op");
+    let runtime_op = runtime_after_finalize
+        .operation_id()
+        .expect("runtime reconcile op");
     let _ = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
         key: key.clone(),
         operation_id: runtime_op,

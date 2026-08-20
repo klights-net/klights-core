@@ -599,4 +599,165 @@ mod tests {
             "readiness probe should not send an unchanged ready=true signal"
         );
     }
+
+    #[tokio::test]
+    async fn readiness_probe_retries_after_pending_status_is_published_running() {
+        // The first successful probe observes a Pending/ContainerCreating
+        // status. The lifecycle handler deliberately ignores that readiness
+        // write until the runtime publishes Running. Once that publication is
+        // visible, the next successful probe must still enqueue the same
+        // ReadinessChanged(true) command; scheduler-side current_ready
+        // optimization must not turn the ignored first command into a
+        // permanent suppression.
+        let pending = klights_cluster_core::Resource::try_from_data(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "latency-probed",
+                "uid": "uid-latency-probed"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {
+                "phase": "Pending",
+                "podIP": "127.0.0.1",
+                "containerStatuses": [{
+                    "name": "app",
+                    "ready": false,
+                    "state": {"waiting": {"reason": "ContainerCreating"}}
+                }]
+            }
+        })))
+        .unwrap();
+        let running = klights_cluster_core::Resource::try_from_data(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "latency-probed",
+                "uid": "uid-latency-probed"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {
+                "phase": "Running",
+                "podIP": "127.0.0.1",
+                "containerStatuses": [{
+                    "name": "app",
+                    "ready": false,
+                    "state": {"running": {"startedAt": "2026-05-01T05:12:39Z"}}
+                }]
+            }
+        })))
+        .unwrap();
+
+        struct LatencyPodQuery {
+            pending: klights_cluster_core::Resource,
+            running: klights_cluster_core::Resource,
+            calls: std::sync::atomic::AtomicUsize,
+            running_published: Arc<tokio::sync::Notify>,
+        }
+
+        impl PodQuery for LatencyPodQuery {
+            fn get_pod(
+                &self,
+                _request: PodGetRequest,
+            ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+                Box::pin(async move {
+                    let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if call == 0 {
+                        return Ok(Some(self.pending.clone()));
+                    }
+                    self.running_published.notified().await;
+                    Ok(Some(self.running.clone()))
+                })
+            }
+
+            fn list_pods(
+                &self,
+                _request: PodListRequest,
+            ) -> PodRepositoryFuture<'_, PodListResult> {
+                Box::pin(async { Err(PodRepositoryError::unavailable("unused list operation")) })
+            }
+
+            fn list_pods_by_owner_uid(
+                &self,
+                _request: PodOwnerListRequest,
+            ) -> PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+                Box::pin(async { Err(PodRepositoryError::unavailable("unused owner query")) })
+            }
+        }
+
+        let pod_reader = Arc::new(LatencyPodQuery {
+            pending,
+            running,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            running_published: Arc::new(tokio::sync::Notify::new()),
+        });
+        let published = pod_reader.running_published.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let startup_completed = Arc::new(RwLock::new(HashSet::new()));
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let handle = spawn_probe_task_with_params(
+            ProbeTaskRuntime {
+                task_supervisor: supervisor,
+                pod_reader,
+                cri: None,
+                startup_completed,
+                lifecycle_tx: tx,
+                wall_clock: Arc::new(crate::runtime_clock::SystemRuntimeClock),
+            },
+            ProbeTaskSpec {
+                pod_key: "default/latency-probed".to_string(),
+                pod_uid: "uid-latency-probed".to_string(),
+                container_name: "app".to_string(),
+                container_id: "container-latency-probed".to_string(),
+                pod_ip: "127.0.0.1".to_string(),
+                probe: Probe::Tcp(TcpProbe { port }),
+                timing: ProbeTaskTiming {
+                    initial_delay_secs: 0,
+                    interval_secs: 0,
+                    timeout_secs: 1,
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                },
+                probe_type: ProbeType::Readiness,
+                has_startup_probe: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let early = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("early readiness command should arrive")
+            .expect("probe task should remain alive after early command");
+        assert!(matches!(
+            early,
+            LifecycleCommand::ReadinessChanged { ready: true, .. }
+        ));
+
+        // Model the delayed runtime status publication after the lifecycle
+        // handler ignored the early command while the Pod was Pending.
+        published.notify_one();
+
+        let retry = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("readiness command must be retried after Running publication")
+            .expect("probe task should emit the retry");
+        assert!(matches!(
+            retry,
+            LifecycleCommand::ReadinessChanged { ready: true, .. }
+        ));
+
+        handle.abort();
+        accept_task.abort();
+    }
 }

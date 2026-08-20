@@ -213,6 +213,162 @@ async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
 }
 
 #[tokio::test]
+async fn readiness_lifecycle_command_retries_after_pending_status_latency() {
+    use crate::pod_repository::RuntimeReconcileStatus;
+
+    let harness = PodRuntimeHarness::new().await;
+    let namespace = "webhook-e2e";
+    let pod_name = "sample-webhook";
+    let pod_uid = "uid-sample-webhook";
+    let container_name = "sample-webhook";
+    let key = PodRuntimeKey::new(namespace, pod_name, pod_uid);
+    let pod = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": namespace,
+            "name": pod_name,
+            "uid": pod_uid,
+            "resourceVersion": "1"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "containers": [{
+                "name": container_name,
+                "image": "registry.k8s.io/e2e-test-images/agnhost:2.56",
+                "readinessProbe": {
+                    "httpGet": {"path": "/ready", "port": 8080},
+                    "periodSeconds": 1,
+                    "timeoutSeconds": 1
+                }
+            }]
+        },
+        "status": {
+            "phase": "Pending",
+            "podIP": "10.42.0.9",
+            "podIPs": [{"ip": "10.42.0.9"}],
+            "containerStatuses": [{
+                "name": container_name,
+                "ready": false,
+                "started": false,
+                "restartCount": 0,
+                "state": {"waiting": {"reason": "ContainerCreating"}}
+            }],
+            "conditions": [
+                {"type": "ContainersReady", "status": "False"},
+                {"type": "Ready", "status": "False"}
+            ]
+        }
+    });
+    harness.create_runtime_pod(pod).await;
+
+    // The probe result can arrive before the delayed runtime status write. It
+    // is correctly ignored while Pending/ContainerCreating. The emitter must
+    // leave that ignored value eligible for retry.
+    harness
+        .runtime
+        .handle_lifecycle_command(crate::lifecycle::LifecycleCommand::ReadinessChanged {
+            pod_uid: pod_uid.into(),
+            namespace: namespace.into(),
+            pod_name: pod_name.into(),
+            container_name: container_name.into(),
+            ready: true,
+        })
+        .await
+        .unwrap();
+    let early = harness.stored_pod(&key).await;
+    assert_eq!(
+        early
+            .pointer("/status/phase")
+            .and_then(|value| value.as_str()),
+        Some("Pending")
+    );
+    assert_eq!(
+        early
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    // Model the Sono e2e latency window with the app-owned timer helper: the
+    // CRI/runtime status reaches the repository only after the early probe.
+    harness
+        .supervisor
+        .sleep(
+            "readiness_probe_before_runtime_status_latency",
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+    harness
+        .repo
+        .pod_status_writer
+        .apply_runtime_reconcile_status_for_uid(
+            namespace,
+            pod_name,
+            pod_uid,
+            RuntimeReconcileStatus {
+                phase: "Running".into(),
+                container_statuses: vec![serde_json::json!({
+                    "name": container_name,
+                    "ready": false,
+                    "started": true,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-08-20T00:00:00Z"}}
+                })],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let running = harness.stored_pod(&key).await;
+    assert_eq!(
+        running
+            .pointer("/status/phase")
+            .and_then(|value| value.as_str()),
+        Some("Running")
+    );
+    assert_eq!(
+        running
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    // The next probe succeeds after the runtime status is Running. It is an
+    // identical `true` event, and must not be suppressed by the ignored early
+    // result.
+    harness
+        .supervisor
+        .sleep(
+            "runtime_status_before_readiness_retry_latency",
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+    harness
+        .runtime
+        .handle_lifecycle_command(crate::lifecycle::LifecycleCommand::ReadinessChanged {
+            pod_uid: pod_uid.into(),
+            namespace: namespace.into(),
+            pod_name: pod_name.into(),
+            container_name: container_name.into(),
+            ready: true,
+        })
+        .await
+        .unwrap();
+
+    let final_status = harness.stored_pod(&key).await;
+    assert_eq!(
+        final_status
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "readiness was lost across delayed status publication: early={early}, running={running}, final={final_status}"
+    );
+}
+
+#[tokio::test]
 async fn liveness_restart_uses_runtime_container_id_with_parity() {
     use crate::lifecycle::{LifecycleCommand, RestartReason};
     use crate::pod_repository::PodStatusUpdate;

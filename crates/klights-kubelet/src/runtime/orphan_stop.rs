@@ -39,19 +39,25 @@ impl RealPodRuntimeService {
         let emit_key = PodRuntimeKey::new(namespace, pod_name, pod_uid);
         let emitted = self
             .status_emitter
-            .emit_readiness_if_changed(&emit_key, container_name, ready, |ready| async move {
-                self.pod_status_writer
-                    .set_probe_readiness_for_uid(
-                        namespace,
-                        pod_name,
-                        pod_uid,
-                        container_name,
-                        ready,
-                        None,
-                    )
-                    .await?;
-                Ok::<(), anyhow::Error>(())
-            })
+            .emit_readiness_if_changed_with_delivery(
+                &emit_key,
+                container_name,
+                ready,
+                |ready| async move {
+                    let result = self
+                        .pod_status_writer
+                        .set_probe_readiness_for_uid(
+                            namespace,
+                            pod_name,
+                            pod_uid,
+                            container_name,
+                            ready,
+                            None,
+                        )
+                        .await?;
+                    Ok::<bool, anyhow::Error>(result.delivered)
+                },
+            )
             .await?;
         if !emitted {
             tracing::debug!(

@@ -409,8 +409,9 @@ mod tests {
 
         // Probe publishes ready=true; this enqueues an outbox row and records
         // a node-local status checkpoint with the new ready value.
-        repo.status_ports()
-            .set_probe_readiness_for_uid(
+        let result = repo
+            .status_ports()
+            .set_probe_readiness_for_uid_with_result(
                 "default",
                 "ryow-ready",
                 "uid-ryow-ready",
@@ -420,6 +421,14 @@ mod tests {
             )
             .await
             .expect("probe readiness write enqueues outbox and records checkpoint");
+        assert!(
+            !result.changed,
+            "worker outbox write is not locally committed"
+        );
+        assert!(
+            result.delivered,
+            "accepted worker outbox write must count as delivered for readiness dedupe"
+        );
 
         // The reconcile-path read must see the pending own write (ready=true)
         // even though the leader still returns ready=false.

@@ -271,12 +271,10 @@ impl PodStatusWriter for TestPodStatusWriter {
         container: &str,
         ready: bool,
         rv: Option<i64>,
-    ) -> anyhow::Result<Resource> {
-        Ok(self
-            .status
+    ) -> anyhow::Result<crate::pod_repository::status::PodStatusWriteResult> {
+        self.status
             .set_probe_readiness(ns, name, container, ready, rv)
-            .await?
-            .resource)
+            .await
     }
     async fn set_probe_readiness_for_uid(
         &self,
@@ -286,12 +284,10 @@ impl PodStatusWriter for TestPodStatusWriter {
         container: &str,
         ready: bool,
         rv: Option<i64>,
-    ) -> anyhow::Result<Resource> {
-        Ok(self
-            .status
+    ) -> anyhow::Result<crate::pod_repository::status::PodStatusWriteResult> {
+        self.status
             .set_probe_readiness_for_uid(ns, name, uid, container, ready, rv)
-            .await?
-            .resource)
+            .await
     }
     async fn set_deadline_exceeded(
         &self,

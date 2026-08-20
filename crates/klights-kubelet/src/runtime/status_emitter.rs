@@ -204,6 +204,7 @@ impl PodStatusEmitter {
     /// — which the leader would no-op anyway — never re-cross the boundary.
     /// A genuine flip always re-emits and carries its downstream side effects;
     /// a failed emit leaves the prior success intact so it retries.
+    #[cfg(test)]
     pub async fn emit_readiness_if_changed<F, Fut, E>(
         &self,
         key: &PodRuntimeKey,
@@ -214,6 +215,32 @@ impl PodStatusEmitter {
     where
         F: FnOnce(bool) -> Fut,
         Fut: Future<Output = Result<(), E>>,
+    {
+        self.emit_readiness_if_changed_with_delivery(
+            key,
+            container_name,
+            ready,
+            move |ready| async move { emit(ready).await.map(|()| true) },
+        )
+        .await
+    }
+
+    /// Dedupe a readiness emission whose side effect can distinguish an
+    /// accepted write from an intentional no-op. `Ok(false)` clears the
+    /// in-flight permit without recording the readiness value, so a probe
+    /// result ignored while the container is still starting can be retried
+    /// after the runtime status reaches Running. An accepted worker-outbox
+    /// write returns `Ok(true)` even when it has not changed the local row.
+    pub async fn emit_readiness_if_changed_with_delivery<F, Fut, E>(
+        &self,
+        key: &PodRuntimeKey,
+        container_name: &str,
+        ready: bool,
+        emit: F,
+    ) -> Result<bool, E>
+    where
+        F: FnOnce(bool) -> Fut,
+        Fut: Future<Output = Result<bool, E>>,
     {
         let permit = {
             let mut cache = self
@@ -228,12 +255,19 @@ impl PodStatusEmitter {
 
         let result = emit(ready).await;
         match result {
-            Ok(()) => {
+            Ok(true) => {
                 self.cache
                     .lock()
                     .expect("pod status emission cache mutex poisoned")
                     .record_readiness_success(&permit);
                 Ok(true)
+            }
+            Ok(false) => {
+                self.cache
+                    .lock()
+                    .expect("pod status emission cache mutex poisoned")
+                    .record_readiness_failure(&permit);
+                Ok(false)
             }
             Err(err) => {
                 self.cache
@@ -476,6 +510,46 @@ mod tests {
                 .await
                 .expect("retry succeeds"),
             "a failed readiness emit must leave the same readiness eligible for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn undelivered_readiness_does_not_poison_cache_for_retry() {
+        let emitter = PodStatusEmitter::default();
+        let key = PodRuntimeKey::new("default", "web", "uid-1");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first_calls = calls.clone();
+        assert!(
+            !emitter
+                .emit_readiness_if_changed_with_delivery(&key, "app", true, move |_| {
+                    let first_calls = first_calls.clone();
+                    async move {
+                        first_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<bool, &'static str>(false)
+                    }
+                })
+                .await
+                .expect("ignored readiness result must not fail the emitter")
+        );
+
+        let second_calls = calls.clone();
+        assert!(
+            emitter
+                .emit_readiness_if_changed_with_delivery(&key, "app", true, move |_| {
+                    let second_calls = second_calls.clone();
+                    async move {
+                        second_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<bool, &'static str>(true)
+                    }
+                })
+                .await
+                .expect("retry after an ignored readiness result must succeed")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "an ignored readiness result must leave the same value eligible for retry"
         );
     }
 

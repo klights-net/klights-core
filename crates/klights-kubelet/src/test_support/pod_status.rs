@@ -92,6 +92,20 @@ impl PodStatusTestPorts {
         self.writer
             .set_probe_readiness(namespace, name, container_name, ready, expected_rv)
             .await
+            .map(|result| result.resource)
+    }
+
+    pub async fn set_probe_readiness_with_result(
+        &self,
+        namespace: &str,
+        name: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::pod_repository::status::PodStatusWriteResult> {
+        self.writer
+            .set_probe_readiness(namespace, name, container_name, ready, expected_rv)
+            .await
     }
 
     pub async fn set_probe_readiness_for_uid(
@@ -103,6 +117,21 @@ impl PodStatusTestPorts {
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
+        self.writer
+            .set_probe_readiness_for_uid(namespace, name, uid, container_name, ready, expected_rv)
+            .await
+            .map(|result| result.resource)
+    }
+
+    pub async fn set_probe_readiness_for_uid_with_result(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::pod_repository::status::PodStatusWriteResult> {
         self.writer
             .set_probe_readiness_for_uid(namespace, name, uid, container_name, ready, expected_rv)
             .await

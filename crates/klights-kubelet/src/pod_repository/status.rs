@@ -181,14 +181,35 @@ pub struct PodStatusWriteResult {
     pub resource: Resource,
     pub changed: bool,
     pub endpoint_state_changed: bool,
+    /// Whether the status operation was accepted by local persistence or the
+    /// worker outbox. An accepted outbox operation can have `changed == false`
+    /// because it has not committed locally yet; an ignored no-op is the only
+    /// successful result with `delivered == false`.
+    pub delivered: bool,
 }
 
 impl PodStatusWriteResult {
-    fn unchanged(resource: Resource) -> Self {
+    /// The requested readiness was intentionally ignored because the
+    /// container was not yet in a publishable running state. This must not
+    /// satisfy the runtime readiness emitter's deduplication cache.
+    fn ignored(resource: Resource) -> Self {
         Self {
             resource,
             changed: false,
             endpoint_state_changed: false,
+            delivered: false,
+        }
+    }
+
+    /// The requested status already matched the persisted status. The
+    /// operation was accepted, so it is safe for readiness deduplication to
+    /// remember the value even though no watch event was written.
+    fn already_satisfied(resource: Resource) -> Self {
+        Self {
+            resource,
+            changed: false,
+            endpoint_state_changed: false,
+            delivered: true,
         }
     }
 }
@@ -247,7 +268,7 @@ pub trait PodStatusWriter: Send + Sync {
         container_name: &str,
         ready: bool,
         expected_rv: Option<i64>,
-    ) -> Result<Resource>;
+    ) -> Result<PodStatusWriteResult>;
 
     async fn set_probe_readiness_for_uid(
         &self,
@@ -257,7 +278,7 @@ pub trait PodStatusWriter: Send + Sync {
         container_name: &str,
         ready: bool,
         expected_rv: Option<i64>,
-    ) -> Result<Resource>;
+    ) -> Result<PodStatusWriteResult>;
 
     async fn set_deadline_exceeded(
         &self,
@@ -841,6 +862,7 @@ impl PodStatusService {
                     resource,
                     changed: false,
                     endpoint_state_changed: false,
+                    delivered: true,
                 });
             }
 
@@ -877,6 +899,7 @@ impl PodStatusService {
                         resource: updated,
                         changed,
                         endpoint_state_changed,
+                        delivered: true,
                     });
                 }
                 Err(e)
@@ -1211,6 +1234,7 @@ impl PodStatusService {
                     resource,
                     changed: false,
                     endpoint_state_changed: false,
+                    delivered: true,
                 });
             }
 
@@ -1249,6 +1273,7 @@ impl PodStatusService {
                         resource: updated,
                         changed,
                         endpoint_state_changed,
+                        delivered: true,
                     });
                 }
                 Err(e)
@@ -1466,6 +1491,7 @@ impl PodStatusService {
                 resource,
                 changed: false,
                 endpoint_state_changed: false,
+                delivered: true,
             });
         }
 
@@ -1492,6 +1518,7 @@ impl PodStatusService {
             resource: updated,
             changed,
             endpoint_state_changed,
+            delivered: true,
         })
     }
 
@@ -1580,7 +1607,7 @@ impl PodStatusService {
                     pod_resource.resource_version,
                     "successful readiness probe ignored until container is running",
                 );
-                return Ok(PodStatusWriteResult::unchanged(pod_resource));
+                return Ok(PodStatusWriteResult::ignored(pod_resource));
             }
             let existing_status = status.clone();
 
@@ -1662,7 +1689,7 @@ impl PodStatusService {
                     pod_resource.resource_version,
                     "computed pod status unchanged",
                 );
-                return Ok(PodStatusWriteResult::unchanged(pod_resource));
+                return Ok(PodStatusWriteResult::already_satisfied(pod_resource));
             }
 
             if let Some(resource) = self
@@ -1678,6 +1705,7 @@ impl PodStatusService {
                     resource,
                     changed: false,
                     endpoint_state_changed: false,
+                    delivered: true,
                 });
             }
 
@@ -1716,6 +1744,7 @@ impl PodStatusService {
                         resource: updated,
                         changed,
                         endpoint_state_changed,
+                        delivered: true,
                     });
                 }
                 Err(e)
@@ -1851,6 +1880,7 @@ impl PodStatusService {
                 resource,
                 changed: false,
                 endpoint_state_changed: false,
+                delivered: true,
             });
         }
 
@@ -1881,6 +1911,7 @@ impl PodStatusService {
             resource: updated,
             changed,
             endpoint_state_changed,
+            delivered: true,
         })
     }
 }
