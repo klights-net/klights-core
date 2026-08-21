@@ -81,6 +81,12 @@ pub async fn kill_namespace_cgroup_processes(
             .await?;
     }
 
+    // PID 0 is how cgroup.procs represents processes outside the caller's PID
+    // namespace. kill(0, signal) targets the caller's entire process group, so
+    // it must never cross this process-control boundary. Negative values are
+    // process-group selectors as well and are equally invalid here.
+    pids.retain(|pid| *pid > 0);
+
     if pids.is_empty() {
         return Ok(0);
     }
@@ -189,7 +195,9 @@ fn collect_cgroup_pids_inner(path: &Path, pids: &mut BTreeSet<libc::pid_t>) -> R
                 let pid = trimmed
                     .parse::<libc::pid_t>()
                     .with_context(|| format!("invalid pid in {}", procs_path.display()))?;
-                pids.insert(pid);
+                if pid > 0 {
+                    pids.insert(pid);
+                }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -329,6 +337,16 @@ mod tests {
         let pids = collect_cgroup_pids(&pod_dir).unwrap();
 
         assert_eq!(pids, vec![100, 101, 102, 103]);
+    }
+
+    #[test]
+    fn collect_cgroup_pids_ignores_non_positive_namespace_placeholders() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cgroup.procs"), "0\n-1\n100\n").unwrap();
+
+        let pids = collect_cgroup_pids(tmp.path()).unwrap();
+
+        assert_eq!(pids, vec![100]);
     }
 
     #[test]
