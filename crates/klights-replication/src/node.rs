@@ -267,8 +267,11 @@ impl RaftNode {
 
     /// Manual promotion entry point. Calls `Raft::initialize` with this
     /// node as the sole voter — the same call openraft uses internally
-    /// when forming a single-voter cluster on first boot. Once committed
-    /// the engine becomes Leader and `client_write` will accept proposals.
+    /// when forming a single-voter cluster on first boot. Fresh initialization
+    /// also Raft-commits a durable receiver-admission proof for the seed, so it
+    /// can later be replaced through the same guarded path as joined voters.
+    /// Once committed the engine becomes Leader and `client_write` accepts
+    /// proposals.
     ///
     /// Idempotent: returns `Ok(())` if the cluster is already
     /// initialized (matches openraft's `NotAllowed` no-op).

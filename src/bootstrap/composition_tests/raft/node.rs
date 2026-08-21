@@ -539,6 +539,43 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn fresh_seed_persists_complete_receiver_admission() {
+        let (node, backend) = fresh_node(700).await;
+        let incarnation = node.storage_incarnation().to_string();
+        node.bootstrap_single_voter("https://127.0.0.1:7700".to_string())
+            .await
+            .unwrap();
+
+        let marker = backend
+            .get_klights_meta("raft_member_admission/700")
+            .await
+            .unwrap()
+            .expect("fresh seed admission marker must be Raft committed");
+        assert!(
+            marker.contains(&format!("\"storage_incarnation\":\"{incarnation}\"")),
+            "fresh seed marker must bind the local storage incarnation: {marker}"
+        );
+        assert!(
+            !marker.contains("\"proven_log\":null"),
+            "fresh seed marker must contain a durable replication proof: {marker}"
+        );
+        let metrics = node.raft.metrics().borrow().clone();
+        let (_, member) = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .find(|(id, _)| **id == 700)
+            .expect("fresh seed must remain in membership");
+        assert_eq!(member.storage_incarnation, incarnation);
+        assert!(
+            member.admitted_log.is_some(),
+            "fresh seed membership must bind its durable receiver proof"
+        );
+
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn codec_v3_activation_is_leader_gated_idempotent_and_persisted() {
         let (node, backend) = fresh_node(701).await;
         node.bootstrap_single_voter("https://127.0.0.1:7701".to_string())

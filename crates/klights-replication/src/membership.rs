@@ -188,15 +188,97 @@ impl EmbeddedRaftMembership {
         let mut members = BTreeMap::new();
         members.insert(
             self.node_id,
-            RaftMemberNode::new(advertise_addr, self.storage_incarnation.clone(), None),
+            RaftMemberNode::new(
+                advertise_addr.clone(),
+                self.storage_incarnation.clone(),
+                None,
+            ),
         );
         match self.raft.initialize(members).await {
-            Ok(()) => Ok(()),
+            Ok(()) => self
+                .establish_fresh_seed_admission(advertise_addr)
+                .await
+                .context("establish fresh Raft seed admission"),
             Err(openraft::error::RaftError::APIError(
                 openraft::error::InitializeError::NotAllowed { .. },
             )) => Ok(()),
             Err(error) => Err(anyhow::anyhow!("Raft::initialize: {error}")),
         }
+    }
+
+    /// Bind a freshly initialized seed voter to the same durable receiver
+    /// proof required of every subsequently admitted control-plane member.
+    ///
+    /// This is deliberately invoked only after `Raft::initialize` succeeds.
+    /// A restored or legacy membership therefore cannot acquire a baseline
+    /// marker merely by restarting without `--leader`.
+    async fn establish_fresh_seed_admission(&self, advertise_addr: String) -> Result<()> {
+        let _guard = self.membership_mutex.lock().await;
+        self.raft
+            .wait(Some(CONTROLPLANE_REPLICATION_WAIT_TIMEOUT))
+            .metrics(
+                |metrics| {
+                    metrics.current_leader == Some(self.node_id)
+                        && metrics.last_applied.is_some()
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .voter_ids()
+                            .eq(std::iter::once(self.node_id))
+                },
+                "wait for fresh Raft seed leadership and initial apply",
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("wait for fresh Raft seed leadership and initial apply: {error}")
+            })?;
+        anyhow::ensure!(
+            self.read_member_admission(self.node_id).await?.is_none(),
+            "fresh Raft seed unexpectedly already has an admission marker"
+        );
+
+        let provisional = RaftMemberAdmission {
+            storage_incarnation: self.storage_incarnation.clone(),
+            addr: advertise_addr.clone(),
+            as_learner: false,
+            proven_log: None,
+        };
+        self.persist_member_admission(self.node_id, &provisional)
+            .await?;
+
+        let applied =
+            self.raft.metrics().borrow().last_applied.ok_or_else(|| {
+                anyhow::anyhow!("fresh Raft seed admission commit was not applied")
+            })?;
+        let proven = klights_leader_api::RaftStorageLogAttestation {
+            term: applied.leader_id.term,
+            leader_node_id: applied.leader_id.node_id,
+            index: applied.index,
+        };
+        let receiver = RaftMemberNode::new(
+            advertise_addr.clone(),
+            self.storage_incarnation.clone(),
+            Some(RaftMemberLogId {
+                term: proven.term,
+                leader_node_id: proven.leader_node_id,
+                index: proven.index,
+            }),
+        );
+        self.raft
+            .change_membership(
+                ChangeMembers::SetNodes(BTreeMap::from([(self.node_id, receiver)])),
+                true,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("bind fresh Raft seed receiver proof: {error}"))?;
+        self.persist_member_admission(
+            self.node_id,
+            &RaftMemberAdmission {
+                proven_log: Some(proven),
+                ..provisional
+            },
+        )
+        .await
     }
 
     pub async fn add_voter(&self, node_id: NodeId, addr: String) -> Result<()> {
