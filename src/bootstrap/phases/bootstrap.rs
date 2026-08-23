@@ -616,7 +616,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     } else {
         crate::bootstrap::composition::pod_repository::build_pod_repository_parts(
             crate::bootstrap::composition::pod_repository::PodRepositoryBuildConfig {
-                resource_query: local_resource_query.clone(),
+                resource_query: leader_resource_query.clone(),
                 ownership_reads: ownership_reads.clone(),
                 resource_reads: resource_reads.clone(),
                 namespace_content_reads: namespace_content_reads.clone(),
@@ -790,7 +790,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ..,
         ) = crate::bootstrap::composition::pod_repository::build_pod_repository_parts(
             crate::bootstrap::composition::pod_repository::PodRepositoryBuildConfig {
-                resource_query: local_resource_query.clone(),
+                resource_query: leader_resource_query.clone(),
                 ownership_reads: ownership_reads.clone(),
                 resource_reads: resource_reads.clone(),
                 namespace_content_reads: namespace_content_reads.clone(),
