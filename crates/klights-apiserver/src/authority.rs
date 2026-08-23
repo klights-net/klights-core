@@ -1,11 +1,14 @@
 //! Permanent Kubernetes API-server authority routing shell.
 //!
 //! In the klights HA model, all controlplanes bind TCP 7679 but only
-//! the current authority serves K8s API requests directly. Follower
-//! controlplanes transparently reverse-proxy K8s API requests to the
-//! current authority. The transitional Kubernetes-native handler/state
-//! remains below this Axum/Reqwest shell and sees only `LeaderAuthority`.
-//! gRPC and health endpoints always go through locally.
+//! the current authority serves ordinary K8s API requests directly. Follower
+//! controlplanes transparently reverse-proxy those requests to the current
+//! authority. Authenticated WebSocket pod streaming upgrades are terminated
+//! locally because an ordinary HTTP reverse proxy cannot relay an upgraded
+//! connection; these CONNECT-style subresources do not mutate canonical
+//! cluster state. The transitional Kubernetes-native handler/state remains
+//! below this Axum/Reqwest shell. gRPC and health endpoints always go through
+//! locally.
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -293,8 +296,9 @@ async fn leader_proxy_middleware(
         .is_some_and(|ct| ct.starts_with("application/grpc"));
     let path = request.uri().path();
     let is_health = matches!(path, "/healthz" | "/livez" | "/readyz");
+    let is_local_stream = is_local_pod_stream_upgrade(&request);
 
-    if is_grpc || is_health {
+    if is_grpc || is_health || is_local_stream {
         return next.run(request).await;
     }
 
@@ -313,6 +317,53 @@ async fn leader_proxy_middleware(
             service_unavailable("no current cluster authority; retry when a leader is available")
         }
     }
+}
+
+/// WebSocket upgrades cannot pass through `reqwest`'s ordinary body relay: a
+/// copied 101 response has no upgraded downstream connection and is rejected
+/// by client-go as a malformed handshake. Authentication and authorization run
+/// outside this authority layer, while pod exec/attach/port-forward/log streams
+/// operate on node runtime state rather than the canonical Raft write path, so
+/// an exact Kubernetes pod streaming upgrade is safely served by the receiving
+/// control plane.
+fn is_local_pod_stream_upgrade(request: &Request) -> bool {
+    if request.method() != axum::http::Method::GET
+        || !request
+            .headers()
+            .get(axum::http::header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        || !request
+            .headers()
+            .get(axum::http::header::CONNECTION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            })
+    {
+        return false;
+    }
+
+    let segments: Vec<_> = request
+        .uri()
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(
+        segments.as_slice(),
+        [
+            "api",
+            "v1",
+            "namespaces",
+            _,
+            "pods",
+            _,
+            "exec" | "attach" | "portforward" | "log"
+        ]
+    )
 }
 
 /// Place the permanent authority/proxy shell around the native handler router.
@@ -659,6 +710,94 @@ mod tests {
             String::from_utf8_lossy(&body).contains("no current cluster authority"),
             "the authority shell must return its fail-closed Kubernetes Status"
         );
+    }
+
+    #[tokio::test]
+    async fn follower_serves_exact_pod_websocket_upgrade_locally() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (_, local_rx) = tokio::sync::watch::channel(false);
+        let (_, endpoint_rx) = tokio::sync::watch::channel(Some("http://127.0.0.1:9".to_string()));
+        let app = wrap_authority_router(
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::NO_CONTENT }),
+            Some(Arc::new(HttpAuthorityRouter::new(
+                local_rx,
+                endpoint_rx,
+                None,
+            ))),
+        );
+
+        for subresource in ["exec", "attach", "portforward", "log"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(format!(
+                        "/api/v1/namespaces/default/pods/remote/{subresource}"
+                    ))
+                    .header(axum::http::header::CONNECTION, "keep-alive, Upgrade")
+                    .header(axum::http::header::UPGRADE, "websocket")
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NO_CONTENT,
+                "{subresource} WebSocket transport must not be flattened by the leader HTTP relay"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_does_not_bypass_authority_for_non_streaming_or_spoofed_paths() {
+        use axum::body::Body;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::ServiceExt;
+
+        let cases = [
+            ("POST", "/api/v1/namespaces/default/pods/remote/exec"),
+            ("GET", "/api/v1/namespaces/default/pods/remote/status"),
+            (
+                "GET",
+                "/apis/example.test/v1/namespaces/default/pods/remote/exec",
+            ),
+        ];
+        for (method, path) in cases {
+            let (_, local_rx) = tokio::sync::watch::channel(false);
+            let (_, endpoint_rx) = tokio::sync::watch::channel(None::<String>);
+            let reached = Arc::new(AtomicBool::new(false));
+            let downstream = reached.clone();
+            let app = wrap_authority_router(
+                axum::Router::new().fallback(move || {
+                    downstream.store(true, Ordering::SeqCst);
+                    async { axum::http::StatusCode::NO_CONTENT }
+                }),
+                Some(Arc::new(HttpAuthorityRouter::new(
+                    local_rx,
+                    endpoint_rx,
+                    None,
+                ))),
+            );
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(axum::http::header::CONNECTION, "Upgrade")
+                        .header(axum::http::header::UPGRADE, "websocket")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(!reached.load(Ordering::SeqCst));
+        }
     }
 
     #[test]

@@ -222,6 +222,43 @@ async fn test_remote_websocket_exec_accepts_upgrade_instead_of_bad_request() {
 }
 
 #[tokio::test]
+async fn test_remote_websocket_exec_handshake_is_accepted_by_standard_client() {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = streaming_router("remote-exec-client-handshake");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = hyper::service::service_fn(move |request| app.clone().oneshot(request));
+        Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(stream), service)
+            .await
+            .unwrap();
+    });
+
+    let mut request = format!(
+        "ws://{address}/api/v1/namespaces/default/pods/remote-exec-client-handshake/exec?command=true&stdout=true&stderr=true"
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        header::HeaderValue::from_static("v5.channel.k8s.io"),
+    );
+    let (socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        response.headers()[header::SEC_WEBSOCKET_PROTOCOL],
+        "v5.channel.k8s.io"
+    );
+    drop(socket);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_remote_websocket_attach_accepts_upgrade_instead_of_not_implemented() {
     let response = streaming_router("remote-attach-ws")
         .oneshot(websocket_request(
