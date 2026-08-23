@@ -1857,8 +1857,11 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_deferred_delete_records_uid_bound_retry_row() {
-        let (workqueue, _db, _node_local) = test_workqueue().await;
-        let before = now_ms();
+        // Keep the reconciler before the due time while this test claims the persisted row itself.
+        let fixed_now_ms = 1_000_000;
+        let (workqueue, _db, _node_local) =
+            test_workqueue_at(Arc::new(FixedRuntimeClock(fixed_now_ms))).await;
+        let before = fixed_now_ms;
 
         workqueue
             .enqueue_deferred_delete(
@@ -1900,8 +1903,11 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_deferred_delete_with_target_node_records_target_in_payload() {
-        let (workqueue, _db, _node_local) = test_workqueue().await;
-        let before = now_ms();
+        // Keep the reconciler before the due time while this test claims the persisted row itself.
+        let fixed_now_ms = 1_000_000;
+        let (workqueue, _db, _node_local) =
+            test_workqueue_at(Arc::new(FixedRuntimeClock(fixed_now_ms))).await;
+        let before = fixed_now_ms;
 
         workqueue
             .enqueue_deferred_delete_with_target_node(
