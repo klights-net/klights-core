@@ -220,6 +220,36 @@ impl LeaderResourceCommand for RemoteApiClient {
     }
 }
 
+impl klights_node_api::NodeExec for RemoteApiClient {
+    fn exec_sync(
+        &self,
+        request: klights_node_api::NodeExecSyncRequest,
+    ) -> klights_node_api::NodeExecFuture<'_, klights_node_api::NodeExecSyncResult> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                klights_node_api::ExecSetupError::unavailable(
+                    "RemoteApiClient missing gRPC transport",
+                )
+            })?;
+            grpc.execute_node_exec_sync_rpc(request).await
+        })
+    }
+
+    fn open_exec(
+        &self,
+        request: klights_node_api::NodeExecRequest,
+    ) -> klights_node_api::NodeExecFuture<'_, Box<dyn klights_node_api::NodeExecSession>> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                klights_node_api::ExecSetupError::unavailable(
+                    "RemoteApiClient missing gRPC transport",
+                )
+            })?;
+            grpc.open_routed_node_exec_rpc(request).await
+        })
+    }
+}
+
 impl LeaderNodeLeaseRenewal for RemoteApiClient {
     fn renew_node_lease(
         &self,

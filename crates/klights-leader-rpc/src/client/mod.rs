@@ -29,11 +29,12 @@ use klights_leader_api::{
     ResourceListResult, ResourceListScope, ResourceQueryError, WatchRequest, WatchStream,
 };
 use klights_node_api::{
-    BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecStreamChannel,
-    ExecStreamOptions, ExecTerminalError, NodeExecFrame, NodeExecRequest, NodeExecRuntime,
-    NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogEvent, NodeLogRequest,
-    NodeLogResult, NodeLogRuntime, NodeLogSetupError, NodeLogTarget, NodeLogTerminalError,
-    NodeMetricsError, NodeMetricsRequest, NodeMetricsRuntime, NodeMetricsTarget,
+    BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecSetupError,
+    ExecStreamChannel, ExecStreamOptions, ExecTerminalError, NodeExecFrame, NodeExecRequest,
+    NodeExecRuntime, NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget,
+    NodeLogEvent, NodeLogRequest, NodeLogResult, NodeLogRuntime, NodeLogSetupError, NodeLogTarget,
+    NodeLogTerminalError, NodeMetricsError, NodeMetricsRequest, NodeMetricsRuntime,
+    NodeMetricsTarget,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::rustls::{
@@ -229,6 +230,18 @@ fn worker_control_stream_reconnect_delay(attempt: u32) -> std::time::Duration {
     let shift = attempt.clamp(0, 5);
     let millis = 250_u64.saturating_mul(1_u64 << shift).min(5_000);
     std::time::Duration::from_millis(millis)
+}
+
+fn node_exec_sync_rpc_deadline(
+    policy: &GrpcTransportPolicy,
+    timeout_seconds: i64,
+) -> std::time::Duration {
+    let runtime_timeout = u64::try_from(timeout_seconds).unwrap_or_default();
+    if runtime_timeout == 0 {
+        policy.unary_deadline
+    } else {
+        std::time::Duration::from_secs(runtime_timeout).saturating_add(policy.unary_deadline)
+    }
 }
 
 #[derive(Debug)]
@@ -519,6 +532,88 @@ struct LanePool {
 struct OpenConnectStream {
     sender: mpsc::Sender<klights_internal_protobuf::FollowerMessage>,
     stream_items: StreamItemQueue,
+}
+
+struct GrpcRoutedNodeExecSession {
+    request_id: String,
+    outbound: Mutex<Option<mpsc::Sender<klights_internal_protobuf::NodeExecTunnelRequest>>>,
+    inbound: Mutex<tonic::Streaming<klights_internal_protobuf::NodeExecStreamFrame>>,
+    cancelled: AtomicBool,
+}
+
+impl BoundedByteStream for GrpcRoutedNodeExecSession {
+    type Frame = NodeExecFrame;
+
+    fn bounds(&self) -> ByteStreamBounds {
+        ByteStreamBounds::try_new(
+            NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY,
+            NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY,
+        )
+        .expect("node exec stream capacity is a non-zero constant")
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn send_frame(&self, frame: NodeExecFrame) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            let sender = self
+                .outbound
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| ByteStreamError::closed("node exec tunnel is closed"))?;
+            sender
+                .send(klights_internal_protobuf::NodeExecTunnelRequest {
+                    payload: Some(
+                        klights_internal_protobuf::node_exec_tunnel_request::Payload::Frame(
+                            node_exec_stream_frame_to_proto(&self.request_id, frame),
+                        ),
+                    ),
+                })
+                .await
+                .map_err(|_| ByteStreamError::closed("node exec tunnel request stream closed"))
+        })
+    }
+
+    fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeExecFrame>> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            let frame = self
+                .inbound
+                .lock()
+                .await
+                .message()
+                .await
+                .map_err(|error| ByteStreamError::failed(error.to_string()))?;
+            let Some(frame) = frame else {
+                return Ok(None);
+            };
+            let (request_id, frame) = node_exec_stream_frame_from_proto(frame)
+                .map_err(|error| ByteStreamError::failed(error.to_string()))?;
+            if request_id != self.request_id {
+                return Err(ByteStreamError::failed(
+                    "node exec tunnel response request_id does not match the open request",
+                ));
+            }
+            Ok(Some(frame))
+        })
+    }
+
+    fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancelled.swap(true, Ordering::AcqRel) {
+                self.outbound.get_mut().take();
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1151,6 +1246,117 @@ impl ReplicationGrpcClient {
                 })
         });
         Ok(WatchStream::deferred_transport(Box::pin(stream)))
+    }
+
+    pub async fn execute_node_exec_sync_rpc(
+        &self,
+        request: NodeExecSyncRequest,
+    ) -> std::result::Result<NodeExecSyncResult, ExecSetupError> {
+        let deadline = node_exec_sync_rpc_deadline(&self.policy, request.timeout_seconds());
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request = direct_node_exec_sync_request_to_proto(request_id.clone(), request);
+        let response = self
+            .unary_call_with_deadline(
+                "grpc_execute_node_exec_sync",
+                ChannelLane::Stream,
+                deadline,
+                move |mut client| {
+                    let request = request.clone();
+                    async move {
+                        client
+                            .execute_node_exec_sync(request)
+                            .await
+                            .map(|response| response.into_inner())
+                    }
+                },
+            )
+            .await
+            .map_err(|error| ExecSetupError::unavailable(error.to_string()))?;
+        if response.request_id != request_id {
+            return Err(ExecSetupError::unavailable(
+                "node exec response request_id does not match the request",
+            ));
+        }
+        Ok(direct_node_exec_sync_response_from_proto(response))
+    }
+
+    pub async fn open_routed_node_exec_rpc(
+        &self,
+        request: NodeExecRequest,
+    ) -> std::result::Result<Box<dyn NodeExecSession>, ExecSetupError> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let open = direct_node_exec_request_to_proto(request_id.clone(), request);
+        let mut last_retryable = None;
+        for endpoint in self.leader_endpoint_candidates() {
+            let mut client = match self
+                .tonic_client_lane_for_endpoint(ChannelLane::Stream, &endpoint)
+                .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    last_retryable = Some(error.to_string());
+                    continue;
+                }
+            };
+            let (outbound, mut outbound_rx) =
+                mpsc::channel(NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY);
+            outbound
+                .try_send(klights_internal_protobuf::NodeExecTunnelRequest {
+                    payload: Some(
+                        klights_internal_protobuf::node_exec_tunnel_request::Payload::Open(
+                            open.clone(),
+                        ),
+                    ),
+                })
+                .expect("new bounded node exec tunnel accepts its open request");
+            let request_stream = async_stream::stream! {
+                while let Some(message) = outbound_rx.recv().await {
+                    yield message;
+                }
+            };
+            match self
+                .supervisor
+                .timeout(
+                    "grpc_open_node_exec",
+                    self.policy.stream_open_deadline,
+                    client.open_node_exec(request_stream),
+                )
+                .await
+            {
+                Ok(Ok(Ok(response))) => {
+                    self.set_current_leader_endpoint(Some(endpoint));
+                    return Ok(Box::new(GrpcRoutedNodeExecSession {
+                        request_id,
+                        outbound: Mutex::new(Some(outbound)),
+                        inbound: Mutex::new(response.into_inner()),
+                        cancelled: AtomicBool::new(false),
+                    }));
+                }
+                Ok(Ok(Err(status)))
+                    if is_not_current_authority_status(&status) || is_transport_status(&status) =>
+                {
+                    if is_transport_status(&status) && self.policy.evict_lane_on_transport_error {
+                        self.heal_lane_on_transport(ChannelLane::Stream, &status)
+                            .await;
+                    }
+                    last_retryable = Some(status.to_string());
+                }
+                Ok(Ok(Err(status))) => {
+                    return Err(ExecSetupError::unavailable(status.to_string()));
+                }
+                Ok(Err(_elapsed)) => {
+                    self.invalidate_lane(ChannelLane::Stream).await;
+                    last_retryable = Some(format!(
+                        "grpc_open_node_exec deadline exceeded after {:?}",
+                        self.policy.stream_open_deadline
+                    ));
+                }
+                Err(error) => last_retryable = Some(error.to_string()),
+            }
+        }
+        Err(ExecSetupError::unavailable(last_retryable.unwrap_or_else(
+            || "no leader endpoint accepted grpc_open_node_exec".to_string(),
+        )))
     }
 
     /// Opens a long-lived streaming RPC through the same bounded candidate
@@ -3862,6 +4068,58 @@ fn node_exec_sync_request_from_proto(
         request.command,
         request.timeout_seconds,
     )?)
+}
+
+fn direct_node_exec_sync_request_to_proto(
+    request_id: String,
+    request: NodeExecSyncRequest,
+) -> klights_internal_protobuf::NodeExecSyncRequest {
+    let (target, command, timeout_seconds) = request.into_parts();
+    let (node_name, namespace, pod_name, container_id) = target.into_parts();
+    klights_internal_protobuf::NodeExecSyncRequest {
+        request_id,
+        node_name,
+        namespace,
+        pod_name,
+        container_id,
+        command,
+        timeout_seconds,
+    }
+}
+
+fn direct_node_exec_sync_response_from_proto(
+    response: klights_internal_protobuf::NodeExecSyncResponse,
+) -> NodeExecSyncResult {
+    match response.error {
+        Some(error) => NodeExecSyncResult::failed(
+            response.stdout,
+            response.stderr,
+            response.exit_code,
+            ExecTerminalError::new(error),
+        ),
+        None => NodeExecSyncResult::success(response.stdout, response.stderr, response.exit_code),
+    }
+}
+
+fn direct_node_exec_request_to_proto(
+    request_id: String,
+    request: NodeExecRequest,
+) -> klights_internal_protobuf::NodeExecRequest {
+    let (target, command, options, attach) = request.into_parts();
+    let (node_name, namespace, pod_name, container_id) = target.into_parts();
+    klights_internal_protobuf::NodeExecRequest {
+        request_id,
+        node_name,
+        namespace,
+        pod_name,
+        container_id,
+        command,
+        tty: options.tty(),
+        stdin: options.stdin(),
+        stdout: options.stdout(),
+        stderr: options.stderr(),
+        attach,
+    }
 }
 
 fn node_exec_sync_response_to_proto(

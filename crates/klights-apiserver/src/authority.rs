@@ -5,10 +5,12 @@
 //! controlplanes transparently reverse-proxy those requests to the current
 //! authority. Authenticated WebSocket pod streaming upgrades are terminated
 //! locally because an ordinary HTTP reverse proxy cannot relay an upgraded
-//! connection; these CONNECT-style subresources do not mutate canonical
-//! cluster state. The transitional Kubernetes-native handler/state remains
-//! below this Axum/Reqwest shell. gRPC and health endpoints always go through
-//! locally.
+//! connection. The local handler authority-routes node exec/attach setup over
+//! the authenticated internal RPC surface, so only the current leader uses its
+//! complete follower-route table to reach the target node; these CONNECT-style
+//! subresources do not mutate canonical cluster state. The transitional
+//! Kubernetes-native handler/state remains below this Axum/Reqwest shell. gRPC
+//! and health endpoints always go through locally.
 
 use axum::body::Body;
 use axum::extract::{Request, State};

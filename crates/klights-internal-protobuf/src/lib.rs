@@ -16,8 +16,9 @@ mod tests {
     use super::{
         DataplanePeer, FollowerMessage, JoinAccepted, JoinAsControlplaneRequest, JoinRequest,
         JoinRole, LeaderMessage, MetadataRequest, MetadataResponse, NodeExecRequest,
-        NodeExecStreamFrame, ObserveLeaderEndpointRequest, ObservedLeaderEndpoint,
-        ReplicationEntry, StreamAck, follower_message, leader_message,
+        NodeExecStreamFrame, NodeExecTunnelRequest, ObserveLeaderEndpointRequest,
+        ObservedLeaderEndpoint, ReplicationEntry, StreamAck, follower_message, leader_message,
+        node_exec_tunnel_request,
     };
 
     const EXACT_COMMAND_CODEC_V3: u32 = 3;
@@ -162,6 +163,30 @@ mod tests {
             let encoded = message.encode_to_vec();
             assert_eq!(encoded, [expected_key, 0], "leader {name}");
             assert_eq!(LeaderMessage::decode(encoded.as_slice()).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn node_exec_tunnel_envelope_tags_are_closed_and_round_trip() {
+        let cases = [
+            NodeExecTunnelRequest {
+                payload: Some(node_exec_tunnel_request::Payload::Open(
+                    NodeExecRequest::default(),
+                )),
+            },
+            NodeExecTunnelRequest {
+                payload: Some(node_exec_tunnel_request::Payload::Frame(
+                    NodeExecStreamFrame::default(),
+                )),
+            },
+        ];
+        for (message, expected_key) in cases.into_iter().zip([0x0a, 0x12]) {
+            let encoded = message.encode_to_vec();
+            assert_eq!(encoded, [expected_key, 0]);
+            assert_eq!(
+                NodeExecTunnelRequest::decode(encoded.as_slice()).unwrap(),
+                message
+            );
         }
     }
 

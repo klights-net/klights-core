@@ -993,9 +993,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     authority_publisher
         .publish(initial_is_leader, initial_leader_addr.clone())
         .await;
-    start_controlplane_remote_informers_if_present(remote_api_client, shutdown_token.clone())
-        .await
-        .context("control-plane remote API informers")?;
+    start_controlplane_remote_informers_if_present(
+        remote_api_client.clone(),
+        shutdown_token.clone(),
+    )
+    .await
+    .context("control-plane remote API informers")?;
     // Load the cluster CA cert once: the follower proxy uses it to verify the
     // leader's serving cert, and the leader uses it to cryptographically
     // re-authenticate client certificates forwarded by follower proxies.
@@ -1694,8 +1697,20 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
             replication.clone(),
         );
+        let node_exec: Arc<dyn klights_node_api::NodeExec> = remote_api_client
+            .clone()
+            .map(|remote| {
+                Arc::new(
+                    crate::bootstrap::composition::authority_routed_node_exec::AuthorityRoutedNodeExec::new(
+                        runtime.clone() as Arc<dyn klights_node_api::NodeExec>,
+                        remote as Arc<dyn klights_node_api::NodeExec>,
+                        leader_authority.clone(),
+                    ),
+                ) as Arc<dyn klights_node_api::NodeExec>
+            })
+            .unwrap_or_else(|| runtime.clone() as Arc<dyn klights_node_api::NodeExec>);
         (
-            runtime.clone() as Arc<dyn klights_node_api::NodeExec>,
+            node_exec,
             runtime as Arc<dyn klights_node_api::NodeLog>,
         )
     });

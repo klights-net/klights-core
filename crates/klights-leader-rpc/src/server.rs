@@ -3,7 +3,8 @@ use futures::stream::BoxStream;
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand, WatchReplayPosition};
 use klights_leader_api::OutboxDeliveryResult;
 use klights_node_api::{
-    ExecStreamChannel, ExecTerminalError, NodeExecFrame, NodeExecSyncResult, NodeLogEvent,
+    ExecStreamChannel, ExecStreamOptions, ExecTerminalError, NodeExec, NodeExecFrame,
+    NodeExecRequest, NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogEvent,
     NodeLogTerminalError, NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample,
     NodeMetricsPodSample, NodeMetricsResult,
 };
@@ -130,6 +131,7 @@ pub struct GrpcReplicationRuntimePorts {
     follower_sessions: Arc<dyn GrpcFollowerSessionRuntime>,
     follower_completions: Arc<dyn GrpcFollowerCompletionRuntime>,
     metadata: Arc<dyn GrpcMetadataRuntime>,
+    node_exec: Arc<dyn NodeExec>,
 }
 
 impl GrpcReplicationRuntimePorts {
@@ -140,6 +142,7 @@ impl GrpcReplicationRuntimePorts {
             + GrpcFollowerSessionRuntime
             + GrpcFollowerCompletionRuntime
             + GrpcMetadataRuntime
+            + NodeExec
             + 'static,
     {
         Self {
@@ -147,7 +150,8 @@ impl GrpcReplicationRuntimePorts {
             bootstrap: shared.clone(),
             follower_sessions: shared.clone(),
             follower_completions: shared.clone(),
-            metadata: shared,
+            metadata: shared.clone(),
+            node_exec: shared,
         }
     }
 }
@@ -1134,6 +1138,10 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         BoxStream<'static, std::result::Result<klights_internal_protobuf::LeaderMessage, Status>>;
     type WatchResourcesStream =
         BoxStream<'static, std::result::Result<klights_internal_protobuf::WatchEvent, Status>>;
+    type OpenNodeExecStream = BoxStream<
+        'static,
+        std::result::Result<klights_internal_protobuf::NodeExecStreamFrame, Status>,
+    >;
 
     async fn connect(
         &self,
@@ -2127,6 +2135,136 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         ))
     }
 
+    async fn execute_node_exec_sync(
+        &self,
+        request: Request<klights_internal_protobuf::NodeExecSyncRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::NodeExecSyncResponse>, Status>
+    {
+        let identity = self.require_steady_state_auth(&request).await?;
+        let leader_permit = self.sample_raft_leadership()?;
+        let caller = node_authority_from_identity(&identity);
+        let request = request.into_inner();
+        let request_id = request.request_id.clone();
+        let request = direct_node_exec_sync_request_from_proto(request)?;
+        enforce_node_authority(&caller, request.target().node_name())?;
+        let result = self
+            .runtime
+            .node_exec
+            .exec_sync(request)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        self.require_raft_leadership_unchanged(leader_permit.as_ref())?;
+        Ok(Response::new(direct_node_exec_sync_response_to_proto(
+            request_id, result,
+        )))
+    }
+
+    async fn open_node_exec(
+        &self,
+        request: Request<tonic::Streaming<klights_internal_protobuf::NodeExecTunnelRequest>>,
+    ) -> std::result::Result<Response<Self::OpenNodeExecStream>, Status> {
+        let identity = self.require_steady_state_auth(&request).await?;
+        let leader_permit = self.sample_raft_leadership()?;
+        let caller = node_authority_from_identity(&identity);
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("node exec tunnel requires an open request"))?;
+        let open = match first.payload {
+            Some(klights_internal_protobuf::node_exec_tunnel_request::Payload::Open(open)) => open,
+            Some(klights_internal_protobuf::node_exec_tunnel_request::Payload::Frame(_)) | None => {
+                return Err(Status::invalid_argument(
+                    "node exec tunnel first message must be an open request",
+                ));
+            }
+        };
+        let request_id = open.request_id.clone();
+        let open = direct_node_exec_request_from_proto(open)?;
+        enforce_node_authority(&caller, open.target().node_name())?;
+        let mut session = self
+            .runtime
+            .node_exec
+            .open_exec(open)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        self.require_raft_leadership_unchanged(leader_permit.as_ref())?;
+        let authority = self.authority.clone();
+        let stream_request_id = request_id.clone();
+        let stream = async_stream::stream! {
+            loop {
+                let authority_revoked = async {
+                    if let (Some(authority), Some(permit)) =
+                        (authority.as_ref(), leader_permit.as_ref())
+                    {
+                        authority.wait_for_revocation(permit).await;
+                    } else {
+                        futures::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    _ = authority_revoked => {
+                        yield Err(Status::failed_precondition(
+                            "leader authority changed during node exec stream",
+                        ));
+                        break;
+                    }
+                    message = inbound.message() => {
+                        let message = match message {
+                            Ok(Some(message)) => message,
+                            Ok(None) => break,
+                            Err(error) => {
+                                yield Err(error);
+                                break;
+                            }
+                        };
+                        let frame = match message.payload {
+                            Some(klights_internal_protobuf::node_exec_tunnel_request::Payload::Frame(frame)) => frame,
+                            Some(klights_internal_protobuf::node_exec_tunnel_request::Payload::Open(_)) | None => {
+                                yield Err(Status::invalid_argument(
+                                    "node exec tunnel accepts exactly one open request",
+                                ));
+                                break;
+                            }
+                        };
+                        if frame.request_id != stream_request_id {
+                            yield Err(Status::invalid_argument(
+                                "node exec tunnel frame request_id does not match the open request",
+                            ));
+                            break;
+                        }
+                        let (_, frame) = match direct_node_exec_stream_frame_from_proto(frame) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                yield Err(Status::invalid_argument(error.to_string()));
+                                break;
+                            }
+                        };
+                        if let Err(error) = session.send_frame(frame).await {
+                            yield Err(Status::unavailable(error.to_string()));
+                            break;
+                        }
+                    }
+                    frame = session.recv_frame() => {
+                        match frame {
+                            Ok(Some(frame)) => yield Ok(direct_node_exec_stream_frame_to_proto(
+                                &stream_request_id,
+                                frame,
+                            )),
+                            Ok(None) => break,
+                            Err(error) => {
+                                yield Err(Status::unavailable(error.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = session.cancel().await;
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     // ── Phase 3 Raft consensus RPCs (P3-11b) ────────────────────────────
 
     async fn raft_append_entries(
@@ -3100,6 +3238,77 @@ fn node_exec_stream_frame_from_proto(
         request_id: frame.request_id,
         frame: NodeExecFrame::new(channel, frame.data, frame.fin),
     })
+}
+
+fn direct_node_exec_sync_request_from_proto(
+    request: klights_internal_protobuf::NodeExecSyncRequest,
+) -> std::result::Result<NodeExecSyncRequest, Status> {
+    let target = NodeExecTarget::try_new(
+        request.node_name,
+        request.namespace,
+        request.pod_name,
+        request.container_id,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    NodeExecSyncRequest::try_new(target, request.command, request.timeout_seconds)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn direct_node_exec_sync_response_to_proto(
+    request_id: String,
+    response: NodeExecSyncResult,
+) -> klights_internal_protobuf::NodeExecSyncResponse {
+    let (stdout, stderr, exit_code, terminal_error) = response.into_parts();
+    klights_internal_protobuf::NodeExecSyncResponse {
+        request_id,
+        stdout,
+        stderr,
+        exit_code,
+        error: terminal_error.map(ExecTerminalError::into_message),
+    }
+}
+
+fn direct_node_exec_request_from_proto(
+    request: klights_internal_protobuf::NodeExecRequest,
+) -> std::result::Result<NodeExecRequest, Status> {
+    let target = NodeExecTarget::try_new(
+        request.node_name,
+        request.namespace,
+        request.pod_name,
+        request.container_id,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let options =
+        ExecStreamOptions::new(request.stdin, request.stdout, request.stderr, request.tty);
+    Ok(if request.attach {
+        NodeExecRequest::attach(target, options)
+    } else {
+        NodeExecRequest::exec(target, request.command, options)
+    })
+}
+
+fn direct_node_exec_stream_frame_to_proto(
+    request_id: &str,
+    frame: NodeExecFrame,
+) -> klights_internal_protobuf::NodeExecStreamFrame {
+    let (channel, data, fin) = frame.into_parts();
+    klights_internal_protobuf::NodeExecStreamFrame {
+        request_id: request_id.to_string(),
+        channel: channel.as_wire_name().to_string(),
+        data,
+        fin,
+    }
+}
+
+fn direct_node_exec_stream_frame_from_proto(
+    frame: klights_internal_protobuf::NodeExecStreamFrame,
+) -> Result<(String, NodeExecFrame)> {
+    let channel = ExecStreamChannel::try_from_wire_name(&frame.channel)
+        .ok_or_else(|| anyhow!("unknown node exec stream channel '{}'", frame.channel))?;
+    Ok((
+        frame.request_id,
+        NodeExecFrame::new(channel, frame.data, frame.fin),
+    ))
 }
 
 fn pod_log_request_to_proto(

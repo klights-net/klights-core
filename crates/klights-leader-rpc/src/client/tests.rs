@@ -6,7 +6,9 @@ mod cases {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::{ConnectDispatchContext, dispatch_leader_message};
+    use super::super::{
+        ConnectDispatchContext, dispatch_leader_message, node_exec_sync_rpc_deadline,
+    };
 
     use klights_internal_protobuf::{self, follower_message, leader_message};
     use klights_leader_api::{CONTROLPLANE_JOIN_RPC_DEADLINE, JoinRole};
@@ -30,6 +32,19 @@ mod cases {
             NodeLogCapability::Unavailable,
             NodeMetricsCapability::Unavailable,
         )
+    }
+
+    #[test]
+    fn node_exec_sync_rpc_deadline_honors_the_requested_runtime_timeout() {
+        let policy = klights_leader_rpc::transport_policy::GrpcTransportPolicy::default();
+        assert_eq!(
+            node_exec_sync_rpc_deadline(&policy, 300),
+            Duration::from_secs(300) + policy.unary_deadline
+        );
+        assert_eq!(
+            node_exec_sync_rpc_deadline(&policy, 0),
+            policy.unary_deadline
+        );
     }
 
     #[test]
@@ -1073,5 +1088,11 @@ mod cases {
 #[test]
 fn remote_api_client_exposes_resource_command_capability() {
     fn assert_capability<T: klights_leader_api::LeaderResourceCommand>() {}
+    assert_capability::<crate::client::RemoteApiClient>();
+}
+
+#[test]
+fn remote_api_client_exposes_node_exec_capability() {
+    fn assert_capability<T: klights_node_api::NodeExec>() {}
     assert_capability::<crate::client::RemoteApiClient>();
 }

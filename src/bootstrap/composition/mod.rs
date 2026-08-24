@@ -6,6 +6,7 @@
 
 pub(crate) mod authority;
 pub(crate) mod authority_routed_leader;
+pub(crate) mod authority_routed_node_exec;
 pub(crate) mod cluster_store;
 pub(crate) mod node_store;
 pub(crate) mod pod_repository;

@@ -19,6 +19,11 @@ service Replication {
   rpc ObservePeerEndpoint(ObservePeerEndpointRequest) returns (ObservePeerEndpointResponse);
   rpc ListPodCleanupIntentsForNode(ListPodCleanupIntentsForNodeRequest) returns (ListPodCleanupIntentsForNodeResponse);
   rpc DeletePodCleanupIntent(DeletePodCleanupIntentRequest) returns (DeletePodCleanupIntentResponse);
+  // Control-plane followers terminate Kubernetes WebSocket upgrades locally,
+  // then tunnel node exec/attach through the current leader. The leader owns
+  // the complete follower-route table used to reach the target node.
+  rpc ExecuteNodeExecSync(NodeExecSyncRequest) returns (NodeExecSyncResponse);
+  rpc OpenNodeExec(stream NodeExecTunnelRequest) returns (stream NodeExecStreamFrame);
 
   // Phase 3 Raft consensus RPCs. Each request carries an opaque envelope
   // of the openraft RPC payload (serialized via serde); the server
@@ -201,6 +206,13 @@ message NodeExecStreamFrame {
   string channel = 2;
   bytes data = 3;
   bool fin = 4;
+}
+
+message NodeExecTunnelRequest {
+  oneof payload {
+    NodeExecRequest open = 1;
+    NodeExecStreamFrame frame = 2;
+  }
 }
 
 message NodeMetricsRequest {

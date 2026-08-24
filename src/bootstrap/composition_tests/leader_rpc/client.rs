@@ -1732,6 +1732,23 @@ mod cases {
 
         assert_bounded!("metadata", client.metadata());
         assert_bounded!(
+            "execute_node_exec_sync_rpc",
+            client.execute_node_exec_sync_rpc(
+                NodeExecSyncRequest::try_new(
+                    NodeExecTarget::try_new(
+                        "worker-1",
+                        "default",
+                        "remote-exec",
+                        "containerd://test",
+                    )
+                    .unwrap(),
+                    vec!["true".to_string()],
+                    0,
+                )
+                .unwrap(),
+            )
+        );
+        assert_bounded!(
             "get_resource_rpc",
             client.get_resource_rpc(ResourceKey {
                 api_version: "v1".to_string(),
@@ -2306,7 +2323,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn client_replies_to_node_exec_sync_requests_on_connect_stream() {
+    async fn follower_node_exec_sync_tunnels_through_leader_to_target_control_stream() {
         let sqlite =
             crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
                 .await
@@ -2382,9 +2399,7 @@ mod cases {
             300,
         )
         .unwrap();
-        let runtime =
-            crate::bootstrap::composition_tests::leader_rpc::support::grpc_runtime(service.clone());
-        let response = runtime.exec_sync(request).await.unwrap();
+        let response = client.execute_node_exec_sync_rpc(request).await.unwrap();
 
         assert_eq!(response.stdout(), b"worker-stdout\n");
         assert_eq!(response.exit_code(), 0);
@@ -2518,7 +2533,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn client_bridges_node_exec_stream_frames_on_connect_stream() {
+    async fn follower_node_exec_stream_tunnels_through_leader_to_target_control_stream() {
         let sqlite =
             crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
                 .await
@@ -2584,9 +2599,7 @@ mod cases {
             vec!["/bin/sh".to_string()],
             ExecStreamOptions::new(true, true, true, true),
         );
-        let runtime =
-            crate::bootstrap::composition_tests::leader_rpc::support::grpc_runtime(service.clone());
-        let session = runtime.open_exec(request).await.unwrap();
+        let session = client.open_routed_node_exec_rpc(request).await.unwrap();
         session
             .send_frame(NodeExecFrame::new(
                 ExecStreamChannel::Stdin,

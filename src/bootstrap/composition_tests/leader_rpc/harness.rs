@@ -107,25 +107,11 @@ impl IntegrationLeaderRpcRuntime {
         }
     }
 
-    pub async fn exec_sync(
-        &self,
-        request: klights_node_api::NodeExecSyncRequest,
-    ) -> Result<klights_node_api::NodeExecSyncResult, klights_node_api::ExecSetupError> {
-        klights_node_api::NodeExec::exec_sync(self.runtime.as_ref(), request).await
-    }
-
     pub async fn collect_metrics(
         &self,
         request: klights_node_api::NodeMetricsRequest,
     ) -> Result<klights_node_api::NodeMetricsResult, klights_node_api::NodeMetricsError> {
         klights_node_api::NodeMetrics::collect_metrics(self.runtime.as_ref(), request).await
-    }
-
-    pub async fn open_exec(
-        &self,
-        request: klights_node_api::NodeExecRequest,
-    ) -> Result<Box<dyn klights_node_api::NodeExecSession>, klights_node_api::ExecSetupError> {
-        klights_node_api::NodeExec::open_exec(self.runtime.as_ref(), request).await
     }
 }
 

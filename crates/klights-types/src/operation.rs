@@ -39,6 +39,8 @@ pub enum OperationId {
     AggregatedApiProxy,
     DebugRead,
     InternalFollowerConnect,
+    InternalNodeExecSync,
+    InternalNodeExecStream,
     InternalMetadataRead,
     InternalProjectedToken,
     InternalOutboxApply,
@@ -58,7 +60,7 @@ pub enum OperationId {
 }
 
 impl OperationId {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 52] = [
         Self::HealthRead,
         Self::RuntimeMetricsRead,
         Self::VersionRead,
@@ -93,6 +95,8 @@ impl OperationId {
         Self::AggregatedApiProxy,
         Self::DebugRead,
         Self::InternalFollowerConnect,
+        Self::InternalNodeExecSync,
+        Self::InternalNodeExecStream,
         Self::InternalMetadataRead,
         Self::InternalProjectedToken,
         Self::InternalOutboxApply,
@@ -147,6 +151,8 @@ impl OperationId {
             Self::AggregatedApiProxy => "aggregated-api.proxy",
             Self::DebugRead => "debug.read",
             Self::InternalFollowerConnect => "internal.follower-connect",
+            Self::InternalNodeExecSync => "internal.node-exec.sync",
+            Self::InternalNodeExecStream => "internal.node-exec.stream",
             Self::InternalMetadataRead => "internal.metadata.read",
             Self::InternalProjectedToken => "internal.projected-token",
             Self::InternalOutboxApply => "internal.outbox.apply",
@@ -534,6 +540,22 @@ pub const ALL_OPERATION_METADATA: [OperationMetadata; OperationId::ALL.len()] = 
         InternalAuthenticated,
         None,
         "klights-leader-rpc::FollowerStreamHandler::connect"
+    ),
+    native!(
+        InternalNodeExecSync,
+        "node-exec",
+        Command,
+        InternalAuthenticated,
+        Preserve,
+        "klights-node-api::NodeExec::exec_sync"
+    ),
+    native!(
+        InternalNodeExecStream,
+        "node-exec",
+        Stream,
+        InternalAuthenticated,
+        Preserve,
+        "klights-node-api::NodeExec::open_exec"
     ),
     native!(
         InternalMetadataRead,
