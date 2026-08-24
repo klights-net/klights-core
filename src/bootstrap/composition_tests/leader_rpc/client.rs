@@ -2026,7 +2026,8 @@ mod cases {
         use klights_leader_rpc::client::GrpcChannelLane as ChannelLane;
         // wedge nothing for IS (empty path never matches), just drive one call
         // through the client to materialize the lane pool.
-        let (client, handle) = raft_timeout_client("/never-wedges").await;
+        let (client, handle) =
+            raft_client_with_deadline("/never-wedges", Duration::from_secs(2)).await;
         let _ = client
             .raft_install_snapshot_rpc(raft_receiver(), Vec::new())
             .await;
@@ -2737,9 +2738,10 @@ mod cases {
     // ── Task 7: raft lane health and per-peer loss observability ─────────────
 
     /// Helper: build a test client against a server that wedges the given
-    /// gRPC method path for 30 s, with a short raft_unary_deadline.
-    async fn raft_timeout_client(
+    /// gRPC method path for 30 s, with the selected raft_unary_deadline.
+    async fn raft_client_with_deadline(
         wedge_path_suffix: &'static str,
+        raft_deadline: Duration,
     ) -> (ReplicationGrpcClient, tokio::task::JoinHandle<()>) {
         let sqlite =
             crate::bootstrap::composition_tests::leader_rpc::support::canonical_sqlite_fixture()
@@ -2796,9 +2798,15 @@ mod cases {
                 client_key_pem: None,
             },
             supervisor,
-            raft_deadline_policy(Duration::from_millis(50)),
+            raft_deadline_policy(raft_deadline),
         );
         (client, handle)
+    }
+
+    async fn raft_timeout_client(
+        wedge_path_suffix: &'static str,
+    ) -> (ReplicationGrpcClient, tokio::task::JoinHandle<()>) {
+        raft_client_with_deadline(wedge_path_suffix, Duration::from_millis(50)).await
     }
 
     #[tokio::test]
