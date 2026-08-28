@@ -51,7 +51,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
                             format!("Namespace \"{}\" already exists", row.name),
                         )
                     }
-                    other => other,
+                    other => klights_supervisor::DbError::Sqlite(other),
                 }
             })?;
         } else {
