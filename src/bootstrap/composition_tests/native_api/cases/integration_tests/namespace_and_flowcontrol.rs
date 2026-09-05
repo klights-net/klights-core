@@ -6483,3 +6483,85 @@ async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalizati
         "namespace must finalize once actor-owned Pod rows are removed"
     );
 }
+
+/// Regression: concurrent explicit-name Namespace creates must preserve
+/// create-only and AlreadyExists semantics at the HTTP API layer.
+///
+/// The run-17 defect: two parallel creates for the same explicit namespace
+/// name both succeeded, allowing two Ginkgo processes to race through the
+/// same namespace. After the fix, the second create must return
+/// 409 Conflict (AlreadyExists) while the first is retained.
+#[tokio::test]
+async fn concurrent_explicit_name_namespace_creates_preserve_already_exists() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_name = "ns-concurrent-explicit-1";
+    let create_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": ns_name}
+    });
+    let body_bytes = serde_json::to_vec(&create_body).unwrap();
+
+    // Fire two concurrent creates for the same explicit name.
+    let (r1, r2) = tokio::join!(
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        ),
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        ),
+    );
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+
+    // Exactly one of the two must succeed.
+    let statuses = [r1.status(), r2.status()];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::CREATED).count(),
+        1,
+        "exactly one concurrent create must return 201 Created, got {:?}",
+        statuses
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::CONFLICT).count(),
+        1,
+        "exactly one concurrent create must return 409 Conflict, got {:?}",
+        statuses
+    );
+
+    // The namespace must be reachable with the first creator's UID.
+    let get_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/namespaces/{ns_name}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let fetched: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fetched["metadata"]["name"], ns_name);
+    assert_eq!(fetched["status"]["phase"], "Active");
+}
