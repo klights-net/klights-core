@@ -6532,13 +6532,19 @@ async fn concurrent_explicit_name_namespace_creates_preserve_already_exists() {
     // Exactly one of the two must succeed.
     let statuses = [r1.status(), r2.status()];
     assert_eq!(
-        statuses.iter().filter(|s| **s == StatusCode::CREATED).count(),
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count(),
         1,
         "exactly one concurrent create must return 201 Created, got {:?}",
         statuses
     );
     assert_eq!(
-        statuses.iter().filter(|s| **s == StatusCode::CONFLICT).count(),
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CONFLICT)
+            .count(),
         1,
         "exactly one concurrent create must return 409 Conflict, got {:?}",
         statuses
