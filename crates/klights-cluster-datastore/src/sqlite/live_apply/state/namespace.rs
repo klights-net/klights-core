@@ -65,8 +65,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
                     }
                     other => klights_supervisor::DbError::Sqlite(other),
                 })?;
-        } else {
-            let (_existing_rv, existing_uid, _existing_bytes) = existing.unwrap();
+        } else if let Some((_existing_rv, existing_uid, _existing_bytes)) = existing {
             if existing_uid != row.uid {
                 // Concurrent create race: the namespace already exists under a
                 // different UID, meaning another explicit-name create won the
