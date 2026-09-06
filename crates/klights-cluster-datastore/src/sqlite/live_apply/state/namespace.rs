@@ -1,9 +1,7 @@
 use super::super::mutation_helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
-use super::super::{
-    ApplyConflictCode, apply_conflict_error, create_staged_post_commit, mutation_queries,
-};
+use super::super::{ApplyConflictCode, apply_conflict_error, create_staged_post_commit, mutation_queries};
 use klights_cluster_core::LogApplyNamespaceRow;
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
@@ -29,74 +27,48 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
             .query_row(
                 mutation_queries::NAMESPACE_GET,
                 rusqlite::params![&row.name],
-                |db_row| {
-                    Ok((
-                        db_row.get::<_, i64>(1)?,
-                        db_row.get::<_, String>(2)?,
-                        db_row.get::<_, Vec<u8>>(3)?,
-                    ))
-                },
+                |db_row| Ok((db_row.get::<_, i64>(1)?, db_row.get::<_, Vec<u8>>(3)?)),
             )
             .optional()?;
-        if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
+        if existing.as_ref().is_some_and(|(rv, existing_bytes)| {
             *rv == row.resource_version && *existing_bytes == data_bytes
         }) {
             return Ok(None);
         }
-        let had_existing = existing.is_some();
         if existing.is_none() {
             // Create-only path: the namespace does not exist yet. Use a plain
             // INSERT so that a concurrent explicit-name create that races past
             // the same check hits the PRIMARY KEY constraint and is rejected as
             // AlreadyExists instead of silently overwriting via UPSERT.
-            self.tx
-                .execute(
-                    mutation_queries::NAMESPACES_INSERT,
-                    rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
-                )
-                .map_err(|err| match err {
-                    rusqlite::Error::SqliteFailure(e, _)
-                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
-                    {
+            self.tx.execute(
+                mutation_queries::NAMESPACES_INSERT,
+                rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
+            ).map_err(|err| {
+                match err {
+                    rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
                         apply_conflict_error(
                             ApplyConflictCode::AlreadyExists,
                             format!("Namespace \"{}\" already exists", row.name),
                         )
                     }
                     other => klights_supervisor::DbError::Sqlite(other),
-                })?;
-        } else if let Some((_existing_rv, existing_uid, _existing_bytes)) = existing {
-            if existing_uid != row.uid {
-                // Concurrent create race: the namespace already exists under a
-                // different UID, meaning another explicit-name create won the
-                // PRIMARY KEY insert. Reject this as AlreadyExists instead of
-                // silently overwriting via UPSERT.
-                self.tx
-                    .execute(
-                        mutation_queries::NAMESPACES_INSERT,
-                        rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
-                    )
-                    .map_err(|err| match err {
-                        rusqlite::Error::SqliteFailure(e, _)
-                            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
-                        {
-                            apply_conflict_error(
-                                ApplyConflictCode::AlreadyExists,
-                                format!("Namespace \"{}\" already exists", row.name),
-                            )
-                        }
-                        other => klights_supervisor::DbError::Sqlite(other),
-                    })?;
-            } else {
-                // Same UID: idempotent replay or legitimate update that Raft has
-                // serialized after the create. UPSERT is safe here.
-                self.tx.execute(
-                    mutation_queries::NAMESPACES_UPSERT_EXACT,
-                    rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
-                )?;
-            }
+                }
+            })?;
+        } else {
+            // The namespace already exists. UPSERT is safe here: either the
+            // row is an idempotent replay that was not caught above (different
+            // RV but same data after a compaction window), or it is a legitimate
+            // update that Raft has serialized after the create.
+            self.tx.execute(
+                mutation_queries::NAMESPACES_UPSERT_EXACT,
+                rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
+            )?;
         }
-        let event_type = if had_existing { "MODIFIED" } else { "ADDED" };
+        let event_type = if existing.is_some() {
+            "MODIFIED"
+        } else {
+            "ADDED"
+        };
         if !emit_watch_events {
             return Ok(None);
         }
