@@ -29,6 +29,7 @@ async fn concurrent_explicit_name_namespace_create_rejects_duplicate() {
             "kind": "Namespace",
             "metadata": {"name": "ns-concurrent-1"}
         }),
+        require_absent: true,
     };
 
     let commit_a =
@@ -52,6 +53,7 @@ async fn concurrent_explicit_name_namespace_create_rejects_duplicate() {
             "kind": "Namespace",
             "metadata": {"name": "ns-concurrent-1"}
         }),
+        require_absent: true,
     };
 
     let commit_b =

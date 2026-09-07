@@ -639,6 +639,7 @@ impl Datastore {
                                     uid,
                                     resource_version: rv,
                                     data,
+                                    require_absent: true,
                                 },
                             ))],
                         )?,
@@ -736,6 +737,7 @@ impl Datastore {
                                     uid,
                                     resource_version: rv,
                                     data,
+                                    require_absent: false,
                                 },
                             ))],
                         )?,
@@ -1435,6 +1437,7 @@ impl Datastore {
                             uid,
                             resource_version: rv,
                             data,
+                            require_absent: true,
                         },
                     ))],
                 )
@@ -1481,6 +1484,7 @@ impl Datastore {
                             uid,
                             resource_version: rv,
                             data,
+                            require_absent: false,
                         },
                     ))],
                 )

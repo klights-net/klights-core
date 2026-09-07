@@ -791,6 +791,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
                         "resourceVersion": "60"
                     },
                 }),
+                require_absent: false,
             }),
             LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),

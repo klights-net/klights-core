@@ -124,6 +124,7 @@ fn namespace_row(name: &str, resource_version: i64) -> LogApplyNamespaceRow {
                 "resourceVersion": resource_version.to_string(),
             }
         }),
+        require_absent: false,
     }
 }
 

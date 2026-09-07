@@ -58,6 +58,7 @@ fn namespace(name: &str, resource_version: i64) -> LogApplyNamespaceRow {
                 "uid": format!("uid-{name}"),
             }
         }),
+        require_absent: false,
     }
 }
 
