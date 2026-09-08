@@ -130,7 +130,6 @@ pub fn resource_snapshot_restore_operation(resource: &Resource) -> SnapshotResto
             uid: resource.uid.clone(),
             resource_version: resource.resource_version,
             data: (*resource.data).clone(),
-            require_absent: false,
         }))
     } else {
         ClusterMutation::Resource(ResourceMutation::PutResource(LogApplyResourceRow {
@@ -265,7 +264,6 @@ impl LogApplyCommit {
             uid: resource.uid.clone(),
             resource_version: 0,
             data,
-            require_absent: false,
         })])
     }
 
@@ -607,8 +605,6 @@ pub struct LogApplyNamespaceRow {
     pub uid: String,
     pub resource_version: i64,
     pub data: serde_json::Value,
-    #[serde(default)]
-    pub require_absent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1189,7 +1185,6 @@ mod tests {
                     uid: "ns-uid".into(),
                     resource_version: 73,
                     data: json!({}),
-                    require_absent: false,
                 }),
             ),
             (
@@ -1299,7 +1294,6 @@ mod tests {
                     uid: "ns-uid".into(),
                     resource_version: 0,
                     data: json!({"metadata": {"resourceVersion": "43"}}),
-                    require_absent: false,
                 }),
             ),
             (
@@ -1352,7 +1346,6 @@ mod tests {
                 uid: "zero-uid".into(),
                 resource_version: 0,
                 data: json!({"metadata": {"resourceVersion": "0"}}),
-                require_absent: false,
             })])
             .expect("an explicit nested zero remains an RV-zero template");
         let mut encoded = serde_json::to_value(zero_nested).unwrap();

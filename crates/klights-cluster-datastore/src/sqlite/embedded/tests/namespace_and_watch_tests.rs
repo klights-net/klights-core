@@ -1148,7 +1148,6 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
                 uid: "deterministic-ns-uid".to_string(),
                 resource_version: 51,
                 data: namespace_data,
-                require_absent: false,
             },
         )],
     );
@@ -1229,7 +1228,6 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
                         "uid": "deterministic-ns-uid"
                     },
                 }),
-                require_absent: false,
             },
         )],
     );

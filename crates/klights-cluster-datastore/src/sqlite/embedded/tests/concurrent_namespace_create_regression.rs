@@ -27,7 +27,6 @@ async fn concurrent_explicit_name_namespace_create_rejects_duplicate() {
             "kind": "Namespace",
             "metadata": {"name": "ns-concurrent-1"}
         }),
-        require_absent: true,
     };
 
     let commit_a = LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(row_a)]).unwrap();
@@ -49,7 +48,6 @@ async fn concurrent_explicit_name_namespace_create_rejects_duplicate() {
             "kind": "Namespace",
             "metadata": {"name": "ns-concurrent-1"}
         }),
-        require_absent: true,
     };
 
     let commit_b = LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(row_b)]).unwrap();

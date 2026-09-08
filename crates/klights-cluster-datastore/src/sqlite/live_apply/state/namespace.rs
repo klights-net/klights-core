@@ -37,12 +37,6 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         }) {
             return Ok(None);
         }
-        if row.require_absent && existing.is_some() {
-            return Err(apply_conflict_error(
-                ApplyConflictCode::AlreadyExists,
-                format!("Namespace \"{}\" already exists (409 Conflict)", row.name),
-            ));
-        }
         if existing.is_none() {
             // Create-only path: the namespace does not exist yet. Use a plain
             // INSERT so that a concurrent explicit-name create that races past

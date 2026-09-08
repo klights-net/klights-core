@@ -204,8 +204,6 @@ pub struct ProtoLogApplyNamespaceRow {
     pub resource_version: i64,
     #[prost(bytes = "vec", tag = "4")]
     pub data_json: Vec<u8>,
-    #[prost(bool, tag = "5")]
-    pub require_absent: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

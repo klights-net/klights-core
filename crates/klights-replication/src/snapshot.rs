@@ -964,7 +964,6 @@ mod tests {
                                 "kind": "Namespace",
                                 "metadata": {"name": "captured", "uid": "captured-uid"}
                             }),
-                            require_absent: false,
                         },
                     )],
                 ),

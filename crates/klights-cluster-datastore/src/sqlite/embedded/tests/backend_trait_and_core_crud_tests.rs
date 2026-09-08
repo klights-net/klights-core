@@ -904,7 +904,6 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
                 "kind": "Namespace",
                 "metadata": {"name": "dup-watermark", "uid": "dup-watermark-uid"}
             }),
-            require_absent: false,
         })],
         Some(OutboxStreamWatermark {
             client_id: "worker-a".to_string(),
@@ -1270,7 +1269,6 @@ async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
                 "kind": "Namespace",
                 "metadata": {"name": "gap-watermark", "uid": "gap-watermark-uid"}
             }),
-            require_absent: false,
         })],
         Some(OutboxStreamWatermark {
             client_id: "worker-a".to_string(),
