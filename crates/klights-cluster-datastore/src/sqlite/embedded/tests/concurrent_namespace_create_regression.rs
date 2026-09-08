@@ -1,9 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use klights_cluster_core::{
-    LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
-};
+use klights_cluster_core::{LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow};
 
 /// Regression: concurrent explicit-name Namespace create must preserve
 /// create-only and AlreadyExists semantics across committed Raft apply.
@@ -32,9 +30,7 @@ async fn concurrent_explicit_name_namespace_create_rejects_duplicate() {
         require_absent: true,
     };
 
-    let commit_a =
-        LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(row_a)])
-            .unwrap();
+    let commit_a = LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(row_a)]).unwrap();
     let result_a = db.apply_raft_log_apply_commit(commit_a).await.unwrap();
     assert!(
         result_a.error_message.is_none(),
@@ -56,9 +52,7 @@ async fn concurrent_explicit_name_namespace_create_rejects_duplicate() {
         require_absent: true,
     };
 
-    let commit_b =
-        LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(row_b)])
-            .unwrap();
+    let commit_b = LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(row_b)]).unwrap();
     let result_b = db.apply_raft_log_apply_commit(commit_b).await.unwrap();
     assert!(
         result_b.error_message.is_some(),

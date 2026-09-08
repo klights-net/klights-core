@@ -360,9 +360,13 @@ mod tests {
     #[test]
     fn test_data_root_lives_under_tmp() {
         let r = test_data_root_path("klights");
+        let configured_root = std::env::var_os("KLIGHTS_TEST_DATA_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/klights"));
         assert!(
-            r.starts_with("/tmp/klights/"),
-            "test root must be under /tmp/klights, got: {}",
+            r.starts_with(&configured_root),
+            "test root must be under {}, got: {}",
+            configured_root.display(),
             r.display()
         );
     }

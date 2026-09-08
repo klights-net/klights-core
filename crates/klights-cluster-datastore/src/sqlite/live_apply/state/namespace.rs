@@ -1,7 +1,9 @@
 use super::super::mutation_helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
-use super::super::{ApplyConflictCode, apply_conflict_error, create_staged_post_commit, mutation_queries};
+use super::super::{
+    ApplyConflictCode, apply_conflict_error, create_staged_post_commit, mutation_queries,
+};
 use klights_cluster_core::LogApplyNamespaceRow;
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
@@ -46,20 +48,22 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
             // INSERT so that a concurrent explicit-name create that races past
             // the same check hits the PRIMARY KEY constraint and is rejected as
             // AlreadyExists instead of silently overwriting via UPSERT.
-            self.tx.execute(
-                mutation_queries::NAMESPACES_INSERT,
-                rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
-            ).map_err(|err| {
-                match err {
-                    rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            self.tx
+                .execute(
+                    mutation_queries::NAMESPACES_INSERT,
+                    rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
+                )
+                .map_err(|err| match err {
+                    rusqlite::Error::SqliteFailure(e, _)
+                        if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
                         apply_conflict_error(
                             ApplyConflictCode::AlreadyExists,
                             format!("Namespace \"{}\" already exists", row.name),
                         )
                     }
                     other => klights_supervisor::DbError::Sqlite(other),
-                }
-            })?;
+                })?;
         } else {
             // The namespace already exists. UPSERT is safe here: either the
             // row is an idempotent replay that was not caught above (different
