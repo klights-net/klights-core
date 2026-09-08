@@ -105,8 +105,26 @@ impl PreparedSqliteSnapshot {
         } = self;
         let header = executor
             .call_raw("snapshot:begin", |conn| {
-                conn.execute_batch("BEGIN")?;
-                Ok(read_header(conn)?)
+                let mut transaction = conn.transaction()?;
+                match read_header(&transaction) {
+                    Ok(header) => {
+                        transaction.set_drop_behavior(rusqlite::DropBehavior::Ignore);
+                        Ok(header)
+                    }
+                    Err(header_error) => {
+                        if let Err(rollback_error) = transaction.rollback() {
+                            return Err(klights_supervisor::DbError::Application(Box::new(
+                                SnapshotPersistenceError::PersistenceFailed {
+                                    message: format!(
+                                        "snapshot header validation failed: {header_error}; \
+                                         rollback failed: {rollback_error}"
+                                    ),
+                                },
+                            )));
+                        }
+                        Err(header_error.into())
+                    }
+                }
             })
             .await
             .map_err(map_sqlite_snapshot_error)
@@ -469,6 +487,42 @@ mod tests {
     ) -> Box<dyn SnapshotCaptureSession> {
         let fence = db.acquire_snapshot_exclusive_fence().await;
         db.begin_pinned_snapshot_capture(request, fence).await
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_header_releases_shared_memory_transaction() {
+        let db = TestStore::new_in_memory().await;
+        let prepared = db.factory.open(request()).await.unwrap();
+        let retained_executor = prepared.executor.clone();
+        let fence = db.acquire_snapshot_exclusive_fence().await;
+
+        let Err(error) = prepared.pin(fence).await else {
+            panic!("pristine store must reject a snapshot without cluster identity");
+        };
+        assert!(
+            error.to_string().contains("cluster_id is missing"),
+            "snapshot must retain the header validation error: {error:#}"
+        );
+        let is_autocommit = retained_executor
+            .call_raw("recovery-test:failed-pin-autocommit", |conn| {
+                Ok(conn.is_autocommit())
+            })
+            .await
+            .unwrap();
+        assert!(
+            is_autocommit,
+            "failed snapshot initialization must synchronously close its transaction"
+        );
+
+        let _mutation_fence = db.acquire_snapshot_mutation_fence().await;
+        db.db_call("recovery-test:write-after-failed-pin", |conn| {
+            conn.execute(
+                "UPDATE metadata SET value=value WHERE key='resource_version'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await;
     }
 
     #[tokio::test]
