@@ -6,6 +6,22 @@ This project uses GitHub Releases as the canonical public release page. The
 release workflow extracts the matching version section from this file and
 attaches distro packages to the GitHub Release.
 
+## [0.10.4] - Unreleased
+
+### Fixed
+
+- Preserve Namespace create-only intent through Raft commit serialization and
+  reject concurrent duplicate creates atomically with `AlreadyExists`, without
+  replacing the winning Namespace or advancing its resource version.
+
+### Documentation
+
+- Reorganized the remaining development roadmap into five dependency-ordered
+  Lightcoder projects with bounded tasks, explicit ownership, and source-bound
+  verification gates.
+- Added planning guidance and reconciled active backlog coverage. These are
+  documentation changes, not claims that planned features are implemented.
+
 ## [0.10.3] - 2026-08-16
 
 This release strengthens multinode correctness, Kubernetes API compatibility,

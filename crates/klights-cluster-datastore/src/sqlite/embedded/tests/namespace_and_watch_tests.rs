@@ -1144,6 +1144,7 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
         51,
         vec![klights_cluster_core::LogApplyMutation::PutNamespace(
             klights_cluster_core::LogApplyNamespaceRow {
+                require_absent: false,
                 name: "deterministic-ns".to_string(),
                 uid: "deterministic-ns-uid".to_string(),
                 resource_version: 51,
@@ -1217,6 +1218,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
         51,
         vec![klights_cluster_core::LogApplyMutation::PutNamespace(
             klights_cluster_core::LogApplyNamespaceRow {
+                require_absent: false,
                 name: "deterministic-ns".to_string(),
                 uid: "deterministic-ns-uid".to_string(),
                 resource_version: 51,

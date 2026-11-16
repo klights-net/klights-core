@@ -47,6 +47,7 @@ fn supervisor() -> Arc<TaskSupervisor> {
 
 fn namespace(name: &str, resource_version: i64) -> LogApplyNamespaceRow {
     LogApplyNamespaceRow {
+        require_absent: false,
         name: name.to_string(),
         uid: format!("uid-{name}"),
         resource_version,

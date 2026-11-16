@@ -22,8 +22,6 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         row: LogApplyNamespaceRow,
         emit_watch_events: bool,
     ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
-        let data_bytes = serde_json::to_vec(&row.data)
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         let existing = self
             .tx
             .query_row(
@@ -32,6 +30,14 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
                 |db_row| Ok((db_row.get::<_, i64>(1)?, db_row.get::<_, Vec<u8>>(3)?)),
             )
             .optional()?;
+        if row.require_absent && existing.is_some() {
+            return Err(apply_conflict_error(
+                ApplyConflictCode::AlreadyExists,
+                format!("Namespace \"{}\" already exists", row.name),
+            ));
+        }
+        let data_bytes = serde_json::to_vec(&row.data)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         if existing.as_ref().is_some_and(|(rv, existing_bytes)| {
             *rv == row.resource_version && *existing_bytes == data_bytes
         }) {
@@ -59,10 +65,8 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
                     other => klights_supervisor::DbError::Sqlite(other),
                 })?;
         } else {
-            // The namespace already exists. UPSERT is safe here: either the
-            // row is an idempotent replay that was not caught above (different
-            // RV but same data after a compaction window), or it is a legitimate
-            // update that Raft has serialized after the create.
+            // Create-only commits were rejected above. Remaining PUTs retain
+            // their update and authoritative snapshot-restore behavior.
             self.tx.execute(
                 mutation_queries::NAMESPACES_UPSERT_EXACT,
                 rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],

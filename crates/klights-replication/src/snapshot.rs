@@ -956,6 +956,7 @@ mod tests {
                     None,
                     vec![klights_cluster_core::LogApplyMutation::PutNamespace(
                         klights_cluster_core::LogApplyNamespaceRow {
+                            require_absent: false,
                             name: "captured".to_string(),
                             uid: "captured-uid".to_string(),
                             resource_version: 1,

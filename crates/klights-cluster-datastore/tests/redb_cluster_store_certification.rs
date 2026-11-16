@@ -112,6 +112,7 @@ fn resource_row(name: &str, resource_version: i64, tier: &str) -> LogApplyResour
 
 fn namespace_row(name: &str, resource_version: i64) -> LogApplyNamespaceRow {
     LogApplyNamespaceRow {
+        require_absent: false,
         name: name.to_string(),
         uid: format!("{name}-uid"),
         resource_version,

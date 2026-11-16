@@ -635,6 +635,7 @@ impl Datastore {
                             rv,
                             vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
                                 LogApplyNamespaceRow {
+                                    require_absent: true,
                                     name,
                                     uid,
                                     resource_version: rv,
@@ -732,6 +733,7 @@ impl Datastore {
                             rv,
                             vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
                                 LogApplyNamespaceRow {
+                                    require_absent: false,
                                     name,
                                     uid,
                                     resource_version: rv,
@@ -1431,6 +1433,7 @@ impl Datastore {
                     rv,
                     vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
                         LogApplyNamespaceRow {
+                            require_absent: true,
                             name: name.clone(),
                             uid,
                             resource_version: rv,
@@ -1477,6 +1480,7 @@ impl Datastore {
                     rv,
                     vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
                         LogApplyNamespaceRow {
+                            require_absent: false,
                             name: name.clone(),
                             uid,
                             resource_version: rv,

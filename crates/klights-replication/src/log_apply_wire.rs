@@ -457,6 +457,7 @@ impl WireFrom<LogApplyNamespaceRow> for ProtoLogApplyNamespaceRow {
             resource_version: row.resource_version,
             data_json: serde_json::to_vec(&row.data)
                 .expect("serde_json::Value serialization is infallible"),
+            require_absent: row.require_absent,
         }
     }
 }
@@ -470,6 +471,7 @@ impl TryWireFrom<ProtoLogApplyNamespaceRow> for LogApplyNamespaceRow {
             uid: row.uid,
             resource_version: row.resource_version,
             data: serde_json::from_slice(&row.data_json)?,
+            require_absent: row.require_absent,
         })
     }
 }
@@ -722,6 +724,7 @@ mod parity_tests {
                 })
             }
             "PutNamespace" => LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                require_absent: true,
                 name: "ns".to_string(),
                 uid: "ns-uid".to_string(),
                 resource_version: 3,

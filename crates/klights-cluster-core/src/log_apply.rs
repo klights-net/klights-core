@@ -126,6 +126,7 @@ pub fn resource_snapshot_restore_operation(resource: &Resource) -> SnapshotResto
         && resource.namespace.is_none()
     {
         ClusterMutation::Namespace(NamespaceMutation::PutNamespace(LogApplyNamespaceRow {
+            require_absent: false,
             name: resource.name.clone(),
             uid: resource.uid.clone(),
             resource_version: resource.resource_version,
@@ -260,6 +261,7 @@ impl LogApplyCommit {
         let mut data = (*resource.data).clone();
         clear_metadata_resource_version(&mut data);
         Self::authored(vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+            require_absent: false,
             name: resource.name.clone(),
             uid: resource.uid.clone(),
             resource_version: 0,
@@ -605,6 +607,8 @@ pub struct LogApplyNamespaceRow {
     pub uid: String,
     pub resource_version: i64,
     pub data: serde_json::Value,
+    #[serde(default)]
+    pub require_absent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1181,6 +1185,7 @@ mod tests {
             (
                 "put_namespace.resource_version",
                 LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                    require_absent: false,
                     name: "ns".into(),
                     uid: "ns-uid".into(),
                     resource_version: 73,
@@ -1290,6 +1295,7 @@ mod tests {
                 "put_namespace.data.metadata.resourceVersion",
                 43,
                 LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                    require_absent: false,
                     name: "ns".into(),
                     uid: "ns-uid".into(),
                     resource_version: 0,
@@ -1342,6 +1348,7 @@ mod tests {
 
         let zero_nested =
             LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                require_absent: false,
                 name: "zero".into(),
                 uid: "zero-uid".into(),
                 resource_version: 0,

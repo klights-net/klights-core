@@ -896,6 +896,7 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
     let db = Datastore::new_in_memory().await.unwrap();
     let commit = LogApplyCommit::try_new_with_watermark(
         vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+            require_absent: false,
             name: "dup-watermark".to_string(),
             uid: "dup-watermark-uid".to_string(),
             resource_version: 0,
@@ -1261,6 +1262,7 @@ async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
     let db = Datastore::new_in_memory().await.unwrap();
     let commit = LogApplyCommit::try_new_with_watermark(
         vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+            require_absent: false,
             name: "gap-watermark".to_string(),
             uid: "gap-watermark-uid".to_string(),
             resource_version: 0,

@@ -779,6 +779,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         60,
         vec![
             LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                require_absent: false,
                 name: "mixed-family-ns".to_string(),
                 uid: "mixed-family-ns-uid".to_string(),
                 resource_version: 60,
